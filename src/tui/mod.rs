@@ -1140,6 +1140,7 @@ impl Ui {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let cmds = self.cmd_matches();
+        let hints = self.hints();
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.cmd_sel = 0;
         }
@@ -1153,8 +1154,8 @@ impl Ui {
             KeyCode::Char('w') if alt => self.close_tab(),
             KeyCode::PageDown if alt => self.step_tab(1),
             KeyCode::PageUp if alt => self.step_tab(-1),
-            KeyCode::Up | KeyCode::Down if !cmds.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
-                let n = cmds.len();
+            KeyCode::Up | KeyCode::Down if !hints.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                let n = hints.len();
                 self.cmd_sel = if k.code == KeyCode::Up { (self.cmd_sel + n - 1) % n } else { (self.cmd_sel + 1) % n };
             }
             KeyCode::Char('c') if ctrl => {
@@ -1196,6 +1197,15 @@ impl Ui {
                 if text.is_empty() {
                     return;
                 }
+                // A half-typed $skill completes first; a full name sends.
+                if let Some(tok) = self.skill_token().map(str::to_string)
+                    && let Some((h, _)) = hints.get(self.cmd_sel).cloned()
+                    && h != tok
+                {
+                    self.complete(&h);
+                    self.cmd_sel = 0;
+                    return;
+                }
                 if text.starts_with('/') && !text.contains('\n') {
                     // Run the highlighted suggestion, or complete a partial command.
                     let first = text.split(' ').next().unwrap_or("");
@@ -1215,8 +1225,8 @@ impl Ui {
                 self.send(text);
             }
             KeyCode::Tab => {
-                if let Some((c, _)) = cmds.get(self.cmd_sel) {
-                    self.input.set(format!("{c} "));
+                if let Some((c, _)) = hints.get(self.cmd_sel).cloned() {
+                    self.complete(&c);
                     self.cmd_sel = 0;
                 } else if self.input.text.starts_with('/') {
                 } else {
@@ -1275,6 +1285,41 @@ impl Ui {
             }
             _ => {}
         }
+    }
+
+    /// The `$prefix` being typed at the end of the input, if any.
+    fn skill_token(&self) -> Option<&str> {
+        let tok = self.input.text.rsplit(' ').next()?;
+        tok.starts_with('$').then_some(tok)
+    }
+
+    /// Suggestions under the input: slash commands, else skills matching a `$prefix`.
+    fn hints(&self) -> Vec<(String, String)> {
+        let slash = self.cmd_matches();
+        if !slash.is_empty() {
+            return slash.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
+        }
+        let Some(tok) = self.skill_token() else { return vec![] };
+        let prefix = tok[1..].to_lowercase();
+        self.app
+            .rt
+            .skills
+            .iter()
+            .filter(|s| s.name.to_lowercase().starts_with(&prefix))
+            .map(|s| {
+                let d = if s.description.is_empty() { s.scope.label().to_string() } else { s.description.clone() };
+                (format!("${}", s.name), d)
+            })
+            .collect()
+    }
+
+    /// Put a picked hint into the input: `$skill` replaces the token being typed, `/cmd` replaces the line.
+    fn complete(&mut self, hint: &str) {
+        let base = match self.skill_token() {
+            Some(tok) => self.input.text[..self.input.text.len() - tok.len()].to_string(),
+            None => String::new(),
+        };
+        self.input.set(format!("{base}{hint} "));
     }
 
     /// Commands matching a `/partial` input (empty when not typing a command).
@@ -1807,7 +1852,7 @@ impl Ui {
         }
 
         // slash-command hints
-        let m = self.cmd_matches();
+        let m = self.hints();
         if self.overlay.is_none() && !m.is_empty() {
             {
                 let sel = self.cmd_sel.min(m.len() - 1);

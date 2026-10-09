@@ -187,7 +187,7 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 | `alt+pgdn` / `alt+pgup` | onglet suivant / précédent |
 | clic sur un onglet · sur `×` · sur `+` | aller à / fermer / ouvrir un onglet |
 
-`/` affiche les commandes : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
+`/` affiche les commandes et `$` les skills : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` incomplet, `enter` complète d'abord). Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
 Commandes : `/new /resume /session /tree /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
 
