@@ -1,0 +1,135 @@
+# θ theta
+
+Harness de coding agent léger en Rust, dans l'esprit de [pi](https://github.com/earendil-works/pi) : petit, configurable, économe en tokens.
+
+## Installation
+
+```bash
+cargo install --path .
+theta login            # choisir un provider (abonnement OAuth ou clé API)
+theta                  # TUI plein écran
+theta -p "explique src/main.rs"   # mode print (non interactif)
+```
+
+Options : `-c` reprend la dernière session du dossier, `-r <id>` une session précise, `-m provider/model`, `-a <agent>`.
+Sous-commandes : `login [provider]`, `logout <provider>`, `models [filtre]`, `agents`, `refresh` (catalogue models.dev).
+
+## Providers
+
+| Accès | Providers |
+|---|---|
+| Abonnement (OAuth) | Anthropic Claude Pro/Max, ChatGPT (Codex), GitHub Copilot |
+| Clé API | Anthropic, OpenAI, Google Gemini, OpenRouter, Groq, xAI, Mistral, DeepSeek, Cerebras, Together, Fireworks, Z.ai, Moonshot, Hugging Face, OpenCode Zen, OpenCode Go, OpenCode Go (Anthropic), Ollama Cloud |
+| Local | Ollama, LM Studio, ou tout endpoint OpenAI-compatible |
+
+Connexion : `/login` dans la TUI (ou `theta login`) → provider → méthode (abonnement ou clé API). OpenAI regroupe l'abonnement ChatGPT (Codex) et la clé API. Pour l'OAuth, le navigateur s'ouvre ; sinon colle le code dans la fenêtre (`ctrl+y` copie l'URL). Aussi : variables d'env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, …). Les identifiants sont stockés dans `~/.theta/auth.json` (mode 0600).
+Catalogue des modèles (contexte, prix) : [models.dev](https://models.dev), mis en cache 24 h.
+
+Provider personnalisé dans `settings.toml` :
+
+```toml
+[providers.local]
+api = "openai-chat"          # openai-chat | openai-responses | anthropic | google
+base_url = "http://localhost:8080/v1"
+api_key_env = "LOCAL_KEY"    # ou api_key = "..."
+models = ["qwen3-coder"]
+context = 128000
+```
+
+## Dossiers `.theta`
+
+```
+~/.theta/                     global
+  settings.toml               réglages
+  SOUL.md                     consignes appliquées à TOUS les agents
+  agents/Build.md             agent par défaut
+  agents/Plan.md              clarifie et planifie, sans coder, puis passe la main à Build
+  agents/*.md                 agents globaux  → affichés « (global) »
+  sessions/<projet>/*.jsonl   sessions
+<projet>/.theta/              local au projet (racine = dossier contenant .theta ou .git)
+  settings.toml               surcharge les réglages globaux
+  SOUL.md                     ajouté après le SOUL global
+  agents/*.md                 agents locaux   → affichés « (local) », prioritaires sur un global du même nom
+```
+
+Le prompt système = SOUL global + SOUL projet + prompt de l'agent + environnement + `AGENTS.md`/`CLAUDE.md` du projet.
+
+### Agent
+
+```markdown
+---
+name: Review
+description: Revue de code stricte
+model: anthropic/claude-opus-5-5     # optionnel
+effort: high                         # optionnel
+subagent_model: anthropic/claude-haiku-5-5   # optionnel, modèle des subagents lancés par cet agent
+tools: read, grep, find, ls, task    # optionnel, défaut = tous
+---
+Tu relis le code et listes les bugs, du plus grave au moins grave.
+```
+
+Modèle et effort par agent, dans `settings.toml` (global ou projet) :
+
+```toml
+[agents.Build]
+model = "anthropic/claude-haiku-5-5"
+effort = "medium"
+
+[agents.Plan]
+model = "anthropic/claude-sonnet-5-5"
+effort = "high"
+```
+
+Ces valeurs se règlent aussi dans `/settings`, onglet **Models** (modèle et effort par agent, modèles compaction / titre / subagent). `tab` change d'onglet dans ce panneau.
+
+Priorité : `-m` / `--agent` en ligne de commande > `[agents.<nom>]` > frontmatter de l'agent > `model` / `effort` globaux. Valable au démarrage, au changement d'agent (`tab`) et pour les subagents lancés par `task` avec `agent`.
+
+## Tools
+
+| Tool | Rôle |
+|---|---|
+| `read` `write` `edit` `ls` `find` `grep` | fichiers ; `grep`/`find` respectent `.gitignore`, résultats groupés |
+| `bash` | shell ; commandes réécrites via **rtk** si installé, sortie compactée (ANSI, répétitions, troncature au milieu + log complet sauvegardé) |
+| `todo` | liste de tâches affichée au-dessus de la saisie |
+| `web_search` | Exa MCP par défaut (sans clé) ; `firecrawl` / `brave` / `tavily` / `duckduckgo` ; repli DuckDuckGo |
+| `web_fetch` | page → texte compact |
+| `task` | subagent à contexte neuf, renvoie seulement son rapport final |
+| `handoff` | propose de passer à un autre agent (Plan → Build) ; si oui, Build enchaîne dans la même conversation. Réservé aux agents qui le listent dans `tools` |
+| `ask` | pose une question à l'utilisateur : choix multiple, oui/non ou texte libre (réponse libre toujours possible) |
+
+Économies de tokens : relecture d'un fichier inchangé → simple notice ; chemins relatifs ; diff visibles dans l'UI mais pas renvoyés au modèle ; prompt caching Anthropic (tools, system, 2 derniers tours).
+
+## Contexte
+
+Compaction automatique au-delà de `compaction.threshold` (80 % par défaut) de la fenêtre : les anciens tours sont résumés par le **modèle de compaction**, les ~20k derniers tokens sont gardés tels quels. `/compact` force. Chaque tâche a son modèle :
+
+```toml
+[models]
+compaction = "anthropic/claude-haiku-5-5"
+title = "anthropic/claude-haiku-5-5"   # nommage auto des sessions
+subagent = ""                          # "" = modèle principal
+```
+
+Un modèle de tâche sans identifiants retombe sur le modèle principal.
+
+## TUI
+
+| Touche | Action |
+|---|---|
+| `enter` / `alt+enter`, `ctrl+j` | envoyer / nouvelle ligne |
+| `esc` | interrompre l'agent |
+| `tab` / `shift+tab` | agent suivant / effort suivant |
+| `ctrl+p` `ctrl+t` `ctrl+r` | modèle · arbre de conversation · sessions |
+| `ctrl+o` | sortie **full** (tools, thinking) ↔ **compact** (réponse finale + ligne `n read · n write · n cmd · n tools`) |
+| `pgup` `pgdn` `shift+↑↓` molette | défiler |
+
+`/` affiche les commandes : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
+
+Commandes : `/new /resume /tree /model /agent /effort /settings /verbose /compact /title /login /logout /copy /help /quit`.
+
+**Arbre** (`ctrl+t`) : une ligne par message utilisateur, les branches n'apparaissent qu'aux bifurcations. `enter` reprend après ce tour (le prochain message crée une branche), `e` réédite le message pour créer une branche sœur. Tout est conservé dans le fichier de session (JSONL append-only, chaque entrée pointe vers son parent).
+
+## Notes
+
+- L'OAuth Claude Pro/Max reprend le flux de pi (identité Claude Code). Vérifie que cet usage respecte les conditions d'Anthropic pour ton compte.
+- Les modèles Claude 4.6+ utilisent le thinking `adaptive` et `output_config.effort` ; les blocs de thinking ne sont renvoyés qu'au modèle qui les a produits.
