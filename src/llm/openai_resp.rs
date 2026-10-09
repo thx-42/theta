@@ -85,6 +85,10 @@ pub async fn stream(
             .header("originator", "theta")
             .header("session_id", req.session_id);
     }
+    if p.id.starts_with("opencode") {
+        // OpenCode Go rejects requests without a session id (400 MissingSessionID).
+        rb = rb.header("x-opencode-session", req.session_id);
+    }
     let resp = send(rb.json(&body)).await?;
     let mut sse = Sse::new(resp);
 

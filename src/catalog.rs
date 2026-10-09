@@ -50,9 +50,13 @@ pub struct Provider {
 }
 
 impl Provider {
-    /// Wire format for one model. OpenCode Go serves MiniMax over Anthropic Messages and the others over chat completions.
+    /// Wire format for one model. OpenCode Go serves MiniMax over Anthropic Messages, Muse over Responses, the others over chat completions.
     pub fn api_for(&self, model: &str) -> Api {
-        if self.id == "opencode-go" && model.starts_with("minimax") { Api::Anthropic } else { self.api }
+        match self.id.as_str() {
+            "opencode-go" if model.starts_with("minimax") => Api::Anthropic,
+            "opencode-go" if model.starts_with("muse-") => Api::OpenAiResponses,
+            _ => self.api,
+        }
     }
 }
 

@@ -1,9 +1,13 @@
 //! `theta update`: look for a newer GitHub release, verify its checksum and replace this binary.
 
+use crate::proto::{Push, Req, socket_path};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// Release tag baked in by CI (`v<version>-<run number>`); absent in local builds.
 const TAG: Option<&str> = option_env!("THETA_TAG");
@@ -122,6 +126,50 @@ fn install(archive: &[u8], exe: &std::path::Path) -> Result<()> {
     result
 }
 
+/// True when the daemon answers `Busy(false)`. An old daemon ignores the request and never answers.
+async fn daemon_idle() -> Result<bool> {
+    let mut sock = UnixStream::connect(socket_path()).await?;
+    sock.write_all(format!("{}\n", serde_json::to_string(&Req::Busy)?).as_bytes()).await?;
+    let line = BufReader::new(sock).lines().next_line().await?.context("daemon closed the connection")?;
+    Ok(matches!(serde_json::from_str::<Push>(&line)?, Push::Busy(false)))
+}
+
+/// Ask the daemon to quit and wait until its socket is gone.
+async fn stop_daemon() -> Result<()> {
+    let mut sock = UnixStream::connect(socket_path()).await?;
+    sock.write_all(format!("{}\n", serde_json::to_string(&Req::Shutdown)?).as_bytes()).await?;
+    drop(sock);
+    for _ in 0..50 {
+        if UnixStream::connect(socket_path()).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("daemon did not stop")
+}
+
+/// Restart the running daemon on the new binary when no task runs; otherwise warn that it must be done by hand.
+async fn restart_daemon(ink: &Ink) {
+    // Not running: the next use starts the new binary.
+    if UnixStream::connect(socket_path()).await.is_err() {
+        return;
+    }
+    if !matches!(tokio::time::timeout(Duration::from_secs(2), daemon_idle()).await, Ok(Ok(true))) {
+        ink.say("=o.o=", "the background daemon may be busy, so it still runs the old version: `theta daemon stop` restarts it (running agents are cut)");
+        return;
+    }
+    let restarted: Result<()> = async {
+        stop_daemon().await?;
+        crate::client::connect().await?;
+        Ok(())
+    }
+    .await;
+    match restarted {
+        Ok(()) => ink.say("=^.^=", "background daemon restarted on the new version"),
+        Err(e) => ink.say("=o.o=", &format!("cannot restart the background daemon ({e:#}): run `theta daemon stop`")),
+    }
+}
+
 pub async fn run(check_only: bool, force: bool) -> Result<()> {
     let ink = Ink(std::io::stdout().is_terminal());
     println!("{}", ink.paint("35;1", ART));
@@ -169,9 +217,7 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
         let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
     }
     ink.cat("^o^", &format!("updated to {}", ink.paint("1", &latest)));
-    if tokio::net::UnixStream::connect(crate::proto::socket_path()).await.is_ok() {
-        ink.say("=o.o=", "the background daemon still runs the old version: `theta daemon stop` restarts it (running agents are cut)");
-    }
+    restart_daemon(&ink).await;
     Ok(())
 }
 
