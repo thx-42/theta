@@ -1,5 +1,12 @@
 # Changelog
 
+## Non publié
+
+### Nouveautés
+- **Jobs de fond.** `bash` et `task` acceptent `background: true` et rendent la main avec un id. Nouveaux outils `job_output` et `job_kill`. `/jobs` (ou `alt+j`) liste les jobs de la session, affiche la sortie en direct (`entrée`) et arrête un job (`k`) pendant que l'agent continue. La fin d'un job est lue par l'agent à son prochain step.
+- **Linter de fond.** Linters embarqués par langage (ruff, eslint, clippy, go vet, shellcheck…), complétés ou remplacés par `[linters]`. `/linters` indique ceux qui sont installés ; un linter absent est signalé dans `/jobs`. Le linter du fichier tourne en fond quand l'agent passe à un autre fichier ou termine son tour, et n'envoie un retour que s'il a quelque chose à dire.
+- **Hooks de message.** Section `[hooks]` : `pre_message` (peut rejeter le message ou ajouter du contexte) et `post_message` (à la fin du run).
+
 ## 0.2.0
 
 ### Nouveautés

@@ -1,6 +1,7 @@
 //! Wire protocol between the TUI client and the background daemon: one JSON value per line over a unix socket.
 
 use crate::agent::Event;
+use crate::jobs::JobInfo;
 use crate::session::Entry;
 use crate::tools::Todo;
 use crate::types::Block;
@@ -49,6 +50,10 @@ pub enum Req {
     McpStatus,
     /// Is an agent run active in any session? Answered with `Push::Busy`.
     Busy,
+    /// Stop a background job of the attached session.
+    JobKill(String),
+    /// Ask for a job's output; answered with `Push::JobOutput`.
+    JobOutput(String),
     Shutdown,
 }
 
@@ -64,6 +69,8 @@ pub struct Snapshot {
     /// Events of the step in flight (streamed text, tool progress, open questions).
     pub replay: Vec<Event>,
     pub todos: Vec<Todo>,
+    #[serde(default)]
+    pub jobs: Vec<JobInfo>,
 }
 
 /// Daemon → client.
@@ -77,4 +84,7 @@ pub enum Push {
     Notice(String),
     Err(String),
     Busy(bool),
+    /// Background jobs of the session changed (started, ended or killed).
+    Jobs(Vec<JobInfo>),
+    JobOutput { id: String, text: String },
 }

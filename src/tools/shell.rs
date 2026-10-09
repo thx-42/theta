@@ -67,19 +67,13 @@ pub fn compact(raw: &str) -> String {
     result.trim_end().to_string()
 }
 
-pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
-    let cmd = s(args, "command").context("command required")?.to_string();
-    let timeout = n(args, "timeout").unwrap_or(ctx.settings.tools.bash_timeout).max(1);
-    let use_rtk = match ctx.settings.tools.rtk.as_str() {
-        "off" => false,
-        _ => rtk_available(),
-    };
-    let effective = if use_rtk { rtk_rewrite(&cmd).await.unwrap_or(cmd.clone()) } else { cmd.clone() };
+/// Spawn `cmd` in bash with stderr merged into a piped stdout. The child dies with its handle.
+fn spawn_sh(cmd: &str, cwd: &std::path::Path) -> std::io::Result<tokio::process::Child> {
     let shell = if std::path::Path::new("/bin/bash").exists() { "/bin/bash" } else { "sh" };
-    let mut child = Command::new(shell)
+    Command::new(shell)
         .arg("-c")
-        .arg(format!("exec 2>&1\n{effective}"))
-        .current_dir(&ctx.cwd)
+        .arg(format!("exec 2>&1\n{cmd}"))
+        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .env("TERM", "dumb")
@@ -87,7 +81,57 @@ pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+}
+
+/// Run `cmd`, stream its output into `out`, return the exit code (-1 on spawn failure or timeout).
+pub async fn run_into(cmd: &str, cwd: &std::path::Path, out: &crate::jobs::Out, timeout: Option<Duration>) -> i32 {
+    use tokio::io::AsyncReadExt;
+    let mut child = match spawn_sh(cmd, cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            out.push(&format!("cannot start: {e}\n"));
+            return -1;
+        }
+    };
+    let mut stdout = child.stdout.take().unwrap();
+    let work = async {
+        let mut buf = [0u8; 4096];
+        while let Ok(k) = stdout.read(&mut buf).await {
+            if k == 0 {
+                break;
+            }
+            out.push(&String::from_utf8_lossy(&buf[..k]));
+        }
+        child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1)
+    };
+    match timeout {
+        Some(t) => tokio::time::timeout(t, work).await.unwrap_or_else(|_| {
+            out.push(&format!("\ntimed out after {}s\n", t.as_secs()));
+            -1
+        }),
+        None => work.await,
+    }
+}
+
+async fn effective(cmd: &str, ctx: &ToolCtx) -> String {
+    let use_rtk = match ctx.settings.tools.rtk.as_str() {
+        "off" => false,
+        _ => rtk_available(),
+    };
+    if use_rtk { rtk_rewrite(cmd).await.unwrap_or(cmd.to_string()) } else { cmd.to_string() }
+}
+
+pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
+    let cmd = s(args, "command").context("command required")?.to_string();
+    let effective = effective(&cmd, ctx).await;
+    if super::b(args, "background") {
+        let (run, cwd, timeout) = (effective.clone(), ctx.cwd.clone(), n(args, "timeout").map(Duration::from_secs));
+        let id = ctx.jobs.spawn(crate::jobs::Kind::Shell, cmd.clone(), false, move |out| Box::pin(async move { run_into(&run, &cwd, &out, timeout).await }));
+        return Ok(ToolOut::ok(format!("started background job {id}: {cmd}\nIts end is reported in a later message; use job_output to look at it, job_kill to stop it.")));
+    }
+    let timeout = n(args, "timeout").unwrap_or(ctx.settings.tools.bash_timeout).max(1);
+    let mut child = spawn_sh(&effective, &ctx.cwd)?;
     let stdout = child.stdout.take().unwrap();
     let read = async {
         use tokio::io::AsyncReadExt;

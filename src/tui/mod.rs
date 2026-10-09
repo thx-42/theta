@@ -11,6 +11,7 @@ use base64::Engine;
 use crate::client::Remote;
 use tabs::{Tab, TabStatus, View};
 use crate::config;
+use crate::jobs::{JobInfo, Kind as JobKind, Status as JobStatus};
 use crate::proto::{Push, Req, Snapshot, Target as Where};
 use crate::session::{self, Kind, Session};
 use crate::tools::{self, Kind as ToolKind, Todo};
@@ -79,11 +80,16 @@ const PULSE: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", 
 const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Computing", "Brewing", "Forging", "Weaving", "Crafting", "Mulling"];
 
 
+/// Main actions behind ctrl+p, in menu order. Descriptions come from COMMANDS.
+const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/compact", "/verbose", "/copy", "/usage", "/settings", "/login", "/help", "/quit"];
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/resume", "open a previous session"),
     ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
+    ("/linters", "linters per language and whether they are installed"),
+    ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
     ("/agent", "change agent"),
@@ -205,6 +211,8 @@ enum Purpose {
     LoginMethod,
     Logout,
     Effort,
+    /// ctrl+p menu: the value is the command to run.
+    Actions,
 }
 
 struct PickItem {
@@ -279,8 +287,18 @@ enum LoginMsg {
     Report(Vec<String>),
 }
 
+/// `/jobs`: background shells, linters and subagents; enter shows one job's live output.
+struct JobsView {
+    sel: usize,
+    /// Job whose output is shown.
+    view: Option<String>,
+    text: String,
+    polled: Instant,
+}
+
 enum Overlay {
     Pick(Picker),
+    Jobs(JobsView),
     Tree(tree::TreeView),
     Settings(SettingsView),
     Help,
@@ -410,6 +428,7 @@ struct Ui {
     status: String,
     overlay: Option<Overlay>,
     todos: Vec<Todo>,
+    jobs: Vec<JobInfo>,
     cost: f64,
     ctx_tokens: u64,
     quit_armed: Option<Instant>,
@@ -848,9 +867,26 @@ impl Ui {
             "/usage" => self.report("Usage", |rt| Box::pin(async move { crate::usage::usage(&rt).await })),
             "/stats" => self.report("Stats", |rt| Box::pin(async move { tokio::task::spawn_blocking(move || crate::usage::stats(&rt.catalog)).await.unwrap_or_default() })),
             "/copy" => self.copy_last(),
+            "/jobs" => self.open_jobs(),
+            "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
             _ => self.notify(format!("unknown command {cmd}")),
+        }
+    }
+
+    fn open_jobs(&mut self) {
+        self.overlay = Some(Overlay::Jobs(JobsView { sel: 0, view: None, text: String::new(), polled: Instant::now() }));
+    }
+
+    /// Refresh the output shown in `/jobs` about once a second.
+    fn poll_job(&mut self) {
+        if let Some(Overlay::Jobs(v)) = &mut self.overlay
+            && let Some(id) = &v.view
+            && v.polled.elapsed() >= Duration::from_secs(1)
+        {
+            v.polled = Instant::now();
+            self.remote.send(Req::JobOutput(id.clone()));
         }
     }
 
@@ -995,6 +1031,11 @@ impl Ui {
         };
         let sel = items.iter().position(|i| i.value == current).unwrap_or(0);
         self.overlay = Some(Overlay::Pick(Picker { title: format!("{title}  (type to filter)"), items, filter: String::new(), sel, purpose: Purpose::Model(target) }));
+    }
+
+    fn open_actions(&mut self) {
+        let items = ACTIONS.iter().map(|c| item(*c, COMMANDS.iter().find(|(n, _)| n == c).map_or("", |(_, d)| *d), *c)).collect();
+        self.overlay = Some(Overlay::Pick(Picker { title: "Actions  (type to filter)".into(), items, filter: String::new(), sel: 0, purpose: Purpose::Actions }));
     }
 
     fn open_agents(&mut self) {
@@ -1216,6 +1257,7 @@ impl Ui {
             }
             Purpose::Logout => self.logout(&value),
             Purpose::Effort => self.set_effort(&value),
+            Purpose::Actions => self.command(&value),
         }
     }
 
@@ -1258,6 +1300,7 @@ impl Ui {
             KeyCode::Char('n') if alt => self.new_tab(),
             KeyCode::Char('w') if alt => self.close_tab(),
             KeyCode::Char('b') if alt => self.toggle_tab_bar(),
+            KeyCode::Char('j') if alt => self.open_jobs(),
             KeyCode::PageDown if alt => self.step_tab(1),
             KeyCode::PageUp if alt => self.step_tab(-1),
             KeyCode::Up | KeyCode::Down if !hints.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1293,7 +1336,7 @@ impl Ui {
             }
             KeyCode::Char('o') if ctrl => self.toggle_verbose(),
             KeyCode::Char('t') if ctrl => self.open_tree(),
-            KeyCode::Char('p') if ctrl => self.open_models(Target::Main),
+            KeyCode::Char('p') if ctrl => self.open_actions(),
             KeyCode::Char('r') if ctrl => self.open_sessions(),
             KeyCode::Char('l') if ctrl => self.invalidate_all(),
             KeyCode::Char('w') if ctrl => self.input.delete_word(),
@@ -1480,6 +1523,30 @@ impl Ui {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
             Overlay::Help | Overlay::Report(..) => {}
+            Overlay::Jobs(mut v) => {
+                let viewing = v.view.is_some();
+                match (viewing, k.code) {
+                    (_, KeyCode::Char('k')) => {
+                        if let Some(id) = v.view.clone().or_else(|| self.jobs.get(v.sel).map(|j| j.id.clone())) {
+                            self.remote.send(Req::JobKill(id));
+                        }
+                    }
+                    (true, KeyCode::Esc | KeyCode::Char('q')) => v.view = None,
+                    (false, KeyCode::Esc | KeyCode::Char('q')) => return,
+                    (false, KeyCode::Up) => v.sel = v.sel.saturating_sub(1),
+                    (false, KeyCode::Down) => v.sel = (v.sel + 1).min(self.jobs.len().saturating_sub(1)),
+                    (false, KeyCode::Enter) => {
+                        if let Some(j) = self.jobs.get(v.sel) {
+                            v.view = Some(j.id.clone());
+                            v.text.clear();
+                            v.polled = Instant::now();
+                            self.remote.send(Req::JobOutput(j.id.clone()));
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Jobs(v));
+            }
             Overlay::Ask(mut a) => {
                 let free = a.options.len();
                 match k.code {
@@ -2020,6 +2087,10 @@ impl Ui {
         if !self.verbose() {
             left.push(Span::styled(" · compact", theme::dim()));
         }
+        let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
+        if live > 0 {
+            left.push(Span::styled(format!(" · ⚙ {live}"), theme::accent()));
+        }
         let ctx_max = self.model_ctx();
         let pct = if ctx_max > 0 { self.ctx_tokens * 100 / ctx_max } else { 0 };
         let title = self.app.session.lock().unwrap().title.clone().unwrap_or_default();
@@ -2093,13 +2164,14 @@ impl Ui {
         let w = (area.width.saturating_sub(4)).min(100);
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
-            Overlay::Help => COMMANDS.len() + 17,
-            Overlay::Report(_, l) => l.len(),
+            Overlay::Help => COMMANDS.len() + 18,
+            Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
+            Overlay::Report(_, l) => l.len() + 2,
             Overlay::Pick(p) => p.rows().max(1) + 1,
-            Overlay::Tree(t) => t.rows.len(),
-            Overlay::Settings(v) => self.settings_rows(v.tab).len() + 3,
-            Overlay::Ask(a) => wrapped_rows(&a.question, iw) + a.options.len() + 3,
-            Overlay::Login(v) => v.lines.iter().map(|l| wrapped_rows(l, iw) + 1).sum::<usize>() + 2,
+            Overlay::Tree(t) => t.rows.len() + 2,
+            Overlay::Settings(v) => self.settings_rows(v.tab).len() + 6,
+            Overlay::Ask(a) => wrapped_rows(&a.question, iw) + a.options.len() + 4,
+            Overlay::Login(v) => v.lines.iter().map(|l| wrapped_rows(l, iw) + 1).sum::<usize>() + 4,
         } as u16;
         let min_h = if matches!(ov, Overlay::Pick(_)) { 12 } else { 5 };
         let h = area.height.saturating_sub(4).min(content.max(min_h) + 2);
@@ -2116,18 +2188,58 @@ impl Ui {
                 let on_free = a.sel == a.options.len();
                 let text = if a.input.text.is_empty() { Span::styled(if a.options.is_empty() { "type your answer" } else { "or type your own answer" }, theme::dim()) } else { Span::raw(a.input.text.clone()) };
                 l.push(Line::from(vec![Span::styled(format!(" {} ✎ ", if on_free { "›" } else { " " }), theme::accent()), text.patch_style(if on_free { theme::sel() } else { Style::default() })]));
-                let b = block("θ question").title_bottom(Line::from(Span::styled(" ↑↓ select · enter answer · 1-9 pick · esc skip ", theme::dim())));
-                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(b), r);
+                l.push(Line::default());
+                l.push(hint(" ↑↓ select · enter answer · 1-9 pick · esc skip "));
+                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(block("θ question")), r);
                 if on_free {
                     let row = wrapped_rows(&a.question, iw) + 1 + a.options.len();
                     let col = 5 + a.input.text[..a.input.cur].width();
                     f.set_cursor_position((r.x + 1 + col as u16, r.y + 1 + row as u16));
                 }
             }
+            Overlay::Jobs(v) => {
+                let mut l = Vec::new();
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                if let Some(id) = &v.view {
+                    let rows = h.saturating_sub(4) as usize;
+                    let lines: Vec<&str> = v.text.lines().collect();
+                    l.extend(lines[lines.len().saturating_sub(rows)..].iter().map(|x| Line::from(x.to_string())));
+                    let label = self.jobs.iter().find(|j| &j.id == id).map(|j| j.label.chars().take(60).collect::<String>()).unwrap_or_default();
+                    f.render_widget(Paragraph::new(l).block(block(&format!("θ job {id} · {label}")).title_bottom(hint(" k stop · esc back "))), r);
+                } else {
+                    for (i, j) in self.jobs.iter().enumerate() {
+                        let (mark, st) = match j.status {
+                            JobStatus::Running => ("●", theme::accent()),
+                            JobStatus::Done(0) => ("✓", theme::dim()),
+                            JobStatus::Done(_) => ("✗", theme::err()),
+                            JobStatus::Killed => ("■", theme::dim()),
+                            JobStatus::Missing => ("✗", theme::err()),
+                        };
+                        let kind = match j.kind {
+                            JobKind::Shell => "shell",
+                            JobKind::Lint => "lint ",
+                            JobKind::Agent => "agent",
+                        };
+                        let secs = j.ended.unwrap_or(now).saturating_sub(j.started);
+                        let sel = if i == v.sel { theme::sel() } else { Style::default() };
+                        let label: String = j.label.chars().take(iw.saturating_sub(24)).collect();
+                        l.push(Line::from(vec![
+                            Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()),
+                            Span::styled(format!("{mark} "), st),
+                            Span::styled(format!("{}  {kind}  {secs:>4}s  {label}", j.id), sel),
+                        ]));
+                    }
+                    if l.is_empty() {
+                        l.push(Line::from(Span::styled(" no background jobs", theme::dim())));
+                    }
+                    f.render_widget(Paragraph::new(l).block(block("θ jobs").title_bottom(hint(" ↑↓ select · enter output · k stop · esc close "))), r);
+                }
+            }
             Overlay::Report(title, lines) => {
-                let l = lines.iter().map(|x| Line::from(Span::styled(x.clone(), if x.starts_with(' ') || x.starts_with("loading") { Style::default() } else { theme::accent().add_modifier(Modifier::BOLD) }))).collect::<Vec<_>>();
-                let b = block(title).title_bottom(Line::from(Span::styled(" any key to close ", theme::dim())));
-                f.render_widget(Paragraph::new(l).block(b), r);
+                let mut l = lines.iter().map(|x| Line::from(Span::styled(x.clone(), if x.starts_with(' ') || x.starts_with("loading") { Style::default() } else { theme::accent().add_modifier(Modifier::BOLD) }))).collect::<Vec<_>>();
+                l.push(Line::default());
+                l.push(hint(" any key to close "));
+                f.render_widget(Paragraph::new(l).block(block(title)), r);
             }
             Overlay::Login(v) => {
                 let mut l = Vec::new();
@@ -2138,9 +2250,10 @@ impl Ui {
                 }
                 let (label, shown) = if v.key { ("API key › ", "•".repeat(v.input.text.chars().count())) } else { ("paste code › ", v.input.text.clone()) };
                 l.push(Line::from(vec![Span::styled(label, theme::accent()), Span::raw(shown.clone())]));
-                let hint = if v.key { " enter save · esc cancel " } else { " waiting for the browser · enter submit pasted code · ctrl+y copy URL · esc cancel " };
-                let b = block(&v.title).title_bottom(Line::from(Span::styled(hint, theme::dim())));
-                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(b), r);
+                let keys = if v.key { " enter save · esc cancel " } else { " waiting for the browser · enter submit pasted code · ctrl+y copy URL · esc cancel " };
+                l.push(Line::default());
+                l.push(hint(keys));
+                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(block(&v.title)), r);
                 let row: usize = v.lines.iter().map(|x| wrapped_rows(x, iw) + 1).sum();
                 f.set_cursor_position((r.x + 1 + (label.width() + shown.width()) as u16, r.y + 1 + row as u16));
             }
@@ -2150,9 +2263,10 @@ impl Ui {
                     ("enter", "send · alt+enter / ctrl+j newline"),
                     ("esc", "interrupt the agent"),
                     ("tab / shift+tab", "next agent / cycle effort"),
-                    ("ctrl+p", "model"),
+                    ("ctrl+p", "actions menu"),
                     ("ctrl+t", "conversation tree (fork)"),
                     ("ctrl+r", "resume a session"),
+                    ("alt+j", "background jobs (shells, linters, subagents)"),
                     ("alt+n / alt+w", "new / close session tab"),
                     ("alt+1 … alt+9", "go to tab"),
                     ("alt+pgdn / alt+pgup", "next / previous tab"),
@@ -2220,9 +2334,9 @@ impl Ui {
                         Span::styled(reply, st.patch(theme::dim())),
                     ]));
                 }
-                let mut b = block("Conversation tree");
-                b = b.title_bottom(Line::from(Span::styled(" ↑↓ move · enter continue from here · e edit & branch · esc close ", theme::dim())));
-                f.render_widget(Paragraph::new(l).block(b), r);
+                l.push(Line::default());
+                l.push(hint(" ↑↓ move · enter continue from here · e edit & branch · esc close "));
+                f.render_widget(Paragraph::new(l).block(block("Conversation tree")), r);
             }
             Overlay::Settings(view) => {
                 let tab = |t: SettingsTab, label: &str| Span::styled(format!(" {label} "), if view.tab == t { theme::sel() } else { theme::dim() });
@@ -2233,11 +2347,17 @@ impl Ui {
                 }
                 l.push(Line::default());
                 l.push(Line::from(Span::styled(format!(" saved to {}", config::global_settings_path().display()), theme::dim())));
-                let b = block("Settings").title_bottom(Line::from(Span::styled(" tab next tab · ↑↓ select · enter/←→ change · esc close ", theme::dim())));
-                f.render_widget(Paragraph::new(l).block(b), r);
+                l.push(Line::default());
+                l.push(hint(" tab next tab · ↑↓ select · enter/←→ change · esc close "));
+                f.render_widget(Paragraph::new(l).block(block("Settings")), r);
             }
         }
     }
+}
+
+/// Key hint drawn as the last line of an overlay body, dimmed.
+fn hint(keys: &'static str) -> Line<'static> {
+    Line::from(Span::styled(keys, theme::dim()))
 }
 
 /// Rows `text` takes when wrapped at `width` (approximate: by display width, per line).
@@ -2335,6 +2455,7 @@ impl Ui {
         swap(&mut self.counts, &mut v.counts);
         swap(&mut self.status, &mut v.status);
         swap(&mut self.todos, &mut v.todos);
+        swap(&mut self.jobs, &mut v.jobs);
         swap(&mut self.cost, &mut v.cost);
         swap(&mut self.ctx_tokens, &mut v.ctx_tokens);
         swap(&mut self.verb, &mut v.verb);
@@ -2634,6 +2755,7 @@ impl Ui {
         *self.app.session.lock().unwrap() = Session::mirror(snap.entries);
         self.apply_meta(&snap.agent, snap.model, snap.effort);
         self.todos = snap.todos;
+        self.jobs = snap.jobs;
         self.asks.clear();
         self.overlay = None;
         self.running = false;
@@ -2675,6 +2797,14 @@ impl Ui {
             Push::Notice(n) => self.push(Item::Info(n)),
             Push::Err(e) => self.push(Item::Error(e)),
             Push::Busy(_) => {}
+            Push::Jobs(l) => self.jobs = l,
+            Push::JobOutput { id, text } => {
+                if let Some(Overlay::Jobs(v)) = &mut self.overlay
+                    && v.view.as_deref() == Some(&id)
+                {
+                    v.text = text;
+                }
+            }
         }
     }
 }
@@ -2710,6 +2840,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         status: String::new(),
         overlay: None,
         todos: vec![],
+        jobs: snap.jobs.clone(),
         cost: 0.0,
         ctx_tokens: 0,
         quit_armed: None,
@@ -2793,6 +2924,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {
                     ui.spin += 1;
                 }
+                ui.poll_job();
             }
         }
         if ui.overlay.is_none()

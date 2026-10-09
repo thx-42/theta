@@ -55,6 +55,9 @@ pub struct Settings {
     /// MCP servers, keyed by name (`[mcp.<name>]`)
     pub mcp: BTreeMap<String, McpServer>,
     pub providers: BTreeMap<String, CustomProvider>,
+    pub hooks: Hooks,
+    /// Linter command per file extension (`[linters]`, e.g. `py = "ruff check {file}"`).
+    pub linters: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -74,6 +77,8 @@ impl Default for Settings {
             skills: SkillSettings::default(),
             mcp: BTreeMap::new(),
             providers: BTreeMap::new(),
+            hooks: Hooks::default(),
+            linters: BTreeMap::new(),
         }
     }
 }
@@ -83,6 +88,16 @@ impl Settings {
     pub fn agent(&self, name: &str) -> Option<&AgentSettings> {
         self.agents.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
     }
+}
+
+/// Shell commands run around each user message; see `hooks.rs`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hooks {
+    /// Before the message reaches the agent: text on stdin, exit != 0 rejects it, stdout is added as context.
+    pub pre_message: Vec<String>,
+    /// After the agent finished: its last reply on stdin, output ignored.
+    pub post_message: Vec<String>,
 }
 
 /// Default model and effort for one agent. Empty string = unset.
@@ -309,6 +324,17 @@ auto = []                # always injected, e.g. ["caveman", "ponytail"]
 # [mcp.notion]
 # url = "https://mcp.notion.com/mcp"
 # headers = { Authorization = "Bearer ${NOTION_TOKEN}" }   # optional static auth
+
+# Shell commands around each message. pre: message on stdin, exit != 0 rejects it, stdout is added as context.
+# post: last reply on stdin. Env: THETA_SESSION, THETA_CWD, THETA_STATUS (post).
+# [hooks]
+# pre_message = ["./scripts/check-message.sh"]
+# post_message = ["notify-send theta done"]
+
+# Linter per file extension, run in the background once the agent moves on to another file ({file} = edited path).
+# [linters]
+# py = "ruff check {file}"
+# rs = "cargo clippy --quiet"
 
 [web]
 backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo

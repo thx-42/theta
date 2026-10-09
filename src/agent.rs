@@ -70,6 +70,7 @@ pub struct Runtime {
     pub todos: Arc<Mutex<Vec<Todo>>>,
     pub read_cache: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     pub asks: Asks,
+    pub jobs: crate::jobs::Jobs,
 }
 
 /// What one run needs: who answers, with which model, and which tools.
@@ -108,6 +109,7 @@ impl Runtime {
             todos: self.todos.clone(),
             read_cache: self.read_cache.clone(),
             session_id: session_id.to_string(),
+            jobs: self.jobs.clone(),
         }
     }
 
@@ -181,9 +183,13 @@ fn is_overflow(e: &anyhow::Error) -> bool {
 /// Messages the user sent while a run was active; the run moves them into the session at its next safe point.
 pub type Steer = Arc<Mutex<VecDeque<String>>>;
 
-/// Append steered messages as user turns. Returns true when there were any.
-fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runtime) -> bool {
-    let texts: Vec<String> = steer.lock().unwrap().drain(..).collect();
+/// Append steered messages, and the results of background jobs that ended, as user turns. Returns true when there were any.
+/// Jobs belong to the main agent: subagents leave their messages alone.
+fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runtime, depth: u8) -> bool {
+    let mut texts: Vec<String> = steer.lock().unwrap().drain(..).collect();
+    if depth == 0 {
+        texts.extend(rt.jobs.take_pending());
+    }
     for t in &texts {
         let _ = session.lock().unwrap().add_msg(Msg::user(crate::skills::expand(&rt.skills, t)), None);
         let _ = tx.send(Event::User(t.clone()));
@@ -201,7 +207,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let mut overflow_retry = false;
     let mut compact_failed = false;
     loop {
-        drain_steer(&steer, &session, &tx, &rt);
+        drain_steer(&steer, &session, &tx, &rt, turn.depth);
         if rt.settings.compaction.enabled && !compact_failed && compact::needed(&session.lock().unwrap(), &model, &rt.settings) {
             let _ = tx.send(Event::Compacting);
             match compact::run(&rt, &session, &turn.model).await {
@@ -240,11 +246,14 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
         let _ = tx.send(Event::Step { usage: resp.usage.clone(), model: model.key() });
         if calls.is_empty() {
-            if drain_steer(&steer, &session, &tx, &rt) {
+            if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
                 continue;
             }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
                 let _ = tx.send(Event::Error("reply cut off at the output token limit — say \"continue\" to resume".into()));
+            }
+            if turn.depth == 0 {
+                crate::lint::flush(&ctx);
             }
             break;
         }
@@ -252,8 +261,10 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             let (rt, ctx, tx, turn) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone());
             async move {
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "task" {
-                    subagent(&rt, &turn, &id, &args, &tx).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
+                let out = if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    background_subagent(&rt, &turn, &id, &args, &tx)
+                } else if name == "task" {
+                    subagent(&rt, &turn, &id, &args, &tx, None).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if name == "ask" {
                     ask(&rt, &args, &tx).await
                 } else if name.starts_with("mcp__") {
@@ -315,8 +326,30 @@ async fn handoff(rt: &Runtime, args: &Value, tx: &Tx) -> tools::ToolOut {
     out
 }
 
+/// `task` with `background`: run the subagent as a job and return its id at once; the report comes back as a message.
+fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx) -> tools::ToolOut {
+    let label = args.get("description").and_then(|v| v.as_str()).unwrap_or("subagent").to_string();
+    let (rt2, parent, call_id, args, tx) = (rt.clone(), parent.clone(), call_id.to_string(), args.clone(), tx.clone());
+    let id = rt.jobs.spawn(crate::jobs::Kind::Agent, label.clone(), false, move |out| {
+        Box::pin(async move {
+            match subagent(&rt2, &parent, &call_id, &args, &tx, Some(&out)).await {
+                Ok(r) => {
+                    out.push(&r.content);
+                    i32::from(r.is_error)
+                }
+                Err(e) => {
+                    out.push(&format!("{e:#}"));
+                    1
+                }
+            }
+        })
+    });
+    tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use job_output to look at it, job_kill to stop it."))
+}
+
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
-async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx) -> Result<tools::ToolOut> {
+/// `log` (background jobs) receives one line per tool call the subagent makes.
+async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).context("prompt required")?;
     let named = args.get("agent").is_some();
     let agent = match args.get("agent").and_then(|v| v.as_str()) {
@@ -336,10 +369,14 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let turn = Turn { agent, model, effort, depth: parent.depth + 1 };
     let fwd_tx = tx.clone();
     let id = call_id.to_string();
+    let log = log.cloned();
     let forward = tokio::spawn(async move {
         while let Some(ev) = srx.recv().await {
             if matches!(ev, Event::Text(_) | Event::Thinking(_)) {
                 continue;
+            }
+            if let (Some(log), Event::ToolStart { name, .. }) = (&log, &ev) {
+                log.push(&format!("→ {name}\n"));
             }
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
@@ -397,6 +434,7 @@ mod tests {
             todos: Default::default(),
             read_cache: Default::default(),
             asks: Default::default(),
+            jobs: Default::default(),
         }
     }
 

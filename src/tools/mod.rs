@@ -30,6 +30,7 @@ pub struct ToolCtx {
     pub read_cache: Arc<Mutex<HashMap<String, u64>>>,
     /// Session the tools run for; `write_plan` names its file after it.
     pub session_id: String,
+    pub jobs: crate::jobs::Jobs,
 }
 
 pub struct ToolOut {
@@ -79,7 +80,11 @@ pub fn all_defs() -> Vec<ToolDef> {
         def("edit", "Edit a file by exact string replacement. Each `old` must match exactly one location (include enough context). Applies all edits atomically.",
             json!({"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}}},"required":["path","edits"]})),
         def("bash", "Run a shell command in the project directory. Output is compacted (ANSI stripped, repeats collapsed, long output middle-truncated with the full log saved to a file). Common commands (git, cargo, npm, tests...) are routed through rtk filters when available.",
-            json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"seconds"}},"required":["command"]})),
+            json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"seconds"},"background":{"type":"boolean","description":"Return at once with a job id and keep running (dev servers, watchers, long builds). Its end is reported to you in a later message."}},"required":["command"]})),
+        def("job_output", "Show the output of a background job (shell, lint or subagent) by id, and whether it still runs.",
+            json!({"type":"object","properties":{"id":{"type":"string"},"tail":{"type":"integer","description":"only the last N lines"}},"required":["id"]})),
+        def("job_kill", "Stop a running background job by id.",
+            json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
         def("grep", "Search file contents with a regex (respects .gitignore). Results grouped by file.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern"]})),
         def("find", "Find files by glob pattern (respects .gitignore), e.g. `**/*.rs`.",
@@ -105,7 +110,7 @@ pub fn all_defs() -> Vec<ToolDef> {
 
 pub fn task_def(agents: &[String]) -> ToolDef {
     def("task", &format!("Delegate a self-contained task to a subagent with a fresh context. It returns only its final report, which keeps your context small. Use for broad searches, research, or independent work. Agents: {}.", agents.join(", ")),
-        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"}},"required":["description","prompt"]}))
+        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return at once with a job id; the report arrives in a later message and you can keep working"}},"required":["description","prompt"]}))
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -165,12 +170,32 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
         "find" => fs::find(args, ctx),
         "grep" => fs::grep(args, ctx),
         "bash" => shell::bash(args, ctx).await,
+        "job_output" => job_output(args, ctx),
+        "job_kill" => job_kill(args, ctx),
         "todo" => todo(args, ctx),
         "web_search" => web::search(args, ctx).await,
         "web_fetch" => web::fetch(args, ctx).await,
         _ => Err(anyhow::anyhow!("unknown tool `{name}`")),
     };
     res.unwrap_or_else(|e| ToolOut::err(format!("{e:#}")))
+}
+
+fn job_output(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
+    let id = s(args, "id").ok_or_else(|| anyhow::anyhow!("id required"))?;
+    let (text, info) = ctx.jobs.output(id, n(args, "tail").map(|t| t as usize)).ok_or_else(|| anyhow::anyhow!("no job `{id}`"))?;
+    let (text, _) = truncate_middle(&text, ctx.settings.tools.max_lines);
+    let state = match info.status {
+        crate::jobs::Status::Running => "running".to_string(),
+        crate::jobs::Status::Done(c) => format!("exit {c}"),
+        crate::jobs::Status::Killed => "killed".into(),
+        crate::jobs::Status::Missing => "absent".into(),
+    };
+    Ok(ToolOut::ok(format!("[{state}] {}\n{text}", info.label)))
+}
+
+fn job_kill(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
+    let id = s(args, "id").ok_or_else(|| anyhow::anyhow!("id required"))?;
+    Ok(if ctx.jobs.kill(id) { ToolOut::ok(format!("stopped job {id}")) } else { ToolOut::err(format!("no running job `{id}`")) })
 }
 
 fn todo(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
