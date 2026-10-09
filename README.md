@@ -180,10 +180,14 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 | `ctrl+p` `ctrl+t` `ctrl+r` | modèle · arbre de conversation · sessions |
 | `ctrl+o` | sortie **full** (tools, thinking) ↔ **compact** (réponse finale + ligne `n read · n write · n cmd · n tools`) |
 | `pgup` `pgdn` `shift+↑↓` molette | défiler |
+| `ctrl+shift+t` / `ctrl+shift+w` | nouvel onglet de session / fermer l'onglet |
+| `ctrl+tab` `ctrl+shift+tab` (ou `alt+pgdn` `alt+pgup`) | onglet suivant / précédent |
 
 `/` affiche les commandes : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
-Commandes : `/new /resume /tree /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
+Commandes : `/new /resume /session /tree /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
+
+**Onglets** : `/session` ouvre une nouvelle session dans un onglet (même agent et modèle), `/session close` ferme l'onglet courant (un run en cours est interrompu), `/session <n>` y va. Chaque onglet a sa propre session ; les onglets en arrière-plan continuent de tourner. La barre apparaît dès 2 onglets avec un spinner pendant qu'un agent travaille, `●` quand un onglet en arrière-plan a fini (ou attend une réponse), `!` en cas d'erreur. `tab_orientation = "horizontal"` (défaut) ou `"vertical"` (barre latérale) dans `settings.toml` ou `/settings`. `ctrl+tab` et `ctrl+shift+t` demandent un terminal avec le protocole clavier kitty ; sinon `alt+pgup/pgdn` et `/session` fonctionnent partout.
 
 **Arbre** (`ctrl+t`) : une ligne par message utilisateur, les branches n'apparaissent qu'aux bifurcations. `enter` reprend après ce tour (le prochain message crée une branche), `e` réédite le message pour créer une branche sœur. Tout est conservé dans le fichier de session (JSONL append-only, chaque entrée pointe vers son parent).
 

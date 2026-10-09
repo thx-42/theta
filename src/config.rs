@@ -35,6 +35,8 @@ pub struct Settings {
     pub effort: String,
     /// full: show tool calls and thinking; compact: only final answer + one progress line
     pub verbose: String,
+    /// Session tab bar: horizontal (top row) | vertical (left sidebar)
+    pub tab_orientation: String,
     /// Default agent name
     pub agent: String,
     pub models: TaskModels,
@@ -55,6 +57,7 @@ impl Default for Settings {
             model: "anthropic/claude-sonnet-5-5".into(),
             effort: "medium".into(),
             verbose: "full".into(),
+            tab_orientation: "horizontal".into(),
             agent: "Build".into(),
             models: TaskModels::default(),
             agents: BTreeMap::new(),
@@ -259,6 +262,7 @@ const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>
 model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
+tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
 agent = "Build"
 
 # Model per background task ("" = main model)

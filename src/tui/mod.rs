@@ -1,12 +1,14 @@
 //! Full-screen ratatui interface.
 
 mod markdown;
+mod tabs;
 mod tree;
 
 use crate::agent::Event;
 use crate::auth::{self, Method};
 use crate::agents::{self, Agent};
 use crate::client::Remote;
+use tabs::{Tab, TabStatus, View};
 use crate::config;
 use crate::proto::{Push, Req, Snapshot, Target as Where};
 use crate::session::{self, Kind, Session};
@@ -79,6 +81,7 @@ const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Compu
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/resume", "open a previous session"),
+    ("/session", "session tabs: new | close | <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/model", "change model"),
     ("/agent", "change agent"),
@@ -410,7 +413,16 @@ struct Ui {
     /// Settings view to return to after a model picker opened from it.
     settings_back: Option<SettingsView>,
     quit: bool,
+    /// Open session tabs; `tabs[cur]` is the one mirrored in the fields above.
+    tabs: Vec<Tab>,
+    cur: usize,
+    next_tab_id: u64,
+    tab_tx: UnboundedSender<(u64, Option<Push>)>,
+    opened_tx: UnboundedSender<Opened>,
 }
+
+/// A tab opened in the background: its connection, pushes and first snapshot.
+type Opened = Result<(Remote, UnboundedReceiver<Push>, Snapshot), String>;
 
 fn agent_label(a: &Agent) -> String {
     format!("{} ({})", a.name, a.scope.label())
@@ -682,6 +694,14 @@ impl Ui {
                 self.attach(Where::New);
             }
             "/resume" => self.open_sessions(),
+            "/session" => match arg {
+                "" | "new" => self.new_tab(),
+                "close" => self.close_tab(),
+                n => match n.parse::<usize>() {
+                    Ok(n) if (1..=self.tabs.len()).contains(&n) => self.switch_to(n - 1),
+                    _ => self.notify("usage: /session [new | close | <n>]"),
+                },
+            },
             "/tree" => self.open_tree(),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
@@ -1117,7 +1137,14 @@ impl Ui {
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.cmd_sel = 0;
         }
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
+            KeyCode::Char(c) if ctrl && shift && c.eq_ignore_ascii_case(&'t') => self.new_tab(),
+            KeyCode::Char(c) if ctrl && shift && c.eq_ignore_ascii_case(&'w') => self.close_tab(),
+            KeyCode::Tab if ctrl => self.step_tab(1),
+            KeyCode::BackTab if ctrl => self.step_tab(-1),
+            KeyCode::PageDown if alt => self.step_tab(1),
+            KeyCode::PageUp if alt => self.step_tab(-1),
             KeyCode::Up | KeyCode::Down if !cmds.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
                 let n = cmds.len();
                 self.cmd_sel = if k.code == KeyCode::Up { (self.cmd_sel + n - 1) % n } else { (self.cmd_sel + 1) % n };
@@ -1444,6 +1471,7 @@ impl Ui {
                 ("Compact at".into(), format!("{:.0}% of context window", s.compaction.threshold * 100.0)),
                 ("Web search".into(), s.web.backend.clone()),
                 ("rtk filters".into(), s.tools.rtk.clone()),
+                ("Tab bar".into(), s.tab_orientation.clone()),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
@@ -1521,6 +1549,10 @@ impl Ui {
             4 => {
                 let v = cycle(&["auto", "off"], &s.tools.rtk);
                 self.update_settings("tools.rtk", v.clone().into(), |s| s.tools.rtk = v);
+            }
+            5 => {
+                let v = cycle(&["horizontal", "vertical"], &s.tab_orientation);
+                self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
             }
             _ => {}
         }
@@ -1646,7 +1678,22 @@ impl Ui {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let area = f.area();
+        let mut area = f.area();
+        if self.tabs.len() > 1 {
+            let vertical = self.app.rt.settings.tab_orientation == "vertical";
+            let infos: Vec<_> = (0..self.tabs.len())
+                .map(|i| if i == self.cur { (self.title_now(), if self.running { TabStatus::Working } else { TabStatus::Idle }, true) } else { (self.tabs[i].title.clone(), self.tabs[i].status, false) })
+                .collect();
+            let (strip, rest) = if vertical {
+                let [a, b] = Layout::horizontal([Constraint::Length(tabs::SIDEBAR_W), Constraint::Min(20)]).areas(area);
+                (a, b)
+            } else {
+                let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(area);
+                (a, b)
+            };
+            f.render_widget(Paragraph::new(tabs::bar(&infos, self.spin, vertical, strip.width)), strip);
+            area = rest;
+        }
         let width = area.width as usize;
         let inner_w = width.saturating_sub(2);
         let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
@@ -1837,7 +1884,7 @@ impl Ui {
         let w = (area.width.saturating_sub(4)).min(100);
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
-            Overlay::Help => COMMANDS.len() + 13,
+            Overlay::Help => COMMANDS.len() + 15,
             Overlay::Report(_, l) => l.len(),
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len(),
@@ -1897,6 +1944,8 @@ impl Ui {
                     ("ctrl+p", "model"),
                     ("ctrl+t", "conversation tree (fork)"),
                     ("ctrl+r", "resume a session"),
+                    ("ctrl+shift+t / ctrl+shift+w", "new / close session tab"),
+                    ("ctrl+tab / alt+pgdn", "next tab (ctrl+shift+tab / alt+pgup: previous)"),
                     ("ctrl+o", "full / compact output"),
                     ("pgup pgdn shift+↑↓ wheel", "scroll"),
                     ("ctrl+c ×2 / ctrl+d", "quit"),
@@ -2007,18 +2056,170 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// Whether the terminal speaks the kitty keyboard protocol (needed to tell ctrl+tab or ctrl+shift+t apart).
+static ENHANCED_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn setup() -> ratatui::DefaultTerminal {
+    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     let t = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && crossterm::execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok() {
+        ENHANCED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     t
 }
 
 fn teardown() {
+    if ENHANCED_KEYS.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 }
 
 impl Ui {
+    fn title_now(&self) -> String {
+        let t = self.app.session.lock().unwrap().title.clone();
+        t.or_else(|| self.items.iter().find_map(|i| if let Item::User(t) = i { Some(t.clone()) } else { None })).unwrap_or_default()
+    }
+
+    fn swap_view(&mut self, v: &mut View) {
+        use std::mem::swap;
+        swap(&mut self.items, &mut v.items);
+        swap(&mut self.cache, &mut v.cache);
+        swap(&mut self.dirty, &mut v.dirty);
+        swap(&mut self.input, &mut v.input);
+        swap(&mut self.scroll_top, &mut v.scroll_top);
+        swap(&mut self.last_total, &mut v.last_total);
+        swap(&mut self.last_view, &mut v.last_view);
+        swap(&mut self.remote, &mut v.remote);
+        swap(&mut self.running, &mut v.running);
+        swap(&mut self.started, &mut v.started);
+        swap(&mut self.elapsed, &mut v.elapsed);
+        swap(&mut self.counts, &mut v.counts);
+        swap(&mut self.status, &mut v.status);
+        swap(&mut self.todos, &mut v.todos);
+        swap(&mut self.cost, &mut v.cost);
+        swap(&mut self.ctx_tokens, &mut v.ctx_tokens);
+        swap(&mut self.verb, &mut v.verb);
+        swap(&mut self.out_tokens, &mut v.out_tokens);
+        swap(&mut self.stream_chars, &mut v.stream_chars);
+        swap(&mut self.asks, &mut v.asks);
+        swap(&mut self.app.session, &mut v.session);
+        swap(&mut self.app.turn, &mut v.turn);
+    }
+
+    /// An open question belongs to its tab: put it back in the queue before the view changes.
+    fn park_overlay(&mut self) {
+        if let Some(Overlay::Ask(a)) = self.overlay.take_if(|o| matches!(o, Overlay::Ask(_))) {
+            self.asks.push_front(a);
+        }
+    }
+
+    /// Make `view` the active one and park the current state in the tab being left.
+    fn install(&mut self, mut view: View, to: usize) {
+        self.park_overlay();
+        let title = self.title_now();
+        self.swap_view(&mut view);
+        let from = &mut self.tabs[self.cur];
+        from.status = if view.running { TabStatus::Working } else { TabStatus::Idle };
+        from.title = title;
+        from.view = Some(view);
+        self.cur = to;
+    }
+
+    fn switch_to(&mut self, to: usize) {
+        if to == self.cur || to >= self.tabs.len() {
+            return;
+        }
+        let view = self.tabs[to].view.take().expect("background tab keeps its view");
+        self.install(view, to);
+        let t = &mut self.tabs[to];
+        (t.status, t.errored) = (TabStatus::Idle, false);
+        for p in std::mem::take(&mut t.backlog) {
+            self.on_push(p);
+        }
+        theme::set_accent(&self.app.turn.agent.name);
+        self.invalidate_all();
+    }
+
+    fn step_tab(&mut self, d: isize) {
+        let n = self.tabs.len() as isize;
+        if n > 1 {
+            self.switch_to((self.cur as isize + d).rem_euclid(n) as usize);
+        }
+    }
+
+    /// Open a fresh session in a new tab, with the current agent and model.
+    fn new_tab(&mut self) {
+        let (tx, cwd) = (self.opened_tx.clone(), self.app.rt.cwd.clone());
+        let (agent, model) = (Some(self.app.turn.agent.name.clone()), Some(self.app.turn.model.clone()));
+        tokio::spawn(async move {
+            let _ = tx.send(crate::client::open(Where::New, cwd, agent, model).await.map_err(|e| format!("{e:#}")));
+        });
+    }
+
+    fn tab_opened(&mut self, opened: Opened) {
+        let (remote, rx, snap) = match opened {
+            Ok(o) => o,
+            Err(e) => return self.push(Item::Error(format!("could not open a tab: {e}"))),
+        };
+        let turn = match crate::make_turn(&self.app.rt, Some(&snap.agent), Some(&snap.model)) {
+            Ok(t) => t,
+            Err(e) => return self.push(Item::Error(format!("could not open a tab: {e:#}"))),
+        };
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.forward(id, rx);
+        self.tabs.push(Tab::new(id));
+        self.install(View::fresh(remote, turn), self.tabs.len() - 1);
+        self.on_snapshot(snap);
+    }
+
+    /// Close the active tab; a run still going in it is interrupted.
+    fn close_tab(&mut self) {
+        if self.tabs.len() < 2 {
+            return self.notify("last tab — /quit to exit");
+        }
+        self.interrupt();
+        let dead = self.cur;
+        self.switch_to(if dead > 0 { dead - 1 } else { 1 });
+        self.tabs.remove(dead);
+        if dead < self.cur {
+            self.cur -= 1;
+        }
+    }
+
+    /// Feed one tab's pushes into the shared channel the main loop reads.
+    fn forward(&self, id: u64, mut rx: UnboundedReceiver<Push>) {
+        let tx = self.tab_tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = rx.recv().await {
+                if tx.send((id, Some(p))).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send((id, None));
+        });
+    }
+
+    fn on_tab_push(&mut self, id: u64, p: Option<Push>) {
+        let Some(i) = self.tabs.iter().position(|t| t.id == id) else { return };
+        match (i == self.cur, p) {
+            (true, Some(p)) => self.on_push(p),
+            (true, None) => {
+                self.push(Item::Error("connection to the daemon lost".into()));
+                self.running = false;
+            }
+            (false, Some(p)) => {
+                self.tabs[i].watch(&p);
+                self.tabs[i].backlog.push(p);
+            }
+            (false, None) => self.tabs[i].status = TabStatus::Error,
+        }
+    }
+
     /// Replace the whole view with a session the daemon just handed us (first attach, /new, /resume, reconnect).
     fn on_snapshot(&mut self, snap: Snapshot) {
         *self.app.session.lock().unwrap() = Session::mirror(snap.entries);
@@ -2068,8 +2269,10 @@ impl Ui {
     }
 }
 
-pub async fn run(rt: crate::agent::Runtime, remote: Remote, mut pushes: UnboundedReceiver<Push>, snap: Snapshot, initial: Option<String>) -> Result<()> {
+pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedReceiver<Push>, snap: Snapshot, initial: Option<String>) -> Result<()> {
     let (login_tx, mut login_rx) = unbounded_channel();
+    let (tab_tx, mut tab_rx) = unbounded_channel();
+    let (opened_tx, mut opened_rx) = unbounded_channel();
     let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
     let app = App { rt, session: Arc::new(Mutex::new(Session::mirror(vec![]))), turn };
     let mut ui = Ui {
@@ -2104,7 +2307,13 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, mut pushes: Unbounde
         cmd_sel: 0,
         settings_back: None,
         quit: false,
+        tabs: vec![Tab::new(0)],
+        cur: 0,
+        next_tab_id: 1,
+        tab_tx,
+        opened_tx,
     };
+    ui.forward(0, pushes);
     ui.on_snapshot(snap);
     // Prompt history from previous sessions in this directory.
     if let Some(i) = session::list(&ui.app.rt.cwd).first()
@@ -2143,22 +2352,17 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, mut pushes: Unbounde
                 Some(Err(_)) | None => break,
                 _ => {}
             },
-            p = pushes.recv() => match p {
-                Some(p) => {
-                    ui.on_push(p);
-                    // Drain whatever else is queued before redrawing.
-                    while let Ok(p) = pushes.try_recv() {
-                        ui.on_push(p);
-                    }
-                }
-                None => {
-                    ui.push(Item::Error("connection to the daemon lost".into()));
-                    ui.running = false;
+            Some((id, p)) = tab_rx.recv() => {
+                ui.on_tab_push(id, p);
+                // Drain whatever else is queued before redrawing.
+                while let Ok((id, p)) = tab_rx.try_recv() {
+                    ui.on_tab_push(id, p);
                 }
             },
+            Some(o) = opened_rx.recv() => ui.tab_opened(o),
             Some(m) = login_rx.recv() => ui.on_login(m),
             _ = tick.tick() => {
-                if ui.running {
+                if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {
                     ui.spin += 1;
                 }
             }
