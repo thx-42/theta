@@ -62,7 +62,14 @@ jobs:
           if [ "${{ github.ref_name }}" = dev ]; then prefix=dev-; pre=--prerelease; else prefix=; pre=; fi
           tag="${prefix}v${version}-${{ github.run_number }}"
           (cd dist && sha256sum *.tar.gz > checksums.txt)
+          if [ -n "$pre" ]; then
+            notes=(--generate-notes)
+          else
+            # stable: the notes are the CHANGELOG section of this version
+            awk -v v="$version" '$0 == "## " v {f=1; next} /^## /{f=0} f' CHANGELOG.md > notes.md
+            notes=(--notes-file notes.md)
+          fi
           gh release create "$tag" dist/* $pre \
             --target "${{ github.sha }}" \
             --title "θ $tag" \
-            --generate-notes
+            "${notes[@]}"
