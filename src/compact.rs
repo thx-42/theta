@@ -58,7 +58,7 @@ pub fn needed(s: &Session, model: &Model, settings: &Settings) -> bool {
     model.context > 0 && current_tokens(s) as f64 > model.context as f64 * settings.compaction.threshold
 }
 
-fn serialize(msgs: &[Msg]) -> String {
+pub fn serialize(msgs: &[Msg]) -> String {
     let mut out = String::new();
     for m in msgs {
         for b in &m.content {

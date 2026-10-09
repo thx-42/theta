@@ -2,17 +2,23 @@
 
 mod agent;
 mod agents;
+mod skills;
+mod mcp;
 mod auth;
 mod catalog;
+mod client;
 mod compact;
 mod config;
 mod llm;
+mod proto;
+mod server;
 mod session;
 mod tools;
 mod tui;
 mod types;
+mod usage;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -51,8 +57,16 @@ enum Cmd {
     Models { filter: Option<String> },
     /// List agents (global and local).
     Agents,
+    /// MCP servers: list, log in (OAuth) or log out.
+    Mcp {
+        /// list | login | logout
+        action: String,
+        server: Option<String>,
+    },
     /// Refresh the model catalog from models.dev.
     Refresh,
+    /// The background server (started automatically on first use). `theta daemon stop` stops it.
+    Daemon { action: Option<String> },
 }
 
 pub struct App {
@@ -61,22 +75,26 @@ pub struct App {
     pub turn: agent::Turn,
 }
 
-pub async fn build_runtime() -> Result<agent::Runtime> {
+pub async fn build_runtime(cwd: std::path::PathBuf) -> Result<agent::Runtime> {
     config::bootstrap()?;
-    let cwd = std::env::current_dir()?;
     let project = config::project_root(&cwd);
     let settings = config::load(&project)?;
     let catalog = catalog::Catalog::load(&settings).await;
+    let skills = skills::discover(&project, &settings.skills.auto);
+    let mcp = mcp::Registry::new(&settings.mcp);
     Ok(agent::Runtime {
         catalog: Arc::new(catalog),
         auth: auth::Auth::load(),
         settings: Arc::new(settings),
         http: llm::http(),
         agents: Arc::new(agents::discover(&project)),
+        skills: Arc::new(skills),
+        mcp: Arc::new(mcp),
         project,
         cwd,
         todos: Default::default(),
         read_cache: Default::default(),
+        asks: Default::default(),
     })
 }
 
@@ -104,7 +122,8 @@ fn open_session(rt: &agent::Runtime, cont: bool, resume: Option<&str>) -> Result
 
 async fn print_mode(app: App, prompt: String) -> Result<()> {
     let compact = app.rt.settings.verbose == "compact";
-    app.session.lock().unwrap().add_msg(types::Msg::user(prompt), None)?;
+    app.rt.mcp.connect_all().await;
+    app.session.lock().unwrap().add_msg(types::Msg::user(skills::expand(&app.rt.skills, &prompt)), None)?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = tokio::spawn(agent::run(app.rt.clone(), app.session.clone(), app.turn.clone(), tx));
     let mut out = std::io::stdout();
@@ -117,6 +136,9 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
             }
             agent::Event::ToolStart { name, args, .. } if !compact => {
                 writeln!(err, "\n▸ {name} {}", tui::tool_summary(&name, &args))?;
+            }
+            agent::Event::Ask { id, .. } => {
+                app.rt.asks.lock().unwrap().remove(&id); // nobody to answer: the tool reports it and the agent decides
             }
             agent::Event::Error(e) => writeln!(err, "error: {e}")?,
             _ => {}
@@ -135,7 +157,22 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let rt = build_runtime().await?;
+    if let Some(Cmd::Daemon { action }) = &cli.cmd {
+        return match action.as_deref() {
+            None => server::serve().await,
+            Some("stop") => {
+                if let Ok(sock) = tokio::net::UnixStream::connect(proto::socket_path()).await {
+                    let mut line = serde_json::to_string(&proto::Req::Shutdown)?;
+                    line.push('\n');
+                    tokio::io::AsyncWriteExt::write_all(&mut { sock }, line.as_bytes()).await?;
+                }
+                Ok(())
+            }
+            Some(a) => bail!("unknown action `{a}` (stop)"),
+        };
+    }
+    let cwd = std::env::current_dir()?;
+    let rt = build_runtime(cwd.clone()).await?;
     match cli.cmd {
         Some(Cmd::Login { provider }) => {
             let id = match provider {
@@ -178,14 +215,51 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::Mcp { action, server }) => {
+            let named = || -> Result<(String, config::McpServer)> {
+                let n = server.clone().context("server name required")?;
+                let c = rt.mcp.config(&n).with_context(|| format!("unknown MCP server `{n}`"))?.clone();
+                Ok((n, c))
+            };
+            match action.as_str() {
+                "list" => {
+                    rt.mcp.connect_all().await;
+                    rt.mcp.status().iter().for_each(|l| println!("{l}"));
+                }
+                "login" => {
+                    let (n, c) = named()?;
+                    let (say, mut said) = tokio::sync::mpsc::unbounded_channel();
+                    let (paste_tx, paste) = tokio::sync::mpsc::unbounded_channel();
+                    std::thread::spawn(move || {
+                        let mut s = String::new();
+                        while std::io::stdin().read_line(&mut s).is_ok_and(|k| k > 0) {
+                            if paste_tx.send(std::mem::take(&mut s)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        while let Some(m) = said.recv().await {
+                            println!("{m}\n");
+                        }
+                    });
+                    mcp::login(&n, &c, &mut auth::Io { say, paste }).await?;
+                    println!("✓ logged in to {n}");
+                }
+                "logout" => mcp::logout(&named()?.0)?,
+                _ => bail!("unknown action `{action}` (list | login | logout)"),
+            }
+            return Ok(());
+        }
         Some(Cmd::Refresh) => return catalog::refresh().await,
+        Some(Cmd::Daemon { .. }) => unreachable!(),
         None => {}
     }
-    let turn = make_turn(&rt, cli.agent.as_deref(), cli.model.as_deref())?;
-    let session = open_session(&rt, cli.r#continue, cli.resume.as_deref())?;
-    let app = App { rt, session: Arc::new(Mutex::new(session)), turn };
     let prompt = cli.prompt.join(" ");
     if cli.print {
+        let turn = make_turn(&rt, cli.agent.as_deref(), cli.model.as_deref())?;
+        let session = open_session(&rt, cli.r#continue, cli.resume.as_deref())?;
+        let app = App { rt, session: Arc::new(Mutex::new(session)), turn };
         let prompt = if prompt.is_empty() {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
@@ -195,5 +269,15 @@ async fn main() -> Result<()> {
         };
         return print_mode(app, prompt).await;
     }
-    tui::run(app, (!prompt.is_empty()).then_some(prompt)).await
+    let target = match (&cli.resume, cli.r#continue) {
+        (Some(r), _) => {
+            // A path is resolved here: the daemon's working directory differs from ours.
+            let p = std::path::Path::new(r);
+            proto::Target::Resume(if p.exists() { p.canonicalize()?.display().to_string() } else { r.clone() })
+        }
+        (None, true) => proto::Target::Continue,
+        (None, false) => proto::Target::New,
+    };
+    let (remote, pushes, snap) = client::open(target, cwd, cli.agent, cli.model).await?;
+    tui::run(rt, remote, pushes, snap, (!prompt.is_empty()).then_some(prompt)).await
 }

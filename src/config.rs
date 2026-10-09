@@ -43,6 +43,9 @@ pub struct Settings {
     pub compaction: Compaction,
     pub tools: ToolSettings,
     pub web: WebSettings,
+    pub skills: SkillSettings,
+    /// MCP servers, keyed by name (`[mcp.<name>]`)
+    pub mcp: BTreeMap<String, McpServer>,
     pub providers: BTreeMap<String, CustomProvider>,
 }
 
@@ -58,6 +61,8 @@ impl Default for Settings {
             compaction: Compaction::default(),
             tools: ToolSettings::default(),
             web: WebSettings::default(),
+            skills: SkillSettings::default(),
+            mcp: BTreeMap::new(),
             providers: BTreeMap::new(),
         }
     }
@@ -122,6 +127,31 @@ impl Default for ToolSettings {
     fn default() -> Self {
         ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 400, disabled: vec![] }
     }
+}
+
+/// One MCP server: `command` (stdio) or `url` (streamable HTTP). `${VAR}` in values is expanded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServer {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub enabled: bool,
+}
+
+impl Default for McpServer {
+    fn default() -> Self {
+        McpServer { command: String::new(), args: vec![], env: BTreeMap::new(), url: String::new(), headers: BTreeMap::new(), enabled: true }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillSettings {
+    /// Skills injected into every system prompt (also: `auto: true` in the skill file).
+    pub auto: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -203,6 +233,7 @@ pub fn set_global(key: &str, value: toml::Value) -> Result<()> {
 pub fn bootstrap() -> Result<()> {
     let h = home();
     std::fs::create_dir_all(h.join("agents"))?;
+    std::fs::create_dir_all(h.join("skills"))?;
     std::fs::create_dir_all(h.join("sessions"))?;
     std::fs::create_dir_all(h.join("cache"))?;
     let soul = h.join("SOUL.md");
@@ -254,6 +285,18 @@ rtk = "auto"             # route shell commands through rtk when installed
 bash_timeout = 120
 max_lines = 400
 disabled = []
+
+# Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
+[skills]
+auto = []                # always injected, e.g. ["caveman", "ponytail"]
+
+# MCP servers: `command` (stdio) or `url` (HTTP, `/mcp login <name>` for OAuth). Tools appear as mcp__<name>__<tool>.
+# [mcp.fs]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# [mcp.notion]
+# url = "https://mcp.notion.com/mcp"
+# headers = { Authorization = "Bearer ${NOTION_TOKEN}" }   # optional static auth
 
 [web]
 backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo

@@ -25,6 +25,9 @@ impl Scope {
 pub struct Agent {
     pub name: String,
     pub description: String,
+    /// Short "can do" / "cannot do" notes, shown to an LLM choosing a handoff target
+    pub can: String,
+    pub cannot: String,
     pub scope: Scope,
     /// Optional `provider/model` override
     pub model: Option<String>,
@@ -40,6 +43,8 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
     let mut a = Agent {
         name: fallback_name.to_string(),
         description: String::new(),
+        can: String::new(),
+        cannot: String::new(),
         scope,
         model: None,
         effort: None,
@@ -59,6 +64,8 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
         match k.trim() {
             "name" => a.name = v,
             "description" => a.description = v,
+            "can" => a.can = v,
+            "cannot" => a.cannot = v,
             "model" => a.model = Some(v),
             "effort" => a.effort = Some(v),
             "subagent_model" => a.subagent_model = Some(v),
@@ -93,6 +100,24 @@ pub fn discover(project: &Path) -> Vec<Agent> {
     out
 }
 
+/// One block per agent for the `list_agents` tool: task, can, cannot.
+pub fn catalog(agents: &[Agent]) -> String {
+    agents
+        .iter()
+        .map(|a| {
+            let mut s = format!("- {}: {}", a.name, a.description);
+            if !a.can.is_empty() {
+                s += &format!("\n  can: {}", a.can);
+            }
+            if !a.cannot.is_empty() {
+                s += &format!("\n  cannot: {}", a.cannot);
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn find<'a>(agents: &'a [Agent], name: &str) -> Option<&'a Agent> {
     agents.iter().find(|a| a.name.eq_ignore_ascii_case(name))
 }
@@ -111,8 +136,8 @@ fn read(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// SOUL (global, then project) + agent prompt + environment + project context file.
-pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path) -> String {
+/// SOUL (global, then project) + agent prompt + auto skills + environment + project context file.
+pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) -> String {
     let mut parts = Vec::new();
     if let Some(s) = read(&config::home().join("SOUL.md")) {
         parts.push(s);
@@ -121,6 +146,9 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path) -> String {
         parts.push(s);
     }
     parts.push(agent.prompt.clone());
+    if !skills.is_empty() {
+        parts.push(skills.to_string());
+    }
     let date = chrono_date();
     parts.push(format!(
         "# Environment\n- cwd: {}\n- project root: {}\n- platform: {} {}\n- date: {date}",
@@ -167,6 +195,8 @@ Rules for every agent. Edit ~/.theta/SOUL.md (global) or <project>/.theta/SOUL.m
 pub const DEFAULT_BUILD: &str = r#"---
 name: Build
 description: Default coding agent — reads, edits, runs and verifies code
+can: read, edit and write files, run shell commands, build and test, search the web, delegate to subagents
+cannot: ask the user questions mid-task or hand off to another agent
 ---
 You are theta, a coding agent working in the user's terminal on their project.
 
@@ -185,7 +215,9 @@ Format answers in Markdown. Reference code as `path:line`.
 pub const DEFAULT_PLAN: &str = r#"---
 name: Plan
 description: Clarifies the task before coding — rephrases, finds blind spots, asks, plans
-tools: read, grep, find, ls, todo, web_search, web_fetch, ask, task, handoff
+can: read and search code, search the web, ask the user, write a todo plan, propose a handoff
+cannot: edit or write files, run shell commands, write code
+tools: read, grep, find, ls, todo, web_search, web_fetch, ask, task, list_agents, handoff
 ---
 You are theta in planning mode. You do not edit files or run commands. Your job is to turn the user's request into a precise, buildable plan.
 
@@ -194,7 +226,7 @@ You are theta in planning mode. You do not edit files or run commands. Your job 
 3. Find blind spots: list what the request leaves vague or unstated (edge cases, data, errors, UX, compatibility, tests, what must not change).
 4. Resolve: answer each point yourself when the code, docs or conventions settle it, and say how you settled it. For decisions only the user can make, use `ask` — one question per call, with concrete options (choice or yes_no) whenever possible, and propose a recommended option first.
 5. Plan: write the plan as a `todo` list of small, verifiable steps, and summarize it: files to touch, approach, risks, how it will be verified.
-6. Hand off: when nothing blocking remains, call `handoff` (agent Build) with a one-line summary. If the user declines, keep refining.
+6. Hand off: when nothing blocking remains, call `list_agents`, pick the agent whose task fits, then call `handoff` with that agent with a one-line summary. If the user declines, keep refining.
 
 Stay brief. Never ask what you can find out yourself. Do not start coding.
 "#;
@@ -210,6 +242,8 @@ mod tests {
         assert_eq!(a.model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(a.tools, Some(vec!["read".into(), "grep".into()]));
         assert_eq!(a.prompt, "Be strict.");
+        let c = parse("---\nname: R\ndescription: reviews\ncan: read\ncannot: edit\n---\nx", "x", Scope::Local);
+        assert_eq!(catalog(&[c]), "- R: reviews\n  can: read\n  cannot: edit");
         let b = parse("plain prompt", "Plain", Scope::Global);
         assert_eq!((b.name.as_str(), b.prompt.as_str()), ("Plain", "plain prompt"));
         assert!(chrono_date().starts_with("20"));

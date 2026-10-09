@@ -1,5 +1,4 @@
 //! Credentials (~/.theta/auth.json, mode 0600): API keys and OAuth for Claude Pro/Max, ChatGPT (Codex), GitHub Copilot.
-//! OAuth flows mirror pi's (packages/ai/src/auth/oauth).
 
 use crate::catalog::{OAuthKind, Provider};
 use crate::config;
@@ -49,7 +48,7 @@ fn path() -> std::path::PathBuf {
     config::home().join("auth.json")
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
@@ -72,6 +71,12 @@ impl Auth {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         Auth { store: Arc::new(Mutex::new(store)) }
+    }
+
+    /// Re-read `auth.json` (another process logged in or out).
+    pub async fn reload(&self) {
+        let fresh = Auth::load().store.lock().await.clone();
+        *self.store.lock().await = fresh;
     }
 
     pub async fn set(&self, provider: &str, cred: Cred) -> Result<()> {
@@ -141,11 +146,11 @@ impl Auth {
 
 // ---------- OAuth ----------
 
-fn b64(bytes: &[u8]) -> String {
+pub(crate) fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn pkce() -> (String, String) {
+pub(crate) fn pkce() -> (String, String) {
     let verifier = b64(&rand::random::<[u8; 32]>());
     let challenge = b64(&Sha256::digest(verifier.as_bytes()));
     (verifier, challenge)
@@ -188,7 +193,7 @@ fn copilot_base_url(token: &str) -> String {
         .unwrap_or_else(|| "https://api.individual.githubcopilot.com".into())
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     let cmd = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
     let _ = std::process::Command::new(cmd)
         .arg(url)
@@ -259,12 +264,12 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-fn query(params: &[(&str, &str)]) -> String {
+pub(crate) fn query(params: &[(&str, &str)]) -> String {
     params.iter().map(|(k, v)| format!("{k}={}", urlencode(v))).collect::<Vec<_>>().join("&")
 }
 
 /// Wait for the browser redirect on 127.0.0.1:port, or a pasted URL/code.
-async fn wait_code(port: u16, path: &str, paste: &mut UnboundedReceiver<String>) -> Result<(Option<String>, Option<String>)> {
+pub(crate) async fn wait_code(port: u16, path: &str, paste: &mut UnboundedReceiver<String>) -> Result<(Option<String>, Option<String>)> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok();
     loop {
         tokio::select! {
@@ -307,7 +312,7 @@ async fn post_json(url: &str, body: Value) -> Result<Value> {
     Ok(serde_json::from_str(&text)?)
 }
 
-async fn post_form(url: &str, form: &[(&str, &str)]) -> Result<Value> {
+pub(crate) async fn post_form(url: &str, form: &[(&str, &str)]) -> Result<Value> {
     let r = reqwest::Client::new()
         .post(url)
         .header("Accept", "application/json")

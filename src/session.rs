@@ -40,6 +40,8 @@ pub struct Session {
     index: HashMap<String, usize>,
     pub leaf: Option<String>,
     written: bool,
+    /// Called with every entry appended after construction (the daemon broadcasts them to attached clients).
+    sink: Option<Box<dyn Fn(&Entry) + Send>>,
 }
 
 fn now() -> u64 {
@@ -102,7 +104,7 @@ impl Session {
     pub fn new(cwd: &Path) -> Session {
         let id = new_id();
         let path = dir_for(cwd).join(format!("{id}.jsonl"));
-        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, written: false };
+        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, written: false, sink: None };
         s.push_entry(Entry { id, parent: None, ts: now(), kind: Kind::Session { cwd: cwd.display().to_string() } });
         s.leaf = None;
         s
@@ -110,31 +112,44 @@ impl Session {
 
     pub fn open(path: &Path) -> Result<Session> {
         let text = std::fs::read_to_string(path)?;
-        let mut s = Session {
-            id: String::new(),
-            path: path.to_path_buf(),
-            cwd: PathBuf::new(),
-            title: None,
-            entries: vec![],
-            index: HashMap::new(),
-            leaf: None,
-            written: true,
-        };
+        let mut s = Session::blank(path);
         for line in text.lines() {
             let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
-            match &e.kind {
-                Kind::Session { cwd } => {
-                    s.id = e.id.clone();
-                    s.cwd = PathBuf::from(cwd);
-                }
-                Kind::Title { title } => s.title = Some(title.clone()),
-                Kind::Leaf { target } => s.leaf = (!target.is_empty()).then(|| target.clone()),
-                _ => s.leaf = Some(e.id.clone()),
-            }
-            s.index.insert(e.id.clone(), s.entries.len());
-            s.entries.push(e);
+            s.apply(e);
         }
         Ok(s)
+    }
+
+    /// Read-only copy of a session held elsewhere (a client mirroring the daemon): never writes to disk.
+    pub fn mirror(entries: Vec<Entry>) -> Session {
+        let mut s = Session::blank(Path::new(""));
+        entries.into_iter().for_each(|e| s.apply(e));
+        s
+    }
+
+    fn blank(path: &Path) -> Session {
+        Session { id: String::new(), path: path.to_path_buf(), cwd: PathBuf::new(), title: None, entries: vec![], index: HashMap::new(), leaf: None, written: true, sink: None }
+    }
+
+    /// Replay one stored entry into the in-memory state. Idempotent per entry id.
+    pub fn apply(&mut self, e: Entry) {
+        if self.index.contains_key(&e.id) {
+            return;
+        }
+        match &e.kind {
+            Kind::Session { cwd } => {
+                self.id = e.id.clone();
+                self.cwd = PathBuf::from(cwd);
+            }
+            Kind::Title { title } => self.title = Some(title.clone()),
+            Kind::Leaf { target } => self.leaf = (!target.is_empty()).then(|| target.clone()),
+            _ => self.leaf = Some(e.id.clone()),
+        }
+        self.push_entry(e);
+    }
+
+    pub fn set_sink(&mut self, f: impl Fn(&Entry) + Send + 'static) {
+        self.sink = Some(Box::new(f));
     }
 
     fn push_entry(&mut self, e: Entry) {
@@ -163,6 +178,9 @@ impl Session {
         let e = Entry { id: id.clone(), parent: self.leaf.clone(), ts: now(), kind };
         self.push_entry(e.clone());
         self.persist(&e)?;
+        if let Some(f) = &self.sink {
+            f(&e);
+        }
         if moves_leaf {
             self.leaf = Some(id.clone());
         }

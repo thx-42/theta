@@ -3,10 +3,12 @@
 mod markdown;
 mod tree;
 
-use crate::agent::{self, Event};
+use crate::agent::Event;
 use crate::auth::{self, Method};
 use crate::agents::{self, Agent};
+use crate::client::Remote;
 use crate::config;
+use crate::proto::{Push, Req, Snapshot, Target as Where};
 use crate::session::{self, Kind, Session};
 use crate::tools::{self, Kind as ToolKind, Todo};
 use crate::types::{Block, Msg, Role};
@@ -73,19 +75,25 @@ const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const PULSE: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Computing", "Brewing", "Forging", "Weaving", "Crafting", "Mulling"];
 
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/resume", "open a previous session"),
     ("/tree", "browse and fork the conversation tree"),
     ("/model", "change model"),
     ("/agent", "change agent"),
+    ("/skills", "list skills (use $name in a message)"),
+    ("/mcp", "MCP servers: list | login | logout | reconnect <name>"),
     ("/effort", "reasoning effort"),
     ("/settings", "settings (verbosity, task models, compaction, web)"),
     ("/verbose", "toggle full / compact output"),
     ("/compact", "compact context now"),
+    ("/btw", "side question, not kept in context"),
     ("/title", "rename the session"),
     ("/login", "log in to a provider"),
     ("/logout", "remove provider credentials"),
+    ("/usage", "subscription limits and resets (Claude, Codex)"),
+    ("/stats", "token statistics across all sessions"),
     ("/copy", "copy the last answer"),
     ("/help", "keys and commands"),
     ("/quit", "exit"),
@@ -239,14 +247,12 @@ struct AskView {
     options: Vec<String>,
     sel: usize,
     input: Editor,
-    reply: agent::Reply,
+    id: String,
 }
 
 impl AskView {
-    fn answer(self, text: String) {
-        if let Some(tx) = self.reply.lock().unwrap().take() {
-            let _ = tx.send(text);
-        }
+    fn answer(self, remote: &Remote, text: String) {
+        remote.send(Req::Answer { id: self.id, text });
     }
 }
 
@@ -265,6 +271,7 @@ struct LoginView {
 enum LoginMsg {
     Say(String),
     Done(Result<(), String>),
+    Report(Vec<String>),
 }
 
 enum Overlay {
@@ -272,6 +279,7 @@ enum Overlay {
     Tree(tree::TreeView),
     Settings(SettingsView),
     Help,
+    Report(String, Vec<String>),
     Ask(AskView),
     Login(LoginView),
 }
@@ -378,8 +386,9 @@ struct Ui {
     scroll_top: Option<usize>,
     last_total: usize,
     last_view: usize,
-    run_rx: Option<UnboundedReceiver<Event>>,
-    run: Option<tokio::task::JoinHandle<()>>,
+    remote: Remote,
+    /// A run (turn, compaction or side question) is active in the daemon.
+    running: bool,
     started: Instant,
     elapsed: Duration,
     counts: Counts,
@@ -388,7 +397,6 @@ struct Ui {
     todos: Vec<Todo>,
     cost: f64,
     ctx_tokens: u64,
-    app_tx: UnboundedSender<Event>,
     quit_armed: Option<Instant>,
     notice: Option<(String, Instant)>,
     spin: usize,
@@ -399,8 +407,6 @@ struct Ui {
     asks: VecDeque<AskView>,
     login_tx: UnboundedSender<LoginMsg>,
     cmd_sel: usize,
-    /// Agent to switch to when the current run ends (accepted `handoff`).
-    handoff: Option<String>,
     /// Settings view to return to after a model picker opened from it.
     settings_back: Option<SettingsView>,
     quit: bool,
@@ -502,34 +508,19 @@ impl Ui {
     // ---------- running ----------
 
     fn send(&mut self, text: String) {
-        if self.run.is_some() {
+        if self.running {
             self.notify("agent is running — Esc to interrupt");
             self.input.set(text);
             return;
         }
-        let added = self.app.session.lock().unwrap().add_msg(Msg::user(text.clone()), None);
-        if let Err(e) = added {
-            self.push(Item::Error(format!("{e:#}")));
-            return;
-        }
         self.history.push(text.clone());
         self.hist = None;
-        self.push(Item::User(text));
-        self.start();
+        self.remote.send(Req::Send(text));
     }
 
-    fn start(&mut self) {
-        let (tx, rx) = unbounded_channel();
-        let rt = self.app.rt.clone();
-        let session = self.app.session.clone();
-        let turn = self.app.turn.clone();
-        self.run = Some(tokio::spawn(async move {
-            if let Err(e) = agent::run(rt, session, turn, tx.clone()).await {
-                let _ = tx.send(Event::Error(format!("{e:#}")));
-            }
-            let _ = tx.send(Event::Done);
-        }));
-        self.run_rx = Some(rx);
+    /// A run began (here or in another client): reset the progress display.
+    fn begin_run(&mut self) {
+        self.running = true;
         self.started = Instant::now();
         self.counts = Counts::default();
         self.status = "thinking".into();
@@ -540,23 +531,26 @@ impl Ui {
     }
 
     fn interrupt(&mut self) {
-        if let Some(h) = self.run.take() {
-            h.abort();
-            self.run_rx = None;
-            self.elapsed = self.started.elapsed();
-            for i in 0..self.items.len() {
-                if let Item::Tool { state: state @ ToolState::Running, .. } = &mut self.items[i] {
-                    *state = ToolState::Done { ok: false };
-                    self.touch(i);
-                }
-            }
-            self.asks.clear();
-            self.handoff = None;
-            if matches!(self.overlay, Some(Overlay::Ask(_))) {
-                self.overlay = None;
-            }
-            self.push(Item::Info("interrupted".into()));
+        if self.running {
+            self.remote.send(Req::Interrupt);
         }
+    }
+
+    fn on_interrupted(&mut self) {
+        self.running = false;
+        self.elapsed = self.started.elapsed();
+        for i in 0..self.items.len() {
+            if let Item::Tool { state: state @ ToolState::Running, .. } = &mut self.items[i] {
+                *state = ToolState::Done { ok: false };
+                self.touch(i);
+            }
+        }
+        self.asks.clear();
+        if matches!(self.overlay, Some(Overlay::Ask(_))) {
+            self.overlay = None;
+        }
+        self.close_streaming();
+        self.push(Item::Info("interrupted".into()));
     }
 
     fn last_assistant_streaming(&mut self) -> usize {
@@ -619,11 +613,20 @@ impl Ui {
                 self.out_tokens += usage.output;
                 self.stream_chars = 0;
             }
-            Event::Handoff { agent } => self.handoff = Some(agent),
-            Event::Ask { question, options, reply } => {
+            Event::Handoff { agent } => self.notify(format!("switching to {agent} after this reply")),
+            Event::Ask { id, question, options } => {
                 self.status = "waiting for your answer".into();
-                self.asks.push_back(AskView { question, options, sel: 0, input: Editor::default(), reply });
+                self.asks.push_back(AskView { question, options, sel: 0, input: Editor::default(), id });
             }
+            Event::Answered(id) => {
+                self.asks.retain(|a| a.id != id);
+                if matches!(&self.overlay, Some(Overlay::Ask(a)) if a.id == id) {
+                    self.overlay = None;
+                }
+            }
+            Event::Started => self.begin_run(),
+            Event::User(t) => self.push(Item::User(t)),
+            Event::Interrupted => self.on_interrupted(),
             Event::Todos(t) => self.todos = t,
             Event::Compacting => {
                 self.status = "compacting context".into();
@@ -633,10 +636,11 @@ impl Ui {
                 self.push(Item::Info(format!("context compacted ({}k tokens summarized)", before / 1000)));
                 self.ctx_tokens = crate::compact::current_tokens(&self.app.session.lock().unwrap());
             }
-            Event::Title(t) => {
-                let _ = self.app.session.lock().unwrap().set_title(t.clone());
-                self.notify(format!("session: {t}"));
+            Event::Side { question, answer } => {
+                self.push(Item::Info(format!("btw: {question}")));
+                self.push(Item::Assistant { text: answer, thinking: String::new(), done: true });
             }
+            Event::Title(t) => self.notify(format!("session: {t}")),
             Event::Sub { id, event } => {
                 if let Event::ToolStart { name, .. } = *event {
                     self.counts.add(&name);
@@ -654,15 +658,8 @@ impl Ui {
             }
             Event::Done => {
                 self.close_streaming();
-                self.run = None;
-                self.run_rx = None;
+                self.running = false;
                 self.elapsed = self.started.elapsed();
-                self.maybe_title();
-                if let Some(name) = self.handoff.take()
-                    && let Some(a) = crate::agents::find(&self.app.rt.agents, &name).cloned() {
-                        self.switch_agent(a);
-                        self.send("Plan approved. Implement it now, following the todo list.".into());
-                    }
             }
         }
     }
@@ -675,27 +672,6 @@ impl Ui {
         }
     }
 
-    fn maybe_title(&mut self) {
-        let first = {
-            let s = self.app.session.lock().unwrap();
-            if s.title.is_some() || !s.has_messages() {
-                return;
-            }
-            s.context().first().map(|m| m.text()).unwrap_or_default()
-        };
-        let rt = self.app.rt.clone();
-        let model = self.app.turn.model.clone();
-        let tx = self.app_tx.clone();
-        // Mark as titled now so we don't spawn twice.
-        let _ = self.app.session.lock().unwrap().set_title(first.chars().take(50).collect());
-        tokio::spawn(async move {
-            if let Ok(t) = agent::make_title(&rt, &model, &first).await
-                && !t.is_empty() {
-                    let _ = tx.send(Event::Title(t));
-                }
-        });
-    }
-
     // ---------- commands ----------
 
     fn command(&mut self, line: &str) {
@@ -703,17 +679,17 @@ impl Ui {
         match cmd {
             "/new" => {
                 self.interrupt();
-                self.app.session = Arc::new(Mutex::new(Session::new(&self.app.rt.cwd)));
-                self.todos.clear();
-                *self.app.rt.todos.lock().unwrap() = vec![];
-                self.app.rt.read_cache.lock().unwrap().clear();
-                self.rebuild();
-                self.notify("new session");
+                self.attach(Where::New);
             }
             "/resume" => self.open_sessions(),
             "/tree" => self.open_tree(),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
+            "/mcp" => self.mcp_command(arg),
+            "/skills" => {
+                let l: Vec<_> = self.app.rt.skills.iter().map(|s| format!("${}{} ({})", s.name, if s.auto { "*" } else { "" }, s.scope.label())).collect();
+                self.notify(if l.is_empty() { "no skills in ~/.theta/skills".into() } else { format!("{} — * = auto", l.join("  ")) });
+            }
             "/effort" => {
                 if arg.is_empty() {
                     let items = ["low", "medium", "high", "xhigh", "max"]
@@ -728,12 +704,12 @@ impl Ui {
             "/settings" => self.overlay = Some(Overlay::Settings(SettingsView { tab: SettingsTab::General, sel: 0 })),
             "/verbose" => self.toggle_verbose(),
             "/compact" => self.compact_now(),
+            "/btw" => self.btw(arg),
             "/title" => {
                 if arg.is_empty() {
                     self.notify("usage: /title <name>");
                 } else {
-                    let _ = self.app.session.lock().unwrap().set_title(arg.to_string());
-                    self.notify(format!("session: {arg}"));
+                    self.remote.send(Req::Title(arg.to_string()));
                 }
             }
             "/login" => {
@@ -750,6 +726,8 @@ impl Ui {
                     self.logout(arg);
                 }
             }
+            "/usage" => self.report("Usage", |rt| Box::pin(async move { crate::usage::usage(&rt).await })),
+            "/stats" => self.report("Stats", |rt| Box::pin(async move { tokio::task::spawn_blocking(move || crate::usage::stats(&rt.catalog)).await.unwrap_or_default() })),
             "/copy" => self.copy_last(),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -757,11 +735,22 @@ impl Ui {
         }
     }
 
+    /// Open a text overlay and fill it when `job` finishes.
+    fn report(&mut self, title: &str, job: impl FnOnce(crate::agent::Runtime) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>) {
+        self.overlay = Some(Overlay::Report(title.into(), vec!["loading…".into()]));
+        let (tx, fut) = (self.login_tx.clone(), job(self.app.rt.clone()));
+        tokio::spawn(async move {
+            let _ = tx.send(LoginMsg::Report(fut.await));
+        });
+    }
+
     fn logout(&mut self, id: &str) {
         let auth = self.app.rt.auth.clone();
         let id = id.to_string();
+        let remote = self.remote.clone();
         tokio::spawn(async move {
             let _ = auth.remove(&id).await;
+            remote.send(Req::Reload);
         });
         self.notify("credentials removed");
     }
@@ -773,28 +762,26 @@ impl Ui {
     }
 
     fn compact_now(&mut self) {
-        if self.run.is_some() {
+        if self.running {
             return self.notify("busy");
         }
-        let (tx, rx) = unbounded_channel();
-        let rt = self.app.rt.clone();
-        let session = self.app.session.clone();
-        let model = self.app.turn.model.clone();
-        self.run = Some(tokio::spawn(async move {
-            let _ = tx.send(Event::Compacting);
-            match crate::compact::run(&rt, &session, &model).await {
-                Ok(before) => {
-                    let _ = tx.send(Event::Compacted { before });
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::Error(format!("compaction: {e:#}")));
-                }
-            }
-            let _ = tx.send(Event::Done);
-        }));
-        self.run_rx = Some(rx);
-        self.started = Instant::now();
-        self.counts = Counts::default();
+        self.remote.send(Req::Compact);
+    }
+
+    /// Answer a side question from the current context. The daemon never writes it to the session.
+    fn btw(&mut self, question: &str) {
+        if question.is_empty() {
+            return self.notify("usage: /btw <question>");
+        }
+        if self.running {
+            return self.notify("busy");
+        }
+        self.remote.send(Req::Btw(question.to_string()));
+    }
+
+    /// Join (or create) a session in the daemon; the snapshot that comes back resets the view.
+    fn attach(&mut self, target: Where) {
+        self.remote.send(Req::Attach { target, cwd: self.app.rt.cwd.clone(), agent: None, model: None });
     }
 
     fn update_settings(&mut self, key: &str, value: toml::Value, apply: impl FnOnce(&mut config::Settings)) {
@@ -804,6 +791,7 @@ impl Ui {
         if let Err(e) = config::set_global(key, value) {
             self.notify(format!("could not save settings: {e}"));
         }
+        self.remote.send(Req::Reload);
         self.invalidate_all();
     }
 
@@ -815,6 +803,7 @@ impl Ui {
 
     fn set_effort(&mut self, e: &str) {
         self.app.turn.effort = e.to_string();
+        self.remote.send(Req::SetEffort(e.to_string()));
         self.update_settings("effort", e.into(), |s| s.effort = e.into());
         self.notify(format!("effort: {e}"));
     }
@@ -834,6 +823,8 @@ impl Ui {
             let s = &self.app.rt.settings;
             self.app.turn.model = agents::model_of(&agent, s).unwrap_or_else(|| s.model.clone());
             self.app.turn.effort = agents::effort_of(&agent, s).unwrap_or_else(|| s.effort.clone());
+            self.remote.send(Req::SetModel(self.app.turn.model.clone()));
+            self.remote.send(Req::SetEffort(self.app.turn.effort.clone()));
         }
     }
 
@@ -973,7 +964,60 @@ impl Ui {
         self.overlay = Some(Overlay::Login(v));
     }
 
+    /// `/mcp [login|logout|reconnect <server>]`
+    fn mcp_command(&mut self, arg: &str) {
+        let mut it = arg.split_whitespace();
+        let (action, name) = (it.next().unwrap_or("list"), it.next().unwrap_or(""));
+        let mcp = self.app.rt.mcp.clone();
+        if action == "list" {
+            self.remote.send(Req::McpStatus);
+            return;
+        }
+        let Some(cfg) = mcp.config(name).cloned() else { return self.notify(format!("usage: /mcp {action} <server> (see /mcp)")) };
+        let n = name.to_string();
+        match action {
+            "login" => {
+                let (say, mut said) = unbounded_channel();
+                let (paste_tx, paste) = unbounded_channel();
+                let tx = self.login_tx.clone();
+                let remote = self.remote.clone();
+                let mut v = LoginView { title: format!("MCP · {n}"), provider: String::new(), key: false, lines: vec!["starting…".into()], input: Editor::default(), paste: Some(paste_tx), task: None };
+                v.task = Some(tokio::spawn(async move {
+                    let fwd_tx = tx.clone();
+                    let fwd = tokio::spawn(async move {
+                        while let Some(m) = said.recv().await {
+                            let _ = fwd_tx.send(LoginMsg::Say(m));
+                        }
+                    });
+                    let r = crate::mcp::login(&n, &cfg, &mut auth::Io { say, paste }).await;
+                    if r.is_ok() {
+                        remote.send(Req::McpConnect(n.clone()));
+                    }
+                    let _ = fwd.await;
+                    let _ = tx.send(LoginMsg::Done(r.map_err(|e| format!("{e:#}"))));
+                }));
+                self.overlay = Some(Overlay::Login(v));
+            }
+            "logout" => match crate::mcp::logout(name) {
+                Ok(()) => {
+                    self.notify(format!("logged out of {name}"));
+                    self.remote.send(Req::McpConnect(n));
+                }
+                Err(e) => self.push(Item::Error(format!("{e:#}"))),
+            },
+            "reconnect" => {
+                self.notify(format!("reconnecting {name}…"));
+                self.remote.send(Req::McpConnect(n));
+            }
+            _ => self.notify("usage: /mcp [list | login <server> | logout <server> | reconnect <server>]"),
+        }
+    }
+
     fn on_login(&mut self, m: LoginMsg) {
+        if let (LoginMsg::Report(lines), Some(Overlay::Report(_, l))) = (&m, &mut self.overlay) {
+            *l = lines.clone();
+            return;
+        }
         let Some(Overlay::Login(v)) = &mut self.overlay else { return };
         match m {
             LoginMsg::Say(s) => {
@@ -984,12 +1028,14 @@ impl Ui {
                 let t = v.title.clone();
                 self.overlay = None;
                 self.notify(format!("✓ logged in · {t}"));
+                self.remote.send(Req::Reload);
                 self.invalidate_all();
             }
             LoginMsg::Done(Err(e)) => {
                 v.lines.push(format!("✗ {e}"));
                 v.task = None;
             }
+            LoginMsg::Report(_) => {}
         }
     }
 
@@ -1010,6 +1056,7 @@ impl Ui {
                 match t {
                     Target::Main => {
                         self.app.turn.model = value.clone();
+                        self.remote.send(Req::SetModel(value.clone()));
                         self.update_settings("model", value.clone().into(), |s| s.model = v);
                         self.ctx_tokens = crate::compact::current_tokens(&self.app.session.lock().unwrap());
                     }
@@ -1028,15 +1075,7 @@ impl Ui {
             }
             Purpose::Session => {
                 self.interrupt();
-                match Session::open(std::path::Path::new(&value)) {
-                    Ok(s) => {
-                        self.app.session = Arc::new(Mutex::new(s));
-                        self.app.rt.read_cache.lock().unwrap().clear();
-                        self.todos.clear();
-                        self.rebuild();
-                    }
-                    Err(e) => self.notify(format!("cannot open session: {e}")),
-                }
+                self.attach(Where::Resume(value));
             }
             Purpose::Login => self.open_login_methods(&value),
             Purpose::LoginMethod => {
@@ -1049,22 +1088,9 @@ impl Ui {
         }
     }
 
+    /// The daemon applies the agent's model and effort rules and answers with `Push::Meta`.
     fn switch_agent(&mut self, a: Agent) {
-        let s = &self.app.rt.settings;
-        if let Some(m) = agents::model_of(&a, s) {
-            self.app.turn.model = m;
-        } else if agents::model_of(&self.app.turn.agent, s).is_some() {
-            self.app.turn.model = s.model.clone();
-        }
-        if let Some(e) = agents::effort_of(&a, s) {
-            self.app.turn.effort = e;
-        } else if agents::effort_of(&self.app.turn.agent, s).is_some() {
-            self.app.turn.effort = s.effort.clone();
-        }
-        self.notify(format!("agent: {}", agent_label(&a)));
-        theme::set_accent(&a.name);
-        self.invalidate_all();
-        self.app.turn.agent = a;
+        self.remote.send(Req::SetAgent(a.name));
     }
 
     fn cycle_agent(&mut self) {
@@ -1099,7 +1125,7 @@ impl Ui {
             KeyCode::Char('c') if ctrl => {
                 if !self.input.text.is_empty() {
                     self.input.take();
-                } else if self.run.is_some() {
+                } else if self.running {
                     self.interrupt();
                 } else if self.quit_armed.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
                     self.quit = true;
@@ -1110,7 +1136,7 @@ impl Ui {
             }
             KeyCode::Char('d') if ctrl && self.input.text.is_empty() => self.quit = true,
             KeyCode::Esc => {
-                if self.run.is_some() {
+                if self.running {
                     self.interrupt();
                 } else {
                     self.scroll_top = None;
@@ -1249,26 +1275,26 @@ impl Ui {
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
-            Overlay::Help => {}
+            Overlay::Help | Overlay::Report(..) => {}
             Overlay::Ask(mut a) => {
                 let free = a.options.len();
                 match k.code {
-                    KeyCode::Esc => return a.answer(String::new()),
+                    KeyCode::Esc => return a.answer(&self.remote, String::new()),
                     KeyCode::Up => a.sel = a.sel.saturating_sub(1),
                     KeyCode::Down => a.sel = (a.sel + 1).min(free),
                     KeyCode::Enter if a.sel < free => {
                         let o = a.options[a.sel].clone();
-                        return a.answer(o);
+                        return a.answer(&self.remote, o);
                     }
                     KeyCode::Enter => {
                         let t = a.input.text.trim().to_string();
                         if !t.is_empty() {
-                            return a.answer(t);
+                            return a.answer(&self.remote, t);
                         }
                     }
                     KeyCode::Char(c @ '1'..='9') if a.sel < free && (c as usize - '1' as usize) < free => {
                         let o = a.options[c as usize - '1' as usize].clone();
-                        return a.answer(o);
+                        return a.answer(&self.remote, o);
                     }
                     KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                         a.sel = free;
@@ -1363,7 +1389,7 @@ impl Ui {
                     self.overlay = Some(Overlay::Tree(t));
                 }
                 KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('f') => {
-                    if self.run.is_some() {
+                    if self.running {
                         self.notify("interrupt the agent first (Esc)");
                         self.overlay = Some(Overlay::Tree(t));
                         return;
@@ -1374,8 +1400,7 @@ impl Ui {
                         let s = self.app.session.lock().unwrap();
                         if edit { (row.parent.clone(), Some(row.text.clone())) } else { (tree::turn_end(&s, &row.id), None) }
                     };
-                    let _ = self.app.session.lock().unwrap().set_leaf(leaf);
-                    self.rebuild();
+                    self.remote.send(Req::Leaf(leaf));
                     if let Some(text) = text {
                         self.input.set(text);
                         self.notify("edit and press Enter to create a new branch");
@@ -1505,7 +1530,7 @@ impl Ui {
 
     fn item_lines(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
         let it = &self.items[i];
-        let running_turn = self.run.is_some() && !self.items[i + 1..].iter().any(|x| matches!(x, Item::User(_)));
+        let running_turn = self.running && !self.items[i + 1..].iter().any(|x| matches!(x, Item::User(_)));
         match it {
             Item::User(t) => {
                 let mut out = vec![Line::default()];
@@ -1605,7 +1630,7 @@ impl Ui {
         let mut all = Vec::new();
         for i in 0..self.items.len() {
             let running_tool = matches!(self.items[i], Item::Tool { state: ToolState::Running, .. });
-            let reusable = !self.dirty[i] && !running_tool && self.run.is_none();
+            let reusable = !self.dirty[i] && !running_tool && !self.running;
             let lines = match &self.cache[i] {
                 Some((w, f, l)) if reusable && *w == width && *f == full => l.clone(),
                 _ => {
@@ -1626,8 +1651,8 @@ impl Ui {
         let inner_w = width.saturating_sub(2);
         let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
         let input_h = (input_lines.len().min(8) + 2) as u16;
-        let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && self.run.is_none() { 0 } else { (self.todos.len().min(8) + 1) as u16 };
-        let show_progress = self.run.is_some() || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
+        let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
+        let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, input_area, status] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(todo_h),
@@ -1671,9 +1696,9 @@ impl Ui {
         // progress line
         if show_progress {
             let mut spans = Vec::new();
-            let secs = if self.run.is_some() { self.started.elapsed() } else { self.elapsed }.as_secs();
+            let secs = if self.running { self.started.elapsed() } else { self.elapsed }.as_secs();
             let time = if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") };
-            if self.run.is_some() {
+            if self.running {
                 // ✻ Pondering… (12s · ↓ 1.2k tokens · esc to interrupt)
                 spans.push(Span::styled(format!(" {} ", PULSE[self.spin % PULSE.len()]), theme::accent()));
                 let verb = if self.status.starts_with("compacting") { "Compacting" } else if self.status.starts_with("waiting") { "Waiting for you" } else { self.verb };
@@ -1700,7 +1725,7 @@ impl Ui {
         }
 
         // input
-        let border = if self.run.is_some() { theme::dim() } else { theme::accent() };
+        let border = if self.running { theme::dim() } else { theme::accent() };
         let block = UiBlock::bordered().border_type(BorderType::Rounded).border_style(border);
         let inner = block.inner(input_area);
         f.render_widget(block, input_area);
@@ -1776,10 +1801,12 @@ impl Ui {
     }
 
     fn splash(&self, h: usize) -> Vec<Line<'static>> {
+        const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
-        let mut out = vec![Line::default(); h.saturating_sub(9) / 2];
-        out.push(Line::from(vec![Span::styled("  θ", theme::accent().add_modifier(Modifier::BOLD)), Span::styled("  theta", Style::default().add_modifier(Modifier::BOLD))]));
-        out.push(Line::default());
+        let accent = theme::accent();
+        let mut out: Vec<Line<'static>> = LOGO.iter().map(|l| Line::from(Span::styled(format!("  {l}"), accent))).collect();
+        out.push(Line::from(Span::styled(format!("  θ v{}  ·  terminal coding agent", env!("CARGO_PKG_VERSION")), theme::dim())));
+        out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
         out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));
         out.push(Line::from(vec![Span::styled("  model  ", theme::dim()), Span::raw(self.app.turn.model.clone())]));
         out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(self.app.rt.cwd.display().to_string())]));
@@ -1790,9 +1817,20 @@ impl Ui {
                 out.push(Line::from(vec![Span::styled("  ! ", theme::err()), Span::raw(format!("no credentials for {} — run ", p.name)), Span::styled("/login", theme::accent()), Span::raw(" or pick another model with "), Span::styled("ctrl+p", theme::accent())]));
             }
         }
-        out.push(Line::default());
-        out.push(Line::from(Span::styled("  /help  ·  tab agent  ·  ctrl+p model  ·  ctrl+t tree  ·  ctrl+o compact output", theme::dim())));
-        out
+        out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
+        out.push(Line::from(vec![
+            Span::styled("  /help", accent),
+            Span::styled(" commands  ·  ", theme::dim()),
+            Span::styled("tab", accent),
+            Span::styled(" agent  ·  ", theme::dim()),
+            Span::styled("ctrl+p", accent),
+            Span::styled(" model  ·  ", theme::dim()),
+            Span::styled("ctrl+t", accent),
+            Span::styled(" tree", theme::dim()),
+        ]));
+        let mut top = vec![Line::default(); h.saturating_sub(out.len()) / 2];
+        top.extend(out);
+        top
     }
 
     fn draw_overlay(&self, f: &mut Frame, ov: &Overlay, area: Rect) {
@@ -1800,6 +1838,7 @@ impl Ui {
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 13,
+            Overlay::Report(_, l) => l.len(),
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len(),
             Overlay::Settings(v) => self.settings_rows(v.tab).len() + 3,
@@ -1828,6 +1867,11 @@ impl Ui {
                     let col = 5 + a.input.text[..a.input.cur].width();
                     f.set_cursor_position((r.x + 1 + col as u16, r.y + 1 + row as u16));
                 }
+            }
+            Overlay::Report(title, lines) => {
+                let l = lines.iter().map(|x| Line::from(Span::styled(x.clone(), if x.starts_with(' ') || x.starts_with("loading") { Style::default() } else { theme::accent().add_modifier(Modifier::BOLD) }))).collect::<Vec<_>>();
+                let b = block(title).title_bottom(Line::from(Span::styled(" any key to close ", theme::dim())));
+                f.render_widget(Paragraph::new(l).block(b), r);
             }
             Overlay::Login(v) => {
                 let mut l = Vec::new();
@@ -1974,9 +2018,60 @@ fn teardown() {
     ratatui::restore();
 }
 
-pub async fn run(app: App, initial: Option<String>) -> Result<()> {
-    let (app_tx, mut app_rx) = unbounded_channel();
+impl Ui {
+    /// Replace the whole view with a session the daemon just handed us (first attach, /new, /resume, reconnect).
+    fn on_snapshot(&mut self, snap: Snapshot) {
+        *self.app.session.lock().unwrap() = Session::mirror(snap.entries);
+        self.apply_meta(&snap.agent, snap.model, snap.effort);
+        self.todos = snap.todos;
+        self.asks.clear();
+        self.overlay = None;
+        self.running = false;
+        self.rebuild();
+        if snap.running {
+            self.begin_run();
+            for e in snap.replay {
+                self.on_event(e);
+            }
+        }
+    }
+
+    fn apply_meta(&mut self, agent: &str, model: String, effort: String) {
+        if let Some(a) = agents::find(&self.app.rt.agents, agent).cloned() {
+            if a.name != self.app.turn.agent.name {
+                self.notify(format!("agent: {}", agent_label(&a)));
+            }
+            theme::set_accent(&a.name);
+            self.app.turn.agent = a;
+        }
+        self.app.turn.model = model;
+        self.app.turn.effort = effort;
+        self.ctx_tokens = crate::compact::current_tokens(&self.app.session.lock().unwrap());
+        self.invalidate_all();
+    }
+
+    fn on_push(&mut self, p: Push) {
+        match p {
+            Push::Snapshot(s) => self.on_snapshot(*s),
+            Push::Event(e) => self.on_event(e),
+            Push::Entry(e) => {
+                let moved = matches!(e.kind, Kind::Leaf { .. });
+                self.app.session.lock().unwrap().apply(e);
+                if moved && !self.running {
+                    self.rebuild();
+                }
+            }
+            Push::Meta { agent, model, effort } => self.apply_meta(&agent, model, effort),
+            Push::Notice(n) => self.push(Item::Info(n)),
+            Push::Err(e) => self.push(Item::Error(e)),
+        }
+    }
+}
+
+pub async fn run(rt: crate::agent::Runtime, remote: Remote, mut pushes: UnboundedReceiver<Push>, snap: Snapshot, initial: Option<String>) -> Result<()> {
     let (login_tx, mut login_rx) = unbounded_channel();
+    let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
+    let app = App { rt, session: Arc::new(Mutex::new(Session::mirror(vec![]))), turn };
     let mut ui = Ui {
         app,
         items: vec![],
@@ -1988,8 +2083,8 @@ pub async fn run(app: App, initial: Option<String>) -> Result<()> {
         scroll_top: None,
         last_total: 0,
         last_view: 0,
-        run_rx: None,
-        run: None,
+        remote,
+        running: false,
         started: Instant::now(),
         elapsed: Duration::ZERO,
         counts: Counts::default(),
@@ -1998,7 +2093,6 @@ pub async fn run(app: App, initial: Option<String>) -> Result<()> {
         todos: vec![],
         cost: 0.0,
         ctx_tokens: 0,
-        app_tx,
         quit_armed: None,
         notice: None,
         spin: 0,
@@ -2008,12 +2102,10 @@ pub async fn run(app: App, initial: Option<String>) -> Result<()> {
         asks: VecDeque::new(),
         login_tx,
         cmd_sel: 0,
-        handoff: None,
         settings_back: None,
         quit: false,
     };
-    theme::set_accent(&ui.app.turn.agent.name);
-    ui.rebuild();
+    ui.on_snapshot(snap);
     // Prompt history from previous sessions in this directory.
     if let Some(i) = session::list(&ui.app.rt.cwd).first()
         && let Ok(s) = Session::open(&i.path) {
@@ -2051,22 +2143,22 @@ pub async fn run(app: App, initial: Option<String>) -> Result<()> {
                 Some(Err(_)) | None => break,
                 _ => {}
             },
-            ev = async { match ui.run_rx.as_mut() { Some(r) => r.recv().await, None => std::future::pending().await } } => {
-                match ev {
-                    Some(e) => {
-                        ui.on_event(e);
-                        // Drain whatever else is queued before redrawing.
-                        while let Some(e) = ui.run_rx.as_mut().and_then(|r| r.try_recv().ok()) {
-                            ui.on_event(e);
-                        }
+            p = pushes.recv() => match p {
+                Some(p) => {
+                    ui.on_push(p);
+                    // Drain whatever else is queued before redrawing.
+                    while let Ok(p) = pushes.try_recv() {
+                        ui.on_push(p);
                     }
-                    None => { ui.run_rx = None; ui.run = None; }
                 }
-            }
-            Some(e) = app_rx.recv() => ui.on_event(e),
+                None => {
+                    ui.push(Item::Error("connection to the daemon lost".into()));
+                    ui.running = false;
+                }
+            },
             Some(m) = login_rx.recv() => ui.on_login(m),
             _ = tick.tick() => {
-                if ui.run.is_some() {
+                if ui.running {
                     ui.spin += 1;
                 }
             }
@@ -2079,13 +2171,11 @@ pub async fn run(app: App, initial: Option<String>) -> Result<()> {
             break;
         }
     }
-    if let Some(h) = ui.run.take() {
-        h.abort();
-    }
     teardown();
     let s = ui.app.session.lock().unwrap();
     if s.has_messages() {
-        println!("θ session saved · resume with: theta -r {}", s.id);
+        let live = if ui.running { " · still running in the background" } else { "" };
+        println!("θ session saved{live} · resume with: theta -r {}", s.id);
     }
     Ok(())
 }
