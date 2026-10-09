@@ -42,6 +42,18 @@ fn turns<'a>(s: &'a Session, from: Option<&str>) -> Vec<&'a Entry> {
     out
 }
 
+/// Newest user prompt on the active branch: its parent and text. Stops at a compaction.
+pub fn last_prompt(s: &Session) -> Option<(Option<String>, String)> {
+    for e in s.path_to(s.leaf.as_deref()).iter().rev() {
+        match &e.kind {
+            Kind::Msg { msg, .. } if visible(e) => return Some((e.parent.clone(), msg.text())),
+            Kind::Compaction { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Last entry of the turn started at `id` (following the newest continuation).
 pub fn turn_end(s: &Session, id: &str) -> Option<String> {
     let mut cur = id.to_string();
@@ -132,6 +144,20 @@ mod tests {
         assert_eq!(t.rows[0].reply, "ra");
         assert!(t.rows[2].current);
         assert_eq!(turn_end(&s, &a), Some(r));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn last_prompt_is_newest_user_turn() {
+        let tmp = std::env::temp_dir().join(format!("theta-undo-{}", rand::random::<u32>()));
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("THETA_HOME", &tmp) };
+        let mut s = Session::new(std::path::Path::new("/tmp/p"));
+        assert!(last_prompt(&s).is_none());
+        s.add_msg(Msg::user("a"), None).unwrap();
+        let r = s.add_msg(Msg { role: Role::Assistant, content: vec![Block::Text { text: "ra".into() }], model: None }, None).unwrap();
+        s.add_msg(Msg::user("b"), None).unwrap();
+        assert_eq!(last_prompt(&s), Some((Some(r), "b".into())));
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

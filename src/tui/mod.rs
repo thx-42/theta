@@ -84,6 +84,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "open a previous session"),
     ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
+    ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
     ("/agent", "change agent"),
     ("/skills", "list skills (use $name in a message)"),
@@ -800,6 +801,7 @@ impl Ui {
                 },
             },
             "/tree" => self.open_tree(),
+            "/undo" => self.undo_turn(),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
             "/mcp" => self.mcp_command(arg),
@@ -1154,6 +1156,18 @@ impl Ui {
             }
             LoginMsg::Report(_) => {}
         }
+    }
+
+    /// Drop the last turn from the active branch (kept in the tree) and edit its prompt.
+    fn undo_turn(&mut self) {
+        if self.running {
+            return self.notify("interrupt the agent first (Esc)");
+        }
+        let last = tree::last_prompt(&self.app.session.lock().unwrap());
+        let Some((parent, text)) = last else { return self.notify("nothing to undo") };
+        self.remote.send(Req::Leaf(parent));
+        self.input.set(text);
+        self.notify("undone: edit and press Enter to resend");
     }
 
     fn open_tree(&mut self) {
