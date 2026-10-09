@@ -7,6 +7,7 @@ mod tree;
 use crate::agent::Event;
 use crate::auth::{self, Method};
 use crate::agents::{self, Agent};
+use base64::Engine;
 use crate::client::Remote;
 use tabs::{Tab, TabStatus, View};
 use crate::config;
@@ -393,7 +394,9 @@ struct Ui {
     /// A run (turn, compaction or side question) is active in the daemon.
     running: bool,
     /// Messages typed during a run; sent together when it ends.
-    queued: Vec<String>,
+    queued: Vec<(String, Vec<Block>)>,
+    /// Images pasted into the next message (`Block::Image`), shown above the text.
+    images: Vec<Block>,
     /// First Esc of a double press; the second one within 2s stops the agent.
     esc_at: Option<Instant>,
     /// The last run was stopped by the user.
@@ -431,6 +434,10 @@ struct Ui {
     shell_tx: UnboundedSender<String>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
+    /// Sidebar rect as drawn last frame (vertical only; empty otherwise).
+    sidebar: Rect,
+    /// Live sidebar width while dragging its divider; saved on release.
+    drag: Option<u16>,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -531,16 +538,31 @@ impl Ui {
 
     // ---------- running ----------
 
-    fn send(&mut self, text: String) {
+    fn send(&mut self, text: String, images: Vec<Block>) {
         if self.running {
-            self.queued.push(text);
+            self.queued.push((text, images));
             self.notify(format!("queued until the agent finishes ({} waiting) — ctrl+enter sends it now", self.queued.len()));
             return;
         }
-        self.history.push(text.clone());
+        if !text.is_empty() {
+            self.history.push(text.clone());
+        }
         self.hist = None;
         self.save_tabs();
-        self.remote.send(Req::Send(text));
+        self.remote.send(Req::Send(text, images));
+    }
+
+    /// Ctrl+V: an image on the clipboard is attached; otherwise its text is pasted.
+    fn paste_clipboard(&mut self) {
+        if let Some(png) = clipboard_image() {
+            if png.len() > MAX_IMAGE_BYTES {
+                return self.notify("image too large (max 5 MB)");
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&png);
+            self.images.push(Block::Image { mime: "image/png".into(), data });
+        } else if let Some(text) = clipboard_text() {
+            self.input.insert(&normalize_paste(&text));
+        }
     }
 
     /// `!cmd`: run in the user's shell, in this project's directory, without the agent.
@@ -573,6 +595,9 @@ impl Ui {
         if text.is_empty() {
             return;
         }
+        if !self.images.is_empty() {
+            return self.notify("images can't be steered: press enter to queue them");
+        }
         self.input.take();
         self.history.push(text.clone());
         self.hist = None;
@@ -584,8 +609,8 @@ impl Ui {
         if self.queued.is_empty() {
             return;
         }
-        let text = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
-        self.send(text);
+        let (texts, images): (Vec<String>, Vec<Vec<Block>>) = self.queued.drain(..).unzip();
+        self.send(texts.join("\n\n"), images.into_iter().flatten().collect());
     }
 
     /// A run began (here or in another client): reset the progress display.
@@ -1223,8 +1248,9 @@ impl Ui {
                 self.cmd_sel = if k.code == KeyCode::Up { (self.cmd_sel + n - 1) % n } else { (self.cmd_sel + 1) % n };
             }
             KeyCode::Char('c') if ctrl => {
-                if !self.input.text.is_empty() {
+                if !self.input.text.is_empty() || !self.images.is_empty() {
                     self.input.take();
+                    self.images.clear();
                 } else if self.running {
                     self.interrupt();
                 } else if self.quit_armed.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
@@ -1261,11 +1287,12 @@ impl Ui {
                 self.input.text.replace_range(start..end, "");
             }
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
+            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
             KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => self.input.insert("\n"),
             KeyCode::Enter | KeyCode::Char('j') if ctrl && self.running => self.steer(),
             KeyCode::Enter => {
                 let text = self.input.text.trim().to_string();
-                if text.is_empty() {
+                if text.is_empty() && self.images.is_empty() {
                     return;
                 }
                 // A half-typed $skill completes first; a full name sends.
@@ -1298,7 +1325,8 @@ impl Ui {
                     return;
                 }
                 self.input.take();
-                self.send(text);
+                let images = std::mem::take(&mut self.images);
+                self.send(text, images);
             }
             KeyCode::Tab => {
                 if let Some((c, _)) = hints.get(self.cmd_sel).cloned() {
@@ -1314,6 +1342,9 @@ impl Ui {
                 let i = order.iter().position(|e| *e == self.app.turn.effort).unwrap_or(1);
                 let e = order[(i + 1) % order.len()];
                 self.set_effort(e);
+            }
+            KeyCode::Backspace if self.input.text.is_empty() => {
+                self.images.pop();
             }
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -1820,7 +1851,7 @@ impl Ui {
     fn draw(&mut self, f: &mut Frame) {
         let vertical = self.app.rt.settings.tab_orientation == "vertical";
         let infos = self.tab_infos();
-        let width = self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX);
+        let width = self.drag.unwrap_or(self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX));
         let (strip_area, area) = if vertical {
             let [a, b] = Layout::horizontal([Constraint::Length(width), Constraint::Min(20)]).areas(f.area());
             (a, b)
@@ -1828,13 +1859,15 @@ impl Ui {
             let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(f.area());
             (a, b)
         };
+        self.sidebar = if vertical { strip_area } else { Rect::default() };
         let (lines, strip) = tabs::strip(strip_area, &infos, self.spin, vertical);
         f.render_widget(Paragraph::new(lines), strip_area);
         self.strip = strip;
         let width = area.width as usize;
         let inner_w = width.saturating_sub(2);
         let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
-        let input_h = (input_lines.len().min(8) + 2) as u16;
+        let chips = u16::from(!self.images.is_empty());
+        let input_h = (input_lines.len().min(8) + 2) as u16 + chips;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, input_area, status] = Layout::vertical([
@@ -1916,16 +1949,21 @@ impl Ui {
         f.render_widget(block, input_area);
         let skip = cursor.0.saturating_sub(7);
         let mut il: Vec<Line> = Vec::new();
+        if !self.images.is_empty() {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend((1..=self.images.len()).map(|n| Span::styled(format!("[image {n}] "), theme::accent())));
+            il.push(Line::from(spans));
+        }
         for (n, l) in input_lines.iter().enumerate().skip(skip).take(8) {
             let prefix = if n == 0 { Span::styled("› ", theme::accent()) } else { Span::raw("  ") };
             il.push(Line::from(vec![prefix, Span::raw(l.clone())]));
         }
-        if self.input.text.is_empty() {
+        if self.input.text.is_empty() && self.images.is_empty() {
             il = vec![Line::from(vec![Span::styled("› ", theme::accent()), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
         }
         f.render_widget(Paragraph::new(il), inner);
         if self.overlay.is_none() {
-            f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + (cursor.0 - skip) as u16));
+            f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + chips + (cursor.0 - skip) as u16));
         }
 
         // slash-command hints
@@ -2182,6 +2220,41 @@ impl Ui {
 /// Rows `text` takes when wrapped at `width` (approximate: by display width, per line).
 fn wrapped_rows(text: &str, width: usize) -> usize {
     text.lines().map(|l| l.width().div_ceil(width.max(1)).max(1)).sum::<usize>().max(1)
+}
+
+/// Largest image attached from the clipboard (Anthropic's limit).
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Stdout of the first command that succeeds with output.
+fn clipboard_out(cmds: &[&[&str]]) -> Option<Vec<u8>> {
+    cmds.iter().find_map(|c| {
+        let o = std::process::Command::new(c[0]).args(&c[1..]).stderr(std::process::Stdio::null()).output().ok()?;
+        (o.status.success() && !o.stdout.is_empty()).then_some(o.stdout)
+    })
+}
+
+/// PNG bytes on the clipboard, if any.
+fn clipboard_image() -> Option<Vec<u8>> {
+    if cfg!(target_os = "macos") {
+        if let Some(png) = clipboard_out(&[&["pngpaste", "-"]]) {
+            return Some(png);
+        }
+        // osascript prints the PNG as hex: «data PNGf89504E47…»
+        let s = String::from_utf8(clipboard_out(&[&["osascript", "-e", "the clipboard as «class PNGf»"]])?).ok()?;
+        let hex = s.trim().strip_prefix("«data PNGf")?.strip_suffix('»')?;
+        return (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
+    }
+    clipboard_out(&[&["wl-paste", "--type", "image/png"], &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]])
+}
+
+fn clipboard_text() -> Option<String> {
+    let cmds: &[&[&str]] = if cfg!(target_os = "macos") { &[&["pbpaste"]] } else { &[&["wl-paste", "-n"], &["xclip", "-selection", "clipboard", "-o"], &["xsel", "-b", "-o"]] };
+    String::from_utf8(clipboard_out(cmds)?).ok()
+}
+
+/// Pasted text as the input shows it: newlines only, tabs as spaces, no other control characters.
+fn normalize_paste(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ").chars().filter(|c| *c == '\n' || !c.is_control()).collect()
 }
 
 fn clipboard(text: &str) -> bool {
@@ -2457,6 +2530,18 @@ impl Ui {
         self.update_settings("tab_width", (v as i64).into(), |s| s.tab_width = v);
     }
 
+    /// The sidebar's right edge: grab it and drag to resize.
+    fn on_divider(&self, col: u16, row: u16) -> bool {
+        self.sidebar.width > 0 && col == self.sidebar.right() - 1 && row >= self.sidebar.y && row < self.sidebar.bottom()
+    }
+
+    /// Release after a drag: save the new width once.
+    fn end_drag(&mut self) {
+        if let Some(w) = self.drag.take() {
+            self.set_tab_width(w);
+        }
+    }
+
     /// Mouse on the tab strip: × closes, the title switches, + opens a new session.
     fn on_click(&mut self, col: u16, row: u16) {
         if self.overlay.is_some() {
@@ -2581,6 +2666,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         remote,
         running: false,
         queued: vec![],
+        images: vec![],
         esc_at: None,
         interrupted: false,
         restoring: 0,
@@ -2610,6 +2696,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         opened_tx,
         shell_tx,
         strip: tabs::Strip::default(),
+        sidebar: Rect::default(),
+        drag: None,
     };
     ui.forward(0, pushes);
     let first = snap.session_id.clone();
@@ -2625,7 +2713,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     if let Some(p) = initial {
-        ui.send(p);
+        ui.send(p, vec![]);
     }
     loop {
         term.draw(|f| ui.draw(f))?;
@@ -2633,7 +2721,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
             ev = events.next() => match ev {
                 Some(Ok(CEvent::Key(k))) => ui.on_key(k),
                 Some(Ok(CEvent::Paste(s))) => {
-                    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+                    let s = normalize_paste(&s);
                     match &mut ui.overlay {
                         None => ui.input.insert(&s),
                         Some(Overlay::Ask(a)) => {
@@ -2647,6 +2735,9 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 Some(Ok(CEvent::Mouse(m))) => match m.kind {
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),
+                    MouseEventKind::Down(MouseButton::Left) if ui.on_divider(m.column, m.row) => ui.drag = Some(ui.sidebar.width),
+                    MouseEventKind::Drag(MouseButton::Left) if ui.drag.is_some() => ui.drag = Some(m.column.saturating_sub(ui.sidebar.x) + 1),
+                    MouseEventKind::Up(MouseButton::Left) if ui.drag.is_some() => ui.end_drag(),
                     MouseEventKind::Down(MouseButton::Left) => ui.on_click(m.column, m.row),
                     _ => {}
                 },
@@ -2696,5 +2787,11 @@ mod tests {
         assert_eq!(color_for("Build"), color_for("build"));
         assert_ne!(color_for("Build"), color_for("Plan"));
         assert!((16..232).contains(&color_for("Review")));
+    }
+
+    #[test]
+    fn paste_keeps_newlines_drops_control_chars() {
+        use super::normalize_paste;
+        assert_eq!(normalize_paste("a\r\nb\rc\td\x1b[0m"), "a\nb\nc    d[0m");
     }
 }

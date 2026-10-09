@@ -3,7 +3,7 @@
 use crate::agent::{self, Event, Runtime, Steer, Turn};
 use crate::proto::{Push, Req, Snapshot, Target, socket_path};
 use crate::session::{self, Session};
-use crate::types::Msg;
+use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -293,13 +293,16 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
         let _ = out.send(Push::Err(m.into()));
     };
     match req {
-        Req::Send(text) => {
+        Req::Send(text, images) => {
             let mut st = live.st.lock().unwrap();
             if st.run.is_some() {
                 return err("agent is running");
             }
             let expanded = crate::skills::expand(&st.rt.skills, &text);
-            if let Err(e) = live.session.lock().unwrap().add_msg(Msg::user(expanded), None) {
+            let mut content: Vec<Block> = if expanded.is_empty() { vec![] } else { vec![Block::Text { text: expanded }] };
+            content.extend(images);
+            let msg = Msg { role: Role::User, content, model: None };
+            if let Err(e) = live.session.lock().unwrap().add_msg(msg, None) {
                 return err(&format!("{e:#}"));
             }
             let _ = live.bus.send(Push::Event(Event::User(text)));
@@ -309,7 +312,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             if live.st.lock().unwrap().run.is_some() {
                 live.steer.lock().unwrap().push_back(text);
             } else {
-                handle(live, Req::Send(text), out);
+                handle(live, Req::Send(text, vec![]), out);
             }
         }
         Req::Interrupt => interrupt(live),

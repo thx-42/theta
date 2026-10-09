@@ -3,6 +3,7 @@
 use crate::agent::Event;
 use crate::session::Entry;
 use crate::tools::Todo;
+use crate::types::Block;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -24,7 +25,8 @@ pub enum Target {
 pub enum Req {
     /// Subscribe this connection to a session (replaces the previous one) and get a `Push::Snapshot`.
     Attach { target: Target, cwd: PathBuf, agent: Option<String>, model: Option<String> },
-    Send(String),
+    /// Text and attached images (`Block::Image`) of a new user message.
+    Send(String, Vec<Block>),
     /// Message for a run in progress: it joins the conversation at the agent's next step. Idle: same as `Send`.
     Steer(String),
     /// Open tabs of `cwd`, in tab order, so the next start can reopen them.
