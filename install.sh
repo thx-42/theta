@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # θ theta — installeur / mise à jour / désinstallation
 # usage: install.sh [install [--release|--source]|update|uninstall|status|help]
-# one-liner: curl -fsSL https://raw.githubusercontent.com/theaux42/theta/main/install.sh | bash
+# one-liner: curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash
 
 set -euo pipefail
 
@@ -10,7 +10,7 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "$(dirname "${BASH_SOURCE[0]}")/Cargo.toml"
   SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 BIN_NAME="theta"
-REPO="${THETA_REPO:-theaux42/theta}"
+REPO="${THETA_REPO:-thx-42/theta}"
 PREFIX="${THETA_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 STATE="$HOME/.theta/install"

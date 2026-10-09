@@ -31,6 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: release tag
+        shell: bash
+        run: echo "THETA_TAG=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)-${{ github.run_number }}" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: package
         run: tar -C target/${{ matrix.target }}/release -czf theta-${{ matrix.target }}.tar.gz theta

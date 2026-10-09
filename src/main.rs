@@ -16,6 +16,7 @@ mod session;
 mod tools;
 mod tui;
 mod types;
+mod update;
 mod usage;
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "theta", version, about = "θ — lightweight coding agent")]
+#[command(name = "theta", version = update::VERSION, about = "θ — lightweight coding agent")]
 struct Cli {
     /// Prompt; with -p runs non-interactively and prints the answer.
     prompt: Vec<String>,
@@ -67,6 +68,15 @@ enum Cmd {
     Refresh,
     /// The background server (started automatically on first use). `theta daemon stop` stops it.
     Daemon { action: Option<String> },
+    /// Check for a newer release and install it.
+    Update {
+        /// Only report whether a newer version exists.
+        #[arg(long)]
+        check: bool,
+        /// Install even when already up to date or on a local build.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub struct App {
@@ -171,6 +181,9 @@ async fn main() -> Result<()> {
             Some(a) => bail!("unknown action `{a}` (stop)"),
         };
     }
+    if let Some(Cmd::Update { check, force }) = &cli.cmd {
+        return update::run(*check, *force).await;
+    }
     let cwd = std::env::current_dir()?;
     let rt = build_runtime(cwd.clone()).await?;
     match cli.cmd {
@@ -252,7 +265,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
-        Some(Cmd::Daemon { .. }) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. }) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");

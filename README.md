@@ -5,10 +5,12 @@ Harness de coding agent léger en Rust : petit, configurable, économe en tokens
 ## Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/theaux42/theta/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash
 ```
 
 Le script demande : binaire pré-compilé (release GitHub, sha256 vérifié) ou compilation depuis les sources. Installe dans `~/.local/bin` (`THETA_PREFIX` pour changer). Chaque push sur `main` publie une release (Linux/macOS, x86_64/arm64).
+
+Mise à jour depuis θ lui-même : `theta update` cherche la dernière release, vérifie le sha256 et remplace le binaire (`--check` pour seulement regarder, `--force` pour réinstaller ou remplacer un build local). Si le daemon tourne, `theta daemon stop` le relance sur la nouvelle version.
 
 Suivi des mises à jour (depuis un clone, ou `curl … | bash -s -- <cmd>`) :
 
@@ -27,7 +29,7 @@ theta -p "explique src/main.rs"   # mode print (non interactif)
 ```
 
 Options : `-c` reprend la dernière session du dossier, `-r <id>` une session précise, `-m provider/model`, `-a <agent>`.
-Sous-commandes : `login [provider]`, `logout <provider>`, `models [filtre]`, `agents`, `refresh` (catalogue models.dev).
+Sous-commandes : `login [provider]`, `logout <provider>`, `models [filtre]`, `agents`, `refresh` (catalogue models.dev), `update [--check] [--force]`.
 
 ## Providers
 
