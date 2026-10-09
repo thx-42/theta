@@ -12,6 +12,7 @@ use crate::types::{Block, Delta, Msg, Role, ToolDef, Usage};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -99,13 +100,14 @@ impl Runtime {
         }
     }
 
-    fn tool_ctx(&self) -> ToolCtx {
+    fn tool_ctx(&self, session_id: &str) -> ToolCtx {
         ToolCtx {
             cwd: self.cwd.clone(),
             settings: self.settings.clone(),
             http: self.http.clone(),
             todos: self.todos.clone(),
             read_cache: self.read_cache.clone(),
+            session_id: session_id.to_string(),
         }
     }
 
@@ -176,16 +178,30 @@ fn is_overflow(e: &anyhow::Error) -> bool {
     s.contains("prompt is too long") || s.contains("context_length") || s.contains("maximum context") || s.contains("too many tokens") || s.contains("context window")
 }
 
+/// Messages the user sent while a run was active; the run moves them into the session at its next safe point.
+pub type Steer = Arc<Mutex<VecDeque<String>>>;
+
+/// Append steered messages as user turns. Returns true when there were any.
+fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runtime) -> bool {
+    let texts: Vec<String> = steer.lock().unwrap().drain(..).collect();
+    for t in &texts {
+        let _ = session.lock().unwrap().add_msg(Msg::user(crate::skills::expand(&rt.skills, t)), None);
+        let _ = tx.send(Event::User(t.clone()));
+    }
+    !texts.is_empty()
+}
+
 /// Run until the model answers without tool calls. Appends everything to `session`.
-pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx) -> Result<()> {
+pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
     let system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills));
     let tools = rt.tools_for(&turn.agent, turn.depth);
     let session_id = session.lock().unwrap().id.clone();
-    let ctx = rt.tool_ctx();
+    let ctx = rt.tool_ctx(&session_id);
     let mut overflow_retry = false;
     let mut compact_failed = false;
     loop {
+        drain_steer(&steer, &session, &tx, &rt);
         if rt.settings.compaction.enabled && !compact_failed && compact::needed(&session.lock().unwrap(), &model, &rt.settings) {
             let _ = tx.send(Event::Compacting);
             match compact::run(&rt, &session, &turn.model).await {
@@ -224,6 +240,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx) 
         session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
         let _ = tx.send(Event::Step { usage: resp.usage.clone(), model: model.key() });
         if calls.is_empty() {
+            if drain_steer(&steer, &session, &tx, &rt) {
+                continue;
+            }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
                 let _ = tx.send(Event::Error("reply cut off at the output token limit — say \"continue\" to resume".into()));
             }
@@ -325,7 +344,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
     });
-    let res = Box::pin(run(rt.clone(), session.clone(), turn, stx)).await;
+    let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
     let _ = forward.await;
     res?;
     let answer = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();

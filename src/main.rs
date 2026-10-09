@@ -135,7 +135,7 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
     app.rt.mcp.connect_all().await;
     app.session.lock().unwrap().add_msg(types::Msg::user(skills::expand(&app.rt.skills, &prompt)), None)?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = tokio::spawn(agent::run(app.rt.clone(), app.session.clone(), app.turn.clone(), tx));
+    let handle = tokio::spawn(agent::run(app.rt.clone(), app.session.clone(), app.turn.clone(), tx, Default::default()));
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     while let Some(ev) = rx.recv().await {
@@ -289,7 +289,10 @@ async fn main() -> Result<()> {
             proto::Target::Resume(if p.exists() { p.canonicalize()?.display().to_string() } else { r.clone() })
         }
         (None, true) => proto::Target::Continue,
-        (None, false) => proto::Target::New,
+        (None, false) => match session::saved_open(&cwd).into_iter().next() {
+            Some(first) => proto::Target::Resume(first),
+            None => proto::Target::New,
+        },
     };
     let (remote, pushes, snap) = client::open(target, cwd, cli.agent, cli.model).await?;
     tui::run(rt, remote, pushes, snap, (!prompt.is_empty()).then_some(prompt)).await

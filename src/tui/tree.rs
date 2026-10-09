@@ -118,6 +118,7 @@ mod tests {
     #[test]
     fn branches_render() {
         let tmp = std::env::temp_dir().join(format!("theta-tree-{}", rand::random::<u32>()));
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("THETA_HOME", &tmp) };
         let mut s = Session::new(std::path::Path::new("/tmp/p"));
         let a = s.add_msg(Msg::user("a"), None).unwrap();

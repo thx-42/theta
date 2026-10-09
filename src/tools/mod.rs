@@ -28,6 +28,8 @@ pub struct ToolCtx {
     pub todos: Arc<Mutex<Vec<Todo>>>,
     /// path -> content hash of the last full read, to answer "unchanged" on re-reads.
     pub read_cache: Arc<Mutex<HashMap<String, u64>>>,
+    /// Session the tools run for; `write_plan` names its file after it.
+    pub session_id: String,
 }
 
 pub struct ToolOut {
@@ -57,7 +59,7 @@ pub enum Kind {
 pub fn kind(name: &str) -> Kind {
     match name {
         "read" | "ls" | "find" | "grep" => Kind::Read,
-        "write" | "edit" => Kind::Write,
+        "write" | "edit" | "write_plan" => Kind::Write,
         "bash" => Kind::Command,
         _ => Kind::Other,
     }
@@ -84,6 +86,8 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]})),
         def("ls", "List a directory (dirs end with /).",
             json!({"type":"object","properties":{"path":{"type":"string"}}})),
+        def("write_plan", "Save the plan of this session as markdown in ~/.theta/plan/. Each session has its own file, rewritten on every call.",
+            json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]})),
         def("todo", "Replace the task list. Use it for multi-step work: keep exactly one item in_progress, mark items done as soon as they are finished.",
             json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["todos"]})),
         def("ask", "Ask the user a question and wait for the answer. Use it only when you are blocked on a decision that is the user's to make. `type`: choice (give 2-6 `options`), yes_no, or text. The user can always type a free answer instead.",
@@ -155,6 +159,7 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
     let res = match name {
         "read" => fs::read(args, ctx),
         "write" => fs::write(args, ctx),
+        "write_plan" => fs::write_plan(args, &ctx.session_id),
         "edit" => fs::edit(args, ctx),
         "ls" => fs::ls(args, ctx),
         "find" => fs::find(args, ctx),

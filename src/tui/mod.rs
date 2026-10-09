@@ -392,6 +392,14 @@ struct Ui {
     remote: Remote,
     /// A run (turn, compaction or side question) is active in the daemon.
     running: bool,
+    /// Messages typed during a run; sent together when it ends.
+    queued: Vec<String>,
+    /// First Esc of a double press; the second one within 2s stops the agent.
+    esc_at: Option<Instant>,
+    /// The last run was stopped by the user.
+    interrupted: bool,
+    /// Tabs being reopened at start; they must not take focus while this counts down.
+    restoring: usize,
     started: Instant,
     elapsed: Duration,
     counts: Counts,
@@ -525,12 +533,13 @@ impl Ui {
 
     fn send(&mut self, text: String) {
         if self.running {
-            self.notify("agent is running — Esc to interrupt");
-            self.input.set(text);
+            self.queued.push(text);
+            self.notify(format!("queued until the agent finishes ({} waiting) — ctrl+enter sends it now", self.queued.len()));
             return;
         }
         self.history.push(text.clone());
         self.hist = None;
+        self.save_tabs();
         self.remote.send(Req::Send(text));
     }
 
@@ -558,8 +567,30 @@ impl Ui {
         });
     }
 
+    /// Ctrl+Enter during a run: the message joins the conversation at the agent's next step.
+    fn steer(&mut self) {
+        let text = self.input.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.input.take();
+        self.history.push(text.clone());
+        self.hist = None;
+        self.remote.send(Req::Steer(text));
+    }
+
+    /// Send what was typed during the run, as one message.
+    fn flush_queued(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let text = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
+        self.send(text);
+    }
+
     /// A run began (here or in another client): reset the progress display.
     fn begin_run(&mut self) {
+        self.interrupted = false;
         self.running = true;
         self.started = Instant::now();
         self.counts = Counts::default();
@@ -578,6 +609,8 @@ impl Ui {
 
     fn on_interrupted(&mut self) {
         self.running = false;
+        self.interrupted = true;
+        self.flush_queued();
         self.elapsed = self.started.elapsed();
         for i in 0..self.items.len() {
             if let Item::Tool { state: state @ ToolState::Running, .. } = &mut self.items[i] {
@@ -698,8 +731,10 @@ impl Ui {
             }
             Event::Done => {
                 self.close_streaming();
+                self.mark_seen();
                 self.running = false;
                 self.elapsed = self.started.elapsed();
+                self.flush_queued();
             }
         }
     }
@@ -718,6 +753,9 @@ impl Ui {
         let (cmd, arg) = line.split_once(' ').map(|(c, a)| (c, a.trim())).unwrap_or((line, ""));
         match cmd {
             "/new" => {
+                if self.is_blank() {
+                    return self.notify("this session is still empty");
+                }
                 self.interrupt();
                 self.attach(Where::New);
             }
@@ -1199,7 +1237,13 @@ impl Ui {
             KeyCode::Char('d') if ctrl && self.input.text.is_empty() => self.quit = true,
             KeyCode::Esc => {
                 if self.running {
-                    self.interrupt();
+                    if self.esc_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                        self.esc_at = None;
+                        self.interrupt();
+                    } else {
+                        self.esc_at = Some(Instant::now());
+                        self.notify("press esc again to stop the agent");
+                    }
                 } else {
                     self.scroll_top = None;
                 }
@@ -1218,6 +1262,7 @@ impl Ui {
             }
             KeyCode::Char('j') if ctrl => self.input.insert("\n"),
             KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => self.input.insert("\n"),
+            KeyCode::Enter | KeyCode::Char('j') if ctrl && self.running => self.steer(),
             KeyCode::Enter => {
                 let text = self.input.text.trim().to_string();
                 if text.is_empty() {
@@ -1856,7 +1901,8 @@ impl Ui {
                     spans.push(Span::styled(format!("  ⎿ {st}"), theme::dim()));
                 }
             } else {
-                spans.push(Span::styled(" ✓ done  ", theme::ok()));
+                let (mark, style) = if self.interrupted { (" ■ interrupted  ", theme::err()) } else { (" ✓ done  ", theme::ok()) };
+                spans.push(Span::styled(mark, style));
                 spans.extend(self.counts.spans());
                 spans.push(Span::styled(format!("  · {time}"), theme::dim()));
             }
@@ -2227,6 +2273,7 @@ impl Ui {
             self.on_push(p);
         }
         theme::set_accent(&self.app.turn.agent.name);
+        self.mark_seen();
         self.invalidate_all();
     }
 
@@ -2237,8 +2284,73 @@ impl Ui {
         }
     }
 
+    /// The active session has no message yet: starting another one would only add an empty tab.
+    fn is_blank(&self) -> bool {
+        !self.app.session.lock().unwrap().has_messages()
+    }
+
+    /// Write the open tabs (sessions with messages) so the next start reopens them.
+    fn save_tabs(&self) {
+        if self.restoring > 0 {
+            return;
+        }
+        let open: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| {
+                let s = match &t.view {
+                    Some(v) => v.session.clone(),
+                    None => self.app.session.clone(),
+                };
+                let s = s.lock().unwrap();
+                s.has_messages().then(|| s.id.clone())
+            })
+            .collect();
+        self.remote.send(Req::SaveTabs { cwd: self.app.rt.cwd.clone(), open });
+    }
+
+    /// The active tab's result has been seen: the daemon drops its unread mark.
+    fn mark_seen(&self) {
+        self.remote.send(Req::Seen);
+    }
+
+    /// Reopen the tabs that were open at last exit, after the first one.
+    fn restore(&mut self, first: String) {
+        let ids: Vec<String> = session::saved_open(&self.app.rt.cwd).into_iter().filter(|i| *i != first).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.restoring = ids.len();
+        let (tx, cwd) = (self.opened_tx.clone(), self.app.rt.cwd.clone());
+        // One task, in order: tabs appear in the order they were saved.
+        tokio::spawn(async move {
+            for id in ids {
+                let r = crate::client::open(Where::Resume(id), cwd.clone(), None, None).await.map_err(|e| format!("{e:#}"));
+                if tx.send(r).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Last restored tab is in: focus the first tab again and show the unread marks saved for the parked ones.
+    fn finish_restore(&mut self) {
+        self.switch_to(0);
+        let f = session::load_tabs(&self.app.rt.cwd);
+        for t in self.tabs.iter_mut().skip(1) {
+            let Some(v) = &t.view else { continue };
+            let id = v.session.lock().unwrap().id.clone();
+            if let Some(u) = f.unseen.get(&id).filter(|_| !v.running) {
+                t.status = if u == "error" { TabStatus::Error } else { TabStatus::Done };
+            }
+        }
+    }
+
     /// Open a fresh session in a new tab, with the current agent and model.
     fn new_tab(&mut self) {
+        if self.is_blank() {
+            return self.notify("this session is still empty");
+        }
         let (tx, cwd) = (self.opened_tx.clone(), self.app.rt.cwd.clone());
         let (agent, model) = (Some(self.app.turn.agent.name.clone()), Some(self.app.turn.model.clone()));
         tokio::spawn(async move {
@@ -2247,6 +2359,16 @@ impl Ui {
     }
 
     fn tab_opened(&mut self, opened: Opened) {
+        let restored = self.restoring > 0;
+        self.restoring = self.restoring.saturating_sub(1);
+        self.open_tab(opened);
+        if restored && self.restoring == 0 {
+            self.finish_restore();
+        }
+        self.save_tabs();
+    }
+
+    fn open_tab(&mut self, opened: Opened) {
         let (remote, rx, snap) = match opened {
             Ok(o) => o,
             Err(e) => return self.push(Item::Error(format!("could not open a tab: {e}"))),
@@ -2281,6 +2403,7 @@ impl Ui {
             }
         }
         self.tabs.remove(dead);
+        self.save_tabs();
         if dead < self.cur {
             self.cur -= 1;
         }
@@ -2447,6 +2570,10 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         last_view: 0,
         remote,
         running: false,
+        queued: vec![],
+        esc_at: None,
+        interrupted: false,
+        restoring: 0,
         started: Instant::now(),
         elapsed: Duration::ZERO,
         counts: Counts::default(),
@@ -2475,7 +2602,10 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         strip: tabs::Strip::default(),
     };
     ui.forward(0, pushes);
+    let first = snap.session_id.clone();
     ui.on_snapshot(snap);
+    ui.mark_seen();
+    ui.restore(first);
     // Prompt history from previous sessions in this directory.
     if let Some(i) = session::list(&ui.app.rt.cwd).first()
         && let Ok(s) = Session::open(&i.path) {
@@ -2538,6 +2668,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
             break;
         }
     }
+    ui.save_tabs();
     teardown();
     let s = ui.app.session.lock().unwrap();
     if s.has_messages() {

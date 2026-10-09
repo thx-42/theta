@@ -1,6 +1,6 @@
 //! Background daemon: owns sessions, agent runs and MCP connections; any number of TUI clients attach over a unix socket.
 
-use crate::agent::{self, Event, Runtime, Turn};
+use crate::agent::{self, Event, Runtime, Steer, Turn};
 use crate::proto::{Push, Req, Snapshot, Target, socket_path};
 use crate::session::{self, Session};
 use crate::types::Msg;
@@ -30,6 +30,7 @@ struct Live {
     session: Arc<Mutex<Session>>,
     bus: broadcast::Sender<Push>,
     st: Mutex<State>,
+    steer: Steer,
 }
 
 struct Server {
@@ -142,6 +143,7 @@ impl Server {
             session: Arc::new(Mutex::new(session)),
             bus,
             st: Mutex::new(State { turn, rt, run: None, epoch: 0, replay: vec![], handoff: None }),
+            steer: Default::default(),
         });
         self.lives.lock().unwrap().insert(id, live.clone());
         Ok(live)
@@ -194,6 +196,18 @@ impl Server {
                     }
                 }
                 Req::Reload => self.reload().await,
+                Req::SaveTabs { cwd, open } => update_tabs(&cwd, |t| t.open = open),
+                Req::Seen => {
+                    if let Some(live) = &current {
+                        let (cwd, id) = {
+                            let s = live.session.lock().unwrap();
+                            (s.cwd.clone(), s.id.clone())
+                        };
+                        update_tabs(&cwd, |t| {
+                            t.unseen.remove(&id);
+                        });
+                    }
+                }
                 Req::McpConnect(name) => {
                     let mcp = self.base.mcp.clone();
                     tokio::spawn(async move { mcp.connect(&name).await });
@@ -223,6 +237,16 @@ impl Server {
         }
         writer.abort();
     }
+}
+
+static TABS_LOCK: Mutex<()> = Mutex::new(());
+
+/// Read-modify-write of a project's `tabs.json`; the daemon's connections and runs share it.
+fn update_tabs(cwd: &Path, f: impl FnOnce(&mut session::TabsFile)) {
+    let _g = TABS_LOCK.lock().unwrap();
+    let mut t = session::load_tabs(cwd);
+    f(&mut t);
+    session::save_tabs(cwd, &t);
 }
 
 fn meta(st: &State) -> Push {
@@ -280,6 +304,13 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
             let _ = live.bus.send(Push::Event(Event::User(text)));
             launch_turn(live, &mut st);
+        }
+        Req::Steer(text) => {
+            if live.st.lock().unwrap().run.is_some() {
+                live.steer.lock().unwrap().push_back(text);
+            } else {
+                handle(live, Req::Send(text), out);
+            }
         }
         Req::Interrupt => interrupt(live),
         Req::Answer { id, text } => {
@@ -354,7 +385,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
-        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown => {}
+        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
     }
 }
 
@@ -386,9 +417,9 @@ fn interrupt(live: &Arc<Live>) {
 }
 
 fn launch_turn(live: &Arc<Live>, st: &mut State) {
-    let (rt, session, turn) = (st.rt.clone(), live.session.clone(), st.turn.clone());
+    let (rt, session, turn, steer) = (st.rt.clone(), live.session.clone(), st.turn.clone(), live.steer.clone());
     launch(live, st, move |tx| async move {
-        if let Err(e) = agent::run(rt, session, turn, tx.clone()).await {
+        if let Err(e) = agent::run(rt, session, turn, tx.clone(), steer).await {
             let _ = tx.send(Event::Error(format!("{e:#}")));
         }
     });
@@ -411,10 +442,27 @@ where
     let _ = live.bus.send(Push::Event(Event::Started));
     let live = live.clone();
     tokio::spawn(async move {
+        let mut errored = false;
         while let Some(ev) = rx.recv().await {
             let mut st = live.st.lock().unwrap();
             if st.epoch != epoch {
                 return;
+            }
+            errored |= matches!(ev, Event::Error(_));
+            // Results are remembered on disk, so a finished run still shows once the client is gone.
+            let unread = match &ev {
+                Event::Done => Some(if errored { "error" } else { "done" }),
+                Event::Ask { .. } => Some("asked"),
+                _ => None,
+            };
+            if let Some(u) = unread {
+                let (cwd, id) = {
+                    let s = live.session.lock().unwrap();
+                    (s.cwd.clone(), s.id.clone())
+                };
+                update_tabs(&cwd, |t| {
+                    t.unseen.insert(id, u.into());
+                });
             }
             match &ev {
                 Event::Step { .. } => st.replay.clear(),
