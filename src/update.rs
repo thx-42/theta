@@ -27,7 +27,13 @@ impl Ink {
         if self.0 { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
     }
     fn say(&self, face: &str, msg: &str) {
-        println!("  {}  {msg}", self.paint("35;1", face));
+        println!("  {}  {msg}", self.paint("35;1", &format!("{face:<7}")));
+    }
+    /// A whole cat with `msg` next to its face. `eyes` is 3 chars wide, e.g. "o.o".
+    fn cat(&self, eyes: &str, msg: &str) {
+        println!("{}", self.paint("35;1", "   /\\_/\\"));
+        println!("{}  {msg}", self.paint("35;1", &format!("  ( {eyes} )")));
+        println!("{}", self.paint("35;1", "   > ^ <"));
     }
 }
 
@@ -81,7 +87,7 @@ async fn download(http: &reqwest::Client, url: &str, ink: &Ink, face: &str) -> R
             let frac = total.map(|t| (buf.len() as f64 / t as f64).min(1.0)).unwrap_or(0.0);
             let full = (frac * 20.0) as usize;
             let bar = format!("{}{}", "█".repeat(full), "░".repeat(20 - full));
-            print!("\r  {}  [{}] {:>3.0}%  {}   ", ink.paint("35;1", face), ink.paint("36", &bar), frac * 100.0, mb(buf.len() as u64));
+            print!("\r  {}  [{}] {:>3.0}%  {}   ", ink.paint("35;1", &format!("{face:<7}")), ink.paint("36", &bar), frac * 100.0, mb(buf.len() as u64));
             let _ = std::io::stdout().flush();
         }
     }
@@ -123,7 +129,7 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
 
     // GitHub's API rejects requests without a user agent.
     let http = reqwest::Client::builder().user_agent(format!("theta/{VERSION}")).connect_timeout(std::time::Duration::from_secs(20)).build()?;
-    ink.say("(•‿•)", &format!("looking for news on github.com/{} …", repo()));
+    ink.say("=o.o=", &format!("looking for news on github.com/{} ...", repo()));
     let latest = latest_tag(&http).await?;
     let dev = TAG.is_none();
     println!("        {} {}", ink.paint("2", "current"), if dev { format!("{VERSION} (local build)") } else { VERSION.to_string() });
@@ -131,40 +137,40 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
 
     let newer = dev || is_newer(&latest, VERSION);
     if !newer && !force {
-        ink.say("(｡•‿•｡)", "already up to date, nothing to do ♥");
+        ink.cat("-.-", "already up to date, nothing to do. zzz");
         return Ok(());
     }
     if check_only {
-        ink.say("(☆ᴗ☆)", &format!("a new version is out! run {} to get it", ink.paint("1", "theta update")));
+        ink.cat("^o^", &format!("a new version is out! run {} to get it", ink.paint("1", "theta update")));
         return Ok(());
     }
     if dev && !force {
-        ink.say("(•ᴗ•)", &format!("this is a local build: {} replaces it with {latest}", ink.paint("1", "theta update --force")));
+        ink.say("=o.o=", &format!("this is a local build: {} replaces it with {latest}", ink.paint("1", "theta update --force")));
         return Ok(());
     }
 
     let (target, base) = (target()?, format!("https://github.com/{}/releases/download/{latest}", repo()));
     let file = format!("theta-{target}.tar.gz");
-    let archive = download(&http, &format!("{base}/{file}"), &ink, "(づ｡◕‿‿◕｡)づ").await?;
-    ink.say("(•_•)", "checking the checksum …");
+    let archive = download(&http, &format!("{base}/{file}"), &ink, "=^.^=").await?;
+    ink.say("=o.o=", "checking the checksum ...");
     let sums = String::from_utf8(download(&http, &format!("{base}/checksums.txt"), &Ink(false), "").await?)?;
     let want = sums.lines().filter_map(|l| l.split_once(char::is_whitespace)).find(|(_, n)| n.trim() == file).map(|(h, _)| h.to_string());
     if want.as_deref() != Some(&sha256(&archive)) {
-        ink.say("(╥﹏╥)", "checksum mismatch, nothing was installed");
+        ink.cat("T.T", "checksum mismatch, nothing was installed");
         bail!("checksum mismatch for {file}");
     }
 
     let exe = std::env::current_exe()?.canonicalize()?;
-    ink.say("(ง •̀_•́)ง", &format!("installing → {}", exe.display()));
+    ink.say("=^.^=", &format!("installing -> {}", exe.display()));
     install(&archive, &exe)?;
     // Keep install.sh's bookkeeping in step when it manages this install.
     let state = crate::config::home().join("install");
     if state.exists() {
         let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
     }
-    ink.say("(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧", &format!("updated to {}", ink.paint("1", &latest)));
+    ink.cat("^o^", &format!("updated to {}", ink.paint("1", &latest)));
     if tokio::net::UnixStream::connect(crate::proto::socket_path()).await.is_ok() {
-        ink.say("(•_•)", "the background daemon still runs the old version: `theta daemon stop` restarts it (running agents are cut)");
+        ink.say("=o.o=", "the background daemon still runs the old version: `theta daemon stop` restarts it (running agents are cut)");
     }
     Ok(())
 }
