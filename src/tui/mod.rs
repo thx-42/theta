@@ -81,7 +81,7 @@ const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Compu
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/resume", "open a previous session"),
-    ("/session", "session tabs: new | close | <n>"),
+    ("/session", "session tabs: new | close | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/model", "change model"),
     ("/agent", "change agent"),
@@ -699,9 +699,13 @@ impl Ui {
             "/session" => match arg {
                 "" | "new" => self.new_tab(),
                 "close" => self.close_tab(),
+                n if n.starts_with("width") => match n["width".len()..].trim().parse::<u16>() {
+                    Ok(w) => self.set_tab_width(w),
+                    Err(_) => self.notify(format!("usage: /session width <{}-{}>", tabs::WIDTH_MIN, tabs::WIDTH_MAX)),
+                },
                 n => match n.parse::<usize>() {
                     Ok(n) if (1..=self.tabs.len()).contains(&n) => self.switch_to(n - 1),
-                    _ => self.notify("usage: /session [new | close | <n>]"),
+                    _ => self.notify("usage: /session [new | close | <n> | width <n>]"),
                 },
             },
             "/tree" => self.open_tree(),
@@ -1476,6 +1480,7 @@ impl Ui {
                 ("Web search".into(), s.web.backend.clone()),
                 ("rtk filters".into(), s.tools.rtk.clone()),
                 ("Tab bar".into(), s.tab_orientation.clone()),
+                ("Tab bar width".into(), format!("{} cols", s.tab_width)),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
@@ -1557,6 +1562,16 @@ impl Ui {
             5 => {
                 let v = cycle(&["horizontal", "vertical"], &s.tab_orientation);
                 self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
+            }
+            6 => {
+                let w = if back {
+                    if s.tab_width >= tabs::WIDTH_MIN + 2 { s.tab_width - 2 } else { tabs::WIDTH_MAX }
+                } else if s.tab_width + 2 > tabs::WIDTH_MAX {
+                    tabs::WIDTH_MIN
+                } else {
+                    s.tab_width + 2
+                };
+                self.set_tab_width(w);
             }
             _ => {}
         }
@@ -1683,11 +1698,10 @@ impl Ui {
 
     fn draw(&mut self, f: &mut Frame) {
         let vertical = self.app.rt.settings.tab_orientation == "vertical";
-        let infos: Vec<_> = (0..self.tabs.len())
-            .map(|i| if i == self.cur { (self.title_now(), if self.running { TabStatus::Working } else { TabStatus::Idle }, true) } else { (self.tabs[i].title.clone(), self.tabs[i].status, false) })
-            .collect();
+        let infos = self.tab_infos();
+        let width = self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX);
         let (strip_area, area) = if vertical {
-            let [a, b] = Layout::horizontal([Constraint::Length(tabs::SIDEBAR_W), Constraint::Min(20)]).areas(f.area());
+            let [a, b] = Layout::horizontal([Constraint::Length(width), Constraint::Min(20)]).areas(f.area());
             (a, b)
         } else {
             let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(f.area());
@@ -2114,10 +2128,13 @@ impl Ui {
     fn install(&mut self, mut view: View, to: usize) {
         self.park_overlay();
         let title = self.title_now();
+        let (agent, model) = (self.app.turn.agent.name.clone(), self.app.turn.model.clone());
         self.swap_view(&mut view);
         let from = &mut self.tabs[self.cur];
         from.status = if view.running { TabStatus::Working } else { TabStatus::Idle };
         from.title = title;
+        from.agent = agent;
+        from.model = model;
         from.view = Some(view);
         self.cur = to;
     }
@@ -2191,6 +2208,44 @@ impl Ui {
         if dead < self.cur {
             self.cur -= 1;
         }
+    }
+
+    /// What the strip shows: the active tab from live state, the others from what they last reported.
+    fn tab_infos(&self) -> Vec<tabs::TabInfo> {
+        (0..self.tabs.len())
+            .map(|i| {
+                if i == self.cur {
+                    let working = self.running;
+                    let detail = match (working, self.status.is_empty()) {
+                        (false, _) => "idle".to_string(),
+                        (true, true) => "working".to_string(),
+                        (true, false) => self.status.clone(),
+                    };
+                    tabs::TabInfo {
+                        title: self.title_now(),
+                        status: if working { TabStatus::Working } else { TabStatus::Idle },
+                        agent: self.app.turn.agent.name.clone(),
+                        model: self.app.turn.model.clone(),
+                        detail,
+                        active: true,
+                    }
+                } else {
+                    let t = &self.tabs[i];
+                    let detail = match t.status {
+                        TabStatus::Working => "working",
+                        TabStatus::Done => "finished",
+                        TabStatus::Error => "error",
+                        TabStatus::Idle => "idle",
+                    };
+                    tabs::TabInfo { title: t.title.clone(), status: t.status, agent: t.agent.clone(), model: t.model.clone(), detail: detail.into(), active: false }
+                }
+            })
+            .collect()
+    }
+
+    fn set_tab_width(&mut self, w: u16) {
+        let v = w.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX);
+        self.update_settings("tab_width", (v as i64).into(), |s| s.tab_width = v);
     }
 
     /// Mouse on the tab strip: × closes, the title switches, + opens a new session.

@@ -37,6 +37,8 @@ pub struct Settings {
     pub verbose: String,
     /// Session tab bar: horizontal (top row) | vertical (left sidebar)
     pub tab_orientation: String,
+    /// Sidebar width in columns (vertical tab bar only)
+    pub tab_width: u16,
     /// Default agent name
     pub agent: String,
     pub models: TaskModels,
@@ -58,6 +60,7 @@ impl Default for Settings {
             effort: "medium".into(),
             verbose: "full".into(),
             tab_orientation: "horizontal".into(),
+            tab_width: 24,
             agent: "Build".into(),
             models: TaskModels::default(),
             agents: BTreeMap::new(),
@@ -263,6 +266,7 @@ model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
 tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
+tab_width = 24                   # sidebar width in columns (14-60)
 agent = "Build"
 
 # Model per background task ("" = main model)

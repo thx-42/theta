@@ -13,7 +13,22 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const SIDEBAR_W: u16 = 24;
+/// Sidebar width bounds, in columns.
+pub const WIDTH_MIN: u16 = 14;
+pub const WIDTH_MAX: u16 = 60;
+/// Rows per tab card in the sidebar: title, agent · model, status, spacer.
+const CARD: usize = 4;
+
+/// What the strip shows for one tab.
+pub struct TabInfo {
+    pub title: String,
+    pub status: TabStatus,
+    pub agent: String,
+    pub model: String,
+    /// Live detail: the current step while working, else a status word.
+    pub detail: String,
+    pub active: bool,
+}
 
 /// idle: nothing to report; working: agent running; done / error: finished (or waiting for an answer) while in the background.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,6 +42,8 @@ pub enum TabStatus {
 pub struct Tab {
     pub id: u64,
     pub title: String,
+    pub agent: String,
+    pub model: String,
     pub status: TabStatus,
     /// The run in progress hit an error.
     pub errored: bool,
@@ -38,13 +55,19 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(id: u64) -> Self {
-        Tab { id, title: String::new(), status: TabStatus::Idle, errored: false, backlog: vec![], view: None }
+        Tab { id, title: String::new(), agent: String::new(), model: String::new(), status: TabStatus::Idle, errored: false, backlog: vec![], view: None }
     }
 
     /// Follow a push meant for a tab that is not on screen.
     pub fn watch(&mut self, p: &Push) {
         match p {
+            Push::Meta { agent, model, .. } => {
+                self.agent = agent.clone();
+                self.model = model.clone();
+            }
             Push::Snapshot(s) => {
+                self.agent = s.agent.clone();
+                self.model = s.model.clone();
                 self.errored = false;
                 self.status = if s.running { TabStatus::Working } else { TabStatus::Idle };
             }
@@ -131,7 +154,7 @@ fn clip(s: &str, max: usize) -> String {
 /// Where the strip's controls landed on screen, for mouse clicks.
 #[derive(Default)]
 pub struct Strip {
-    /// Per tab: the title (click switches) and the × (click closes).
+    /// Per tab: the whole tab (click switches) and its × (click closes).
     pub tabs: Vec<(Rect, Rect)>,
     /// The + button (click opens a new session).
     pub new: Rect,
@@ -146,8 +169,13 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(n)))
 }
 
-/// Render the tab strip into `area` (one row, or a column of rows when vertical) and return its clickable parts.
-pub fn strip(area: Rect, tabs: &[(String, TabStatus, bool)], spin: usize, vertical: bool) -> (Vec<Line<'static>>, Strip) {
+fn short_model(m: &str) -> &str {
+    m.rsplit('/').next().unwrap_or(m)
+}
+
+/// Render the tab strip into `area` and return its clickable parts.
+/// Horizontal: one row. Vertical: a card of `CARD` rows per tab, then a + row, then the divider.
+pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<Line<'static>>, Strip) {
     let mut out = Strip::default();
     let glyph = |status: TabStatus| match status {
         TabStatus::Working => (SPIN[spin % SPIN.len()], theme::accent()),
@@ -157,46 +185,67 @@ pub fn strip(area: Rect, tabs: &[(String, TabStatus, bool)], spin: usize, vertic
     };
     let name = |t: &str| if t.trim().is_empty() { "new session".to_string() } else { t.trim().to_string() };
     let style = |active: bool| if active { theme::sel() } else { theme::dim() };
-    let mut lines = Vec::new();
 
     if vertical {
-        let inner = area.width.saturating_sub(1) as usize;
-        let body_w = inner.saturating_sub(2);
-        for (i, (title, status, active)) in tabs.iter().enumerate() {
-            let y = area.y + i as u16;
-            let (g, c) = glyph(*status);
-            let st = style(*active);
-            let text = pad(&clip(&format!(" {} {}", i + 1, name(title)), body_w.saturating_sub(2)), body_w.saturating_sub(2));
+        let w = area.width.saturating_sub(1) as usize; // last column is the divider
+        let divider = || Span::styled("│", theme::dim());
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (i, t) in tabs.iter().enumerate() {
+            let y0 = area.y + (i * CARD) as u16;
+            let st = style(t.active);
+            let (g, c) = glyph(t.status);
+            let idx = format!(" {} ", i + 1);
+            // Row 1: glyph, number, title, then " ×" at the right edge.
+            let room = w.saturating_sub(1 + 1 + idx.len() + 2);
+            let title = clip(&name(&t.title), room);
             lines.push(Line::from(vec![
                 Span::styled(" ", st),
                 Span::styled(g, st.patch(c)),
-                Span::styled(text, st),
+                Span::styled(pad(&format!("{idx}{title}"), w.saturating_sub(4)), st),
                 Span::styled(" ", st),
                 Span::styled("×", st.patch(theme::dim())),
-                Span::styled("│", theme::dim()),
+                divider(),
             ]));
-            out.tabs.push((Rect { x: area.x, y, width: inner.saturating_sub(1) as u16, height: 1 }, Rect { x: area.x + inner.saturating_sub(1) as u16, y, width: 1, height: 1 }));
+            // Row 2: agent · model. Row 3: what it is doing. Row 4: spacer.
+            let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, short_model(&t.model)) };
+            lines.push(Line::from(vec![Span::styled(pad(&clip(&who, w), w), theme::dim()), divider()]));
+            let detail_style = match t.status {
+                TabStatus::Working => theme::accent(),
+                TabStatus::Done => theme::ok(),
+                TabStatus::Error => theme::err(),
+                TabStatus::Idle => theme::dim(),
+            };
+            lines.push(Line::from(vec![Span::styled(pad(&clip(&format!("   {}", t.detail), w), w), detail_style), divider()]));
+            lines.push(Line::from(vec![Span::raw(pad("", w)), divider()]));
+            out.tabs.push((
+                Rect { x: area.x, y: y0, width: w as u16, height: CARD as u16 },
+                Rect { x: area.x + w as u16 - 1, y: y0, width: 1, height: 1 },
+            ));
         }
-        let y = area.y + tabs.len() as u16;
-        lines.push(Line::from(vec![Span::styled(pad(" + new session", inner), theme::accent()), Span::styled("│", theme::dim())]));
-        out.new = Rect { x: area.x, y, width: inner as u16, height: 1 };
+        let y = area.y + (tabs.len() * CARD) as u16;
+        lines.push(Line::from(vec![Span::styled(pad(" + new session", w), theme::accent()), divider()]));
+        out.new = Rect { x: area.x, y, width: w as u16, height: 1 };
+        // Keep the divider running down the empty space below the cards.
+        while lines.len() < area.height as usize {
+            lines.push(Line::from(vec![Span::raw(pad("", w)), divider()]));
+        }
         return (lines, out);
     }
 
     let max = (area.width as usize / tabs.len().max(1)).saturating_sub(8).clamp(6, 24);
     let mut spans = Vec::new();
     let mut x = area.x;
-    for (i, (title, status, active)) in tabs.iter().enumerate() {
+    for (i, t) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("│", theme::dim()));
             x += 1;
         }
-        let (g, c) = glyph(*status);
-        let st = style(*active);
-        let w = (3 + format!("{}", i + 1).len() + 1 + max.min(name(title).chars().count()) + 1) as u16;
+        let (g, c) = glyph(t.status);
+        let st = style(t.active);
+        let w = (5 + format!("{}", i + 1).len() + max.min(name(&t.title).chars().count())) as u16;
         spans.push(Span::styled(" ", st));
         spans.push(Span::styled(g, st.patch(c)));
-        spans.push(Span::styled(format!(" {} {} ", i + 1, clip(&name(title), max)), st));
+        spans.push(Span::styled(format!(" {} {} ", i + 1, clip(&name(&t.title), max)), st));
         let tab = Rect { x, y: area.y, width: w, height: 1 };
         x += w;
         spans.push(Span::styled("×", st.patch(theme::dim())));
@@ -206,8 +255,7 @@ pub fn strip(area: Rect, tabs: &[(String, TabStatus, bool)], spin: usize, vertic
     }
     spans.push(Span::styled(" + ", theme::accent()));
     out.new = Rect { x, y: area.y, width: 3, height: 1 };
-    lines.push(Line::from(spans));
-    (lines, out)
+    (vec![Line::from(spans)], out)
 }
 
 #[cfg(test)]
