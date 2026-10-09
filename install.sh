@@ -14,6 +14,8 @@ REPO="${THETA_REPO:-thx-42/theta}"
 PREFIX="${THETA_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 STATE="$HOME/.theta/install"
+TMP=""
+trap '[[ -z "$TMP" ]] || rm -rf "$TMP"' EXIT
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -83,22 +85,22 @@ remote_head() { git ls-remote "https://github.com/$REPO" HEAD | cut -f1; }
 
 install_release() {
   command -v curl >/dev/null || die "curl requis"
-  local target tag tmp url want got
+  local target tag url want got
   target="$(detect_target)"
   tag="$(latest_release)"
   [[ -n "$tag" ]] || die "aucune release trouvée sur github.com/$REPO"
   step "téléchargement de $tag ($target)"
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  TMP="$(mktemp -d)"
   url="https://github.com/$REPO/releases/download/$tag"
-  curl -fsSL "$url/theta-$target.tar.gz" -o "$tmp/theta.tar.gz"
-  curl -fsSL "$url/checksums.txt" -o "$tmp/checksums.txt"
-  want="$(grep " theta-$target.tar.gz\$" "$tmp/checksums.txt" | cut -d' ' -f1)"
-  if command -v sha256sum >/dev/null; then got="$(sha256sum "$tmp/theta.tar.gz" | cut -d' ' -f1)"
-  else got="$(shasum -a 256 "$tmp/theta.tar.gz" | cut -d' ' -f1)"; fi
+  curl -fsSL "$url/theta-$target.tar.gz" -o "$TMP/theta.tar.gz"
+  curl -fsSL "$url/checksums.txt" -o "$TMP/checksums.txt"
+  want="$(grep " theta-$target.tar.gz\$" "$TMP/checksums.txt" | cut -d' ' -f1)"
+  if command -v sha256sum >/dev/null; then got="$(sha256sum "$TMP/theta.tar.gz" | cut -d' ' -f1)"
+  else got="$(shasum -a 256 "$TMP/theta.tar.gz" | cut -d' ' -f1)"; fi
   [[ -n "$want" && "$want" == "$got" ]] || die "checksum invalide"
-  tar -xzf "$tmp/theta.tar.gz" -C "$tmp"
+  tar -xzf "$TMP/theta.tar.gz" -C "$TMP"
   mkdir -p "$BIN_DIR"
-  install -m 755 "$tmp/theta" "$BIN_DIR/$BIN_NAME"
+  install -m 755 "$TMP/theta" "$BIN_DIR/$BIN_NAME"
   state_set release "$tag"
 }
 
