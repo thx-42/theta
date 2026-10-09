@@ -1989,7 +1989,17 @@ impl Ui {
         const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
         let accent = theme::accent();
-        let mut out: Vec<Line<'static>> = LOGO.iter().map(|l| Line::from(Span::styled(format!("  {l}"), accent))).collect();
+        let mut out: Vec<Line<'static>> = LOGO
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut spans = vec![Span::styled(format!("  {l}"), accent)];
+                if i == LOGO.len() - 1 && crate::update::is_dev() {
+                    spans.push(Span::styled(" (dev)", theme::dim()));
+                }
+                Line::from(spans)
+            })
+            .collect();
         out.push(Line::from(Span::styled(format!("  θ v{}  ·  terminal coding agent", env!("CARGO_PKG_VERSION")), theme::dim())));
         out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
         out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));

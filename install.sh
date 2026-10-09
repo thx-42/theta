@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # θ theta — installeur / mise à jour / désinstallation
-# usage: install.sh [install [--release|--source]|update|uninstall|status|help]
+# usage: install.sh [install [--release|--source] [--stable|--dev]|update|uninstall|status|help]
 # one-liner: curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash
 
 set -euo pipefail
@@ -14,6 +14,8 @@ REPO="${THETA_REPO:-thx-42/theta}"
 PREFIX="${THETA_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 STATE="$HOME/.theta/install"
+# canal : stable (branche main, releases) | dev (nightly : branche dev, prereleases dev-*)
+CHANNEL=""
 TMP=""
 trap '[[ -z "$TMP" ]] || rm -rf "$TMP"' EXIT
 
@@ -49,12 +51,15 @@ need_cargo() {
     die "cargo introuvable. Installe Rust : curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
 }
 
-# état d'installation : method=release|source, ref=<tag release | sha git>
+# état d'installation : method=release|source, ref=<tag release | sha git>, channel=stable|dev
 state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1=//p" "$STATE" | head -n1 || true; }
 state_set() {
   mkdir -p "$(dirname "$STATE")"
-  printf 'method=%s\nref=%s\n' "$1" "$2" > "$STATE"
+  printf 'method=%s\nref=%s\nchannel=%s\n' "$1" "$2" "$CHANNEL" > "$STATE"
 }
+# installs made before channels existed are stable
+load_channel() { CHANNEL="$(state_get channel)"; CHANNEL="${CHANNEL:-stable}"; }
+branch() { [[ "$CHANNEL" == dev ]] && echo dev || echo main; }
 
 installed_version() {
   if [[ -x "$BIN_DIR/$BIN_NAME" ]]; then
@@ -77,18 +82,24 @@ detect_target() {
 }
 
 latest_release() {
-  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-    sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
+  if [[ "$CHANNEL" == dev ]]; then
+    # newest nightly: releases are listed newest first
+    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
+      sed -n 's/.*"tag_name": *"\(dev-[^"]*\)".*/\1/p' | head -n1
+  else
+    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
+      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
+  fi
 }
 
-remote_head() { git ls-remote "https://github.com/$REPO" HEAD | cut -f1; }
+remote_head() { git ls-remote "https://github.com/$REPO" "refs/heads/$(branch)" | cut -f1; }
 
 install_release() {
   command -v curl >/dev/null || die "curl requis"
   local target tag url want got
   target="$(detect_target)"
   tag="$(latest_release)"
-  [[ -n "$tag" ]] || die "aucune release trouvée sur github.com/$REPO"
+  [[ -n "$tag" ]] || die "aucune release $CHANNEL trouvée sur github.com/$REPO"
   step "téléchargement de $tag ($target)"
   TMP="$(mktemp -d)"
   url="https://github.com/$REPO/releases/download/$tag"
@@ -109,15 +120,28 @@ install_source() {
   local ref
   if [[ -n "$SRC" ]]; then
     step "compilation depuis $SRC"
-    cargo install --path "$SRC" --locked --force --root "$PREFIX"
+    THETA_CHANNEL="$CHANNEL" cargo install --path "$SRC" --locked --force --root "$PREFIX"
     ref="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo local)"
   else
     command -v git >/dev/null || die "git requis"
-    step "compilation depuis github.com/$REPO"
-    cargo install --git "https://github.com/$REPO" --locked --force --root "$PREFIX"
+    step "compilation depuis github.com/$REPO ($(branch))"
+    THETA_CHANNEL="$CHANNEL" cargo install --git "https://github.com/$REPO" --branch "$(branch)" --locked --force --root "$PREFIX"
     ref="$(remote_head)"
   fi
   state_set source "$ref"
+}
+
+ask_channel() {
+  local ans
+  if [[ ! -r /dev/tty ]]; then echo stable; return; fi
+  {
+    printf '%sQuel canal ?%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %s1)%s stable (branche main, releases)\n' "$C_CYAN" "$C_RESET"
+    printf '  %s2)%s nightly (branche dev, builds en avance)\n' "$C_CYAN" "$C_RESET"
+    printf 'choix [1] : '
+  } >/dev/tty
+  read -r ans </dev/tty || ans=""
+  case "${ans:-1}" in 2|n|nightly|dev) echo dev ;; *) echo stable ;; esac
 }
 
 ask_method() {
@@ -143,13 +167,14 @@ path_hint() {
 cmd_install() {
   banner
   local method="${1:-}"
+  [[ -n "$CHANNEL" ]] || CHANNEL="$(ask_channel)"
   [[ -n "$method" ]] || method="$(ask_method)"
   case "$method" in
     release) install_release ;;
     source)  install_source ;;
     *) die "méthode inconnue : $method" ;;
   esac
-  ok "θ installé ($method) → $BIN_DIR/$BIN_NAME"
+  ok "θ installé ($method, $CHANNEL) → $BIN_DIR/$BIN_NAME"
   path_hint
   printf '\n  %sessaie :%s theta --help\n' "$C_DIM" "$C_RESET"
 }
@@ -159,6 +184,7 @@ cmd_update() {
   local method cur new
   method="$(state_get method)"; cur="$(state_get ref)"
   [[ -n "$method" ]] || die "θ n'a pas été installé via ce script : lance « install »"
+  load_channel
   case "$method" in
     release) new="$(latest_release)" ;;
     source)
@@ -175,7 +201,7 @@ cmd_update() {
     ok "θ déjà à jour ($method, ${cur:0:12})"
     return
   fi
-  step "mise à jour ($method) : ${cur:0:12} → ${new:0:12}"
+  step "mise à jour ($method, $CHANNEL) : ${cur:0:12} → ${new:0:12}"
   if [[ "$method" == release ]]; then install_release; else install_source; fi
   ok "θ mis à jour"
 }
@@ -192,9 +218,11 @@ cmd_status() {
   banner
   local method cur latest=""
   method="$(state_get method)"; cur="$(state_get ref)"
+  load_channel
   printf '  %sinstallé%s  %s\n' "$C_DIM" "$C_RESET" "$(installed_version)"
   printf '  %schemin%s    %s\n' "$C_DIM" "$C_RESET" "$BIN_DIR/$BIN_NAME"
   printf '  %sméthode%s   %s (%s)\n' "$C_DIM" "$C_RESET" "${method:-inconnue}" "${cur:0:12}"
+  printf '  %scanal%s     %s\n' "$C_DIM" "$C_RESET" "$CHANNEL"
   case "$method" in
     release) latest="$(latest_release 2>/dev/null || true)" ;;
     source)  latest="$(remote_head 2>/dev/null || true)" ;;
@@ -211,8 +239,8 @@ cmd_help() {
   banner
   cat <<EOF
   ${C_BOLD}commandes${C_RESET}
-    ${C_CYAN}install${C_RESET} [--release|--source]   installe θ (menu interactif sans option)
-    ${C_CYAN}update${C_RESET}      installe la dernière release / les derniers commits
+    ${C_CYAN}install${C_RESET} [--release|--source] [--stable|--dev]   installe θ (menus interactifs sans option)
+    ${C_CYAN}update${C_RESET}      installe la dernière release / les derniers commits, sur le canal installé
     ${C_CYAN}uninstall${C_RESET}   retire le binaire (garde ~/.theta)
     ${C_CYAN}status${C_RESET}      version installée et mise à jour disponible
     ${C_CYAN}help${C_RESET}        cette aide
@@ -221,14 +249,20 @@ cmd_help() {
 EOF
 }
 
+# options après la commande : --release|--source (méthode), --stable|--dev (canal)
+METHOD=""
+for arg in "${@:2}"; do
+  case "$arg" in
+    --release) METHOD=release ;;
+    --source)  METHOD=source ;;
+    --stable)  CHANNEL=stable ;;
+    --dev)     CHANNEL=dev ;;
+    *) die "option inconnue : $arg" ;;
+  esac
+done
+
 case "${1:-install}" in
-  install)
-    case "${2:-}" in
-      --release) cmd_install release ;;
-      --source)  cmd_install source ;;
-      "")        cmd_install ;;
-      *) die "option inconnue : $2" ;;
-    esac ;;
+  install)    cmd_install "$METHOD" ;;
   update)    cmd_update ;;
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
