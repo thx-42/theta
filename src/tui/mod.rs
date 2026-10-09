@@ -16,7 +16,7 @@ use crate::tools::{self, Kind as ToolKind, Todo};
 use crate::types::{Block, Msg, Role};
 use crate::App;
 use anyhow::Result;
-use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -419,6 +419,8 @@ struct Ui {
     next_tab_id: u64,
     tab_tx: UnboundedSender<(u64, Option<Push>)>,
     opened_tx: UnboundedSender<Opened>,
+    /// Clickable parts of the tab strip, as drawn last frame.
+    strip: tabs::Strip,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -1137,12 +1139,14 @@ impl Ui {
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.cmd_sel = 0;
         }
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char(c) if ctrl && shift && c.eq_ignore_ascii_case(&'t') => self.new_tab(),
-            KeyCode::Char(c) if ctrl && shift && c.eq_ignore_ascii_case(&'w') => self.close_tab(),
-            KeyCode::Tab if ctrl => self.step_tab(1),
-            KeyCode::BackTab if ctrl => self.step_tab(-1),
+            // Tab keys: alt, because ctrl+tab and ctrl+shift+t belong to terminal emulators such as Warp.
+            KeyCode::Char(c @ '1'..='9') if alt => {
+                let n = c as usize - '1' as usize;
+                if n < self.tabs.len() { self.switch_to(n) } else { self.notify(format!("no tab {c}")) }
+            }
+            KeyCode::Char('n') if alt => self.new_tab(),
+            KeyCode::Char('w') if alt => self.close_tab(),
             KeyCode::PageDown if alt => self.step_tab(1),
             KeyCode::PageUp if alt => self.step_tab(-1),
             KeyCode::Up | KeyCode::Down if !cmds.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1678,22 +1682,20 @@ impl Ui {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let mut area = f.area();
-        if self.tabs.len() > 1 {
-            let vertical = self.app.rt.settings.tab_orientation == "vertical";
-            let infos: Vec<_> = (0..self.tabs.len())
-                .map(|i| if i == self.cur { (self.title_now(), if self.running { TabStatus::Working } else { TabStatus::Idle }, true) } else { (self.tabs[i].title.clone(), self.tabs[i].status, false) })
-                .collect();
-            let (strip, rest) = if vertical {
-                let [a, b] = Layout::horizontal([Constraint::Length(tabs::SIDEBAR_W), Constraint::Min(20)]).areas(area);
-                (a, b)
-            } else {
-                let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(area);
-                (a, b)
-            };
-            f.render_widget(Paragraph::new(tabs::bar(&infos, self.spin, vertical, strip.width)), strip);
-            area = rest;
-        }
+        let vertical = self.app.rt.settings.tab_orientation == "vertical";
+        let infos: Vec<_> = (0..self.tabs.len())
+            .map(|i| if i == self.cur { (self.title_now(), if self.running { TabStatus::Working } else { TabStatus::Idle }, true) } else { (self.tabs[i].title.clone(), self.tabs[i].status, false) })
+            .collect();
+        let (strip_area, area) = if vertical {
+            let [a, b] = Layout::horizontal([Constraint::Length(tabs::SIDEBAR_W), Constraint::Min(20)]).areas(f.area());
+            (a, b)
+        } else {
+            let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(f.area());
+            (a, b)
+        };
+        let (lines, strip) = tabs::strip(strip_area, &infos, self.spin, vertical);
+        f.render_widget(Paragraph::new(lines), strip_area);
+        self.strip = strip;
         let width = area.width as usize;
         let inner_w = width.saturating_sub(2);
         let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
@@ -1884,7 +1886,7 @@ impl Ui {
         let w = (area.width.saturating_sub(4)).min(100);
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
-            Overlay::Help => COMMANDS.len() + 15,
+            Overlay::Help => COMMANDS.len() + 17,
             Overlay::Report(_, l) => l.len(),
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len(),
@@ -1944,8 +1946,10 @@ impl Ui {
                     ("ctrl+p", "model"),
                     ("ctrl+t", "conversation tree (fork)"),
                     ("ctrl+r", "resume a session"),
-                    ("ctrl+shift+t / ctrl+shift+w", "new / close session tab"),
-                    ("ctrl+tab / alt+pgdn", "next tab (ctrl+shift+tab / alt+pgup: previous)"),
+                    ("alt+n / alt+w", "new / close session tab"),
+                    ("alt+1 … alt+9", "go to tab"),
+                    ("alt+pgdn / alt+pgup", "next / previous tab"),
+                    ("click tab / × / +", "switch / close / new tab"),
                     ("ctrl+o", "full / compact output"),
                     ("pgup pgdn shift+↑↓ wheel", "scroll"),
                     ("ctrl+c ×2 / ctrl+d", "quit"),
@@ -2056,24 +2060,13 @@ fn ago(secs: u64) -> String {
     }
 }
 
-/// Whether the terminal speaks the kitty keyboard protocol (needed to tell ctrl+tab or ctrl+shift+t apart).
-static ENHANCED_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 fn setup() -> ratatui::DefaultTerminal {
-    use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     let t = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
-        && crossterm::execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok() {
-        ENHANCED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
     t
 }
 
 fn teardown() {
-    if ENHANCED_KEYS.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
-    }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 }
@@ -2177,17 +2170,50 @@ impl Ui {
         self.on_snapshot(snap);
     }
 
-    /// Close the active tab; a run still going in it is interrupted.
     fn close_tab(&mut self) {
+        self.close_at(self.cur);
+    }
+
+    /// Close tab `dead`; a run still going in it is interrupted. Closing the active tab moves to its neighbour.
+    fn close_at(&mut self, dead: usize) {
         if self.tabs.len() < 2 {
             return self.notify("last tab — /quit to exit");
         }
-        self.interrupt();
-        let dead = self.cur;
-        self.switch_to(if dead > 0 { dead - 1 } else { 1 });
+        if dead == self.cur {
+            self.interrupt();
+            self.switch_to(if dead > 0 { dead - 1 } else { 1 });
+        } else if self.tabs[dead].view.as_ref().is_some_and(|v| v.running) {
+            if let Some(v) = &self.tabs[dead].view {
+                v.remote.send(Req::Interrupt);
+            }
+        }
         self.tabs.remove(dead);
         if dead < self.cur {
             self.cur -= 1;
+        }
+    }
+
+    /// Mouse on the tab strip: × closes, the title switches, + opens a new session.
+    fn on_click(&mut self, col: u16, row: u16) {
+        if self.overlay.is_some() {
+            return;
+        }
+        let mut hit = None;
+        for (i, (tab, close)) in self.strip.tabs.iter().enumerate() {
+            if tabs::hit(*close, col, row) {
+                hit = Some((i, true));
+                break;
+            }
+            if tabs::hit(*tab, col, row) {
+                hit = Some((i, false));
+                break;
+            }
+        }
+        match hit {
+            Some((i, true)) => self.close_at(i),
+            Some((i, false)) => self.switch_to(i),
+            None if tabs::hit(self.strip.new, col, row) => self.new_tab(),
+            None => {}
         }
     }
 
@@ -2312,6 +2338,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         next_tab_id: 1,
         tab_tx,
         opened_tx,
+        strip: tabs::Strip::default(),
     };
     ui.forward(0, pushes);
     ui.on_snapshot(snap);
@@ -2346,6 +2373,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 Some(Ok(CEvent::Mouse(m))) => match m.kind {
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),
+                    MouseEventKind::Down(MouseButton::Left) => ui.on_click(m.column, m.row),
                     _ => {}
                 },
                 Some(Ok(CEvent::Resize(..))) => ui.invalidate_all(),

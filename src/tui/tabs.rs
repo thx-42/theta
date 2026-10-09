@@ -7,6 +7,7 @@ use crate::client::Remote;
 use crate::proto::Push;
 use crate::session::Session;
 use crate::tools::Todo;
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -127,48 +128,86 @@ fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>()) }
 }
 
-/// One line per tab (vertical sidebar, `width` wide) or a single line (horizontal strip).
-pub fn bar(tabs: &[(String, TabStatus, bool)], spin: usize, vertical: bool, width: u16) -> Vec<Line<'static>> {
-    let cell = |i: usize, (title, status, active): &(String, TabStatus, bool), max: usize| -> Vec<Span<'static>> {
-        let (glyph, color) = match status {
-            TabStatus::Working => (SPIN[spin % SPIN.len()], theme::accent()),
-            TabStatus::Done => ("●", theme::ok()),
-            TabStatus::Error => ("!", theme::err()),
-            TabStatus::Idle => ("·", theme::dim()),
-        };
-        let title = if title.trim().is_empty() { "new session" } else { title.trim() };
-        let base = if *active { theme::sel() } else { theme::dim() };
-        vec![
-            Span::styled(" ", base),
-            Span::styled(glyph, base.patch(color)),
-            Span::styled(format!(" {} {} ", i + 1, clip(title, max)), base),
-        ]
+/// Where the strip's controls landed on screen, for mouse clicks.
+#[derive(Default)]
+pub struct Strip {
+    /// Per tab: the title (click switches) and the × (click closes).
+    pub tabs: Vec<(Rect, Rect)>,
+    /// The + button (click opens a new session).
+    pub new: Rect,
+}
+
+pub fn hit(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.right() && row >= r.y && row < r.bottom()
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    format!("{s}{}", " ".repeat(w.saturating_sub(n)))
+}
+
+/// Render the tab strip into `area` (one row, or a column of rows when vertical) and return its clickable parts.
+pub fn strip(area: Rect, tabs: &[(String, TabStatus, bool)], spin: usize, vertical: bool) -> (Vec<Line<'static>>, Strip) {
+    let mut out = Strip::default();
+    let glyph = |status: TabStatus| match status {
+        TabStatus::Working => (SPIN[spin % SPIN.len()], theme::accent()),
+        TabStatus::Done => ("●", theme::ok()),
+        TabStatus::Error => ("!", theme::err()),
+        TabStatus::Idle => ("·", theme::dim()),
     };
+    let name = |t: &str| if t.trim().is_empty() { "new session".to_string() } else { t.trim().to_string() };
+    let style = |active: bool| if active { theme::sel() } else { theme::dim() };
+    let mut lines = Vec::new();
+
     if vertical {
-        let inner = width.saturating_sub(1) as usize;
-        return tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let mut spans = cell(i, t, inner.saturating_sub(6));
-                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let pad = inner.saturating_sub(used);
-                let base = if t.2 { theme::sel() } else { theme::dim() };
-                spans.push(Span::styled(" ".repeat(pad), base));
-                spans.push(Span::styled("│", theme::dim()));
-                Line::from(spans)
-            })
-            .collect();
+        let inner = area.width.saturating_sub(1) as usize;
+        let body_w = inner.saturating_sub(2);
+        for (i, (title, status, active)) in tabs.iter().enumerate() {
+            let y = area.y + i as u16;
+            let (g, c) = glyph(*status);
+            let st = style(*active);
+            let text = pad(&clip(&format!(" {} {}", i + 1, name(title)), body_w.saturating_sub(2)), body_w.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled(" ", st),
+                Span::styled(g, st.patch(c)),
+                Span::styled(text, st),
+                Span::styled(" ", st),
+                Span::styled("×", st.patch(theme::dim())),
+                Span::styled("│", theme::dim()),
+            ]));
+            out.tabs.push((Rect { x: area.x, y, width: inner.saturating_sub(1) as u16, height: 1 }, Rect { x: area.x + inner.saturating_sub(1) as u16, y, width: 1, height: 1 }));
+        }
+        let y = area.y + tabs.len() as u16;
+        lines.push(Line::from(vec![Span::styled(pad(" + new session", inner), theme::accent()), Span::styled("│", theme::dim())]));
+        out.new = Rect { x: area.x, y, width: inner as u16, height: 1 };
+        return (lines, out);
     }
-    let max = (width as usize / tabs.len().max(1)).saturating_sub(7).clamp(4, 24);
+
+    let max = (area.width as usize / tabs.len().max(1)).saturating_sub(8).clamp(6, 24);
     let mut spans = Vec::new();
-    for (i, t) in tabs.iter().enumerate() {
+    let mut x = area.x;
+    for (i, (title, status, active)) in tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("│", theme::dim()));
+            x += 1;
         }
-        spans.extend(cell(i, t, max));
+        let (g, c) = glyph(*status);
+        let st = style(*active);
+        let w = (3 + format!("{}", i + 1).len() + 1 + max.min(name(title).chars().count()) + 1) as u16;
+        spans.push(Span::styled(" ", st));
+        spans.push(Span::styled(g, st.patch(c)));
+        spans.push(Span::styled(format!(" {} {} ", i + 1, clip(&name(title), max)), st));
+        let tab = Rect { x, y: area.y, width: w, height: 1 };
+        x += w;
+        spans.push(Span::styled("×", st.patch(theme::dim())));
+        spans.push(Span::styled(" ", st));
+        out.tabs.push((tab, Rect { x, y: area.y, width: 1, height: 1 }));
+        x += 2;
     }
-    vec![Line::from(spans)]
+    spans.push(Span::styled(" + ", theme::accent()));
+    out.new = Rect { x, y: area.y, width: 3, height: 1 };
+    lines.push(Line::from(spans));
+    (lines, out)
 }
 
 #[cfg(test)]
