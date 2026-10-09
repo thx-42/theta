@@ -5,7 +5,7 @@ use crate::config;
 use crate::types::{Block, Msg, Role, Usage};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +62,35 @@ pub struct Info {
     pub title: String,
     pub updated: u64,
     pub messages: usize,
+}
+
+/// Open tabs and unread results of one project, kept by the daemon in `tabs.json` next to its sessions.
+#[derive(Default, Serialize, Deserialize)]
+pub struct TabsFile {
+    /// Session ids of the open tabs, in tab order.
+    #[serde(default)]
+    pub open: Vec<String>,
+    /// Finished results nobody looked at yet: session id -> done | error | asked.
+    #[serde(default)]
+    pub unseen: BTreeMap<String, String>,
+}
+
+pub fn load_tabs(cwd: &Path) -> TabsFile {
+    std::fs::read_to_string(dir_for(cwd).join("tabs.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_tabs(cwd: &Path, f: &TabsFile) {
+    let dir = dir_for(cwd);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(s) = serde_json::to_string(f) {
+        let _ = std::fs::write(dir.join("tabs.json"), s);
+    }
+}
+
+/// Tabs that were open last time and whose session file still exists.
+pub fn saved_open(cwd: &Path) -> Vec<String> {
+    let dir = dir_for(cwd);
+    load_tabs(cwd).open.into_iter().filter(|i| dir.join(format!("{i}.jsonl")).exists()).collect()
 }
 
 pub fn list(cwd: &Path) -> Vec<Info> {
@@ -295,6 +324,7 @@ mod tests {
     #[test]
     fn tree_and_fork() {
         let tmp = std::env::temp_dir().join(format!("theta-test-{}", rand::random::<u32>()));
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("THETA_HOME", &tmp) };
         let mut s = Session::new(Path::new("/tmp/proj"));
         let u1 = s.add_msg(Msg::user("one"), None).unwrap();
@@ -318,5 +348,23 @@ mod tests {
         assert!(c[0].text().contains("sum"));
         assert_eq!(c[1].text(), "alt");
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn tabs_round_trip_and_skip_missing_sessions() {
+        let home = std::env::temp_dir().join(format!("theta-tabs-test-{}", std::process::id()));
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("THETA_HOME", &home) };
+        let cwd = Path::new("/tmp/theta-tabs-project");
+        std::fs::create_dir_all(dir_for(cwd)).unwrap();
+        std::fs::write(dir_for(cwd).join("keep.jsonl"), "").unwrap();
+        let mut f = TabsFile::default();
+        f.open = vec!["keep".into(), "gone".into()];
+        f.unseen.insert("keep".into(), "done".into());
+        save_tabs(cwd, &f);
+        let back = load_tabs(cwd);
+        assert_eq!(back.unseen.get("keep").map(String::as_str), Some("done"));
+        assert_eq!(saved_open(cwd), vec!["keep".to_string()]);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

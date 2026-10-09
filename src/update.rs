@@ -12,6 +12,16 @@ use tokio::net::UnixStream;
 /// Release tag baked in by CI (`v<version>-<run number>`); absent in local builds.
 const TAG: Option<&str> = option_env!("THETA_TAG");
 
+/// `stable` (main branch releases) or `dev` (nightly releases from the dev branch); set by CI and install.sh.
+pub const CHANNEL: &str = match option_env!("THETA_CHANNEL") {
+    Some(c) => c,
+    None => "stable",
+};
+
+pub fn is_dev() -> bool {
+    CHANNEL == "dev"
+}
+
 pub const VERSION: &str = match TAG {
     Some(t) => t,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -68,6 +78,18 @@ fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 async fn latest_tag(http: &reqwest::Client) -> Result<String> {
+    if is_dev() {
+        // Nightly releases are prereleases tagged `dev-v…`; the newest one comes first in the list.
+        let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
+        let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
+        let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
+        return v
+            .iter()
+            .filter_map(|r| r["tag_name"].as_str())
+            .find(|t| t.starts_with("dev-"))
+            .map(String::from)
+            .context("no nightly release published yet");
+    }
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
     let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
     if r.status() == reqwest::StatusCode::NOT_FOUND {
@@ -181,6 +203,9 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     let latest = latest_tag(&http).await?;
     let dev = TAG.is_none();
     println!("        {} {}", ink.paint("2", "current"), if dev { format!("{VERSION} (local build)") } else { VERSION.to_string() });
+    if is_dev() {
+        println!("        {} nightly (dev)", ink.paint("2", "channel"));
+    }
     println!("        {} {latest}", ink.paint("2", "latest "));
 
     let newer = dev || is_newer(&latest, VERSION);

@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths-ignore: ["**.md"]
 
 permissions:
@@ -33,7 +33,10 @@ jobs:
           key: ${{ matrix.target }}
       - name: release tag
         shell: bash
-        run: echo "THETA_TAG=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)-${{ github.run_number }}" >> "$GITHUB_ENV"
+        run: |
+          if [ "${{ github.ref_name }}" = dev ]; then prefix=dev-; channel=dev; else prefix=; channel=stable; fi
+          echo "THETA_TAG=${prefix}v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)-${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "THETA_CHANNEL=$channel" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: package
         run: tar -C target/${{ matrix.target }}/release -czf theta-${{ matrix.target }}.tar.gz theta
@@ -56,9 +59,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          tag="v${version}-${{ github.run_number }}"
+          if [ "${{ github.ref_name }}" = dev ]; then prefix=dev-; pre=--prerelease; else prefix=; pre=; fi
+          tag="${prefix}v${version}-${{ github.run_number }}"
           (cd dist && sha256sum *.tar.gz > checksums.txt)
-          gh release create "$tag" dist/* \
+          if [ -n "$pre" ]; then
+            notes=(--generate-notes)
+          else
+            # stable: the notes are the CHANGELOG section of this version
+            awk -v v="$version" '$0 == "## " v {f=1; next} /^## /{f=0} f' CHANGELOG.md > notes.md
+            notes=(--notes-file notes.md)
+          fi
+          gh release create "$tag" dist/* $pre \
             --target "${{ github.sha }}" \
             --title "θ $tag" \
-            --generate-notes
+            "${notes[@]}"

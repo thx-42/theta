@@ -10,6 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash
 
 Le script demande : binaire pré-compilé (release GitHub, sha256 vérifié) ou compilation depuis les sources. Installe dans `~/.local/bin` (`THETA_PREFIX` pour changer). Chaque push sur `main` publie une release (Linux/macOS, x86_64/arm64).
 
+Canaux : `stable` (branche `main`, releases) ou `nightly` (branche `dev`, prereleases `dev-v…` publiées à chaque push sur `dev`). Le script demande le canal ; `--stable` / `--dev` le fixent sans menu. Le canal est gardé dans `~/.theta/install` et `theta update` suit ce canal. Un binaire nightly affiche `(dev)` à côté du logo.
+
 Mise à jour depuis θ lui-même : `theta update` cherche la dernière release, vérifie le sha256 et remplace le binaire (`--check` pour seulement regarder, `--force` pour réinstaller ou remplacer un build local). Si le daemon tourne, `theta daemon stop` le relance sur la nouvelle version.
 
 Suivi des mises à jour (depuis un clone, ou `curl … | bash -s -- <cmd>`) :

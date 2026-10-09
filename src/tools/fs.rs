@@ -2,6 +2,7 @@
 
 use super::{ToolCtx, ToolOut, b, n, resolve, s};
 use anyhow::{Context, Result, bail};
+use crate::config;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -78,6 +79,19 @@ pub fn write(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
         is_error: false,
         display,
     })
+}
+
+/// One plan per session: `~/.theta/plan/<session id>.md`. The model cannot choose the file.
+pub fn write_plan(args: &Value, session_id: &str) -> Result<ToolOut> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.starts_with('.') {
+        bail!("no session to attach the plan to");
+    }
+    let content = s(args, "content").context("content required")?;
+    let dir = config::home().join("plan");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{session_id}.md"));
+    std::fs::write(&path, content)?;
+    Ok(ToolOut::ok(format!("wrote plan {}", path.display())))
 }
 
 pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
@@ -298,5 +312,17 @@ mod tests {
         let (s, e) = fuzzy_find(hay, "fn a() {\n    x();").unwrap();
         assert_eq!(&hay[s..e], "fn a() {  \n    x();");
         assert!(fuzzy_find("a\nb\na\nb\n", "a\nb").is_none());
+    }
+
+    #[test]
+    fn plan_is_written_per_session() {
+        let home = std::env::temp_dir().join(format!("theta-plan-test-{}", std::process::id()));
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("THETA_HOME", &home) };
+        let out = write_plan(&serde_json::json!({"content": "# plan"}), "abc123").unwrap();
+        assert!(!out.is_error);
+        assert_eq!(std::fs::read_to_string(home.join("plan/abc123.md")).unwrap(), "# plan");
+        assert!(write_plan(&serde_json::json!({"content": "x"}), "../evil").is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

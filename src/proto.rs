@@ -25,6 +25,12 @@ pub enum Req {
     /// Subscribe this connection to a session (replaces the previous one) and get a `Push::Snapshot`.
     Attach { target: Target, cwd: PathBuf, agent: Option<String>, model: Option<String> },
     Send(String),
+    /// Message for a run in progress: it joins the conversation at the agent's next step. Idle: same as `Send`.
+    Steer(String),
+    /// Open tabs of `cwd`, in tab order, so the next start can reopen them.
+    SaveTabs { cwd: PathBuf, open: Vec<String> },
+    /// The user looked at this session: drop its unread result.
+    Seen,
     Interrupt,
     Answer { id: String, text: String },
     SetModel(String),

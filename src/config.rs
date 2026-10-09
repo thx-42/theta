@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Tests that set THETA_HOME hold this, so they do not see each other's folder.
+#[cfg(test)]
+pub static TEST_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn home() -> PathBuf {
     if let Ok(dir) = std::env::var("THETA_HOME") {
         return PathBuf::from(dir);
