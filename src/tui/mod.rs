@@ -419,6 +419,8 @@ struct Ui {
     next_tab_id: u64,
     tab_tx: UnboundedSender<(u64, Option<Push>)>,
     opened_tx: UnboundedSender<Opened>,
+    /// Output of `!cmd` shell lines, already formatted for display.
+    shell_tx: UnboundedSender<String>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
 }
@@ -530,6 +532,30 @@ impl Ui {
         self.history.push(text.clone());
         self.hist = None;
         self.remote.send(Req::Send(text));
+    }
+
+    /// `!cmd`: run in the user's shell, in this project's directory, without the agent.
+    fn shell(&mut self, cmd: String) {
+        if cmd.is_empty() {
+            return self.notify("usage: !<shell command>");
+        }
+        self.push(Item::User(format!("!{cmd}")));
+        let (tx, cwd) = (self.shell_tx.clone(), self.app.rt.cwd.clone());
+        tokio::spawn(async move {
+            let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let run = tokio::process::Command::new(sh).arg("-c").arg(&cmd).current_dir(&cwd).stdin(std::process::Stdio::null()).output();
+            let text = match tokio::time::timeout(Duration::from_secs(120), run).await {
+                Ok(Ok(o)) => {
+                    let raw = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                    let out = tools::shell::compact(&raw);
+                    let code = o.status.code().filter(|c| *c != 0).map(|c| format!("\n\nexit {c}")).unwrap_or_default();
+                    format!("```\n{out}\n```{code}")
+                }
+                Ok(Err(e)) => format!("cannot run `{cmd}`: {e}"),
+                Err(_) => format!("`{cmd}` timed out after 120s"),
+            };
+            let _ = tx.send(text);
+        });
     }
 
     /// A run began (here or in another client): reset the progress display.
@@ -1204,6 +1230,11 @@ impl Ui {
                 {
                     self.complete(&h);
                     self.cmd_sel = 0;
+                    return;
+                }
+                if let Some(cmd) = text.strip_prefix('!') {
+                    self.input.take();
+                    self.shell(cmd.trim().to_string());
                     return;
                 }
                 if text.starts_with('/') && !text.contains('\n') {
@@ -2391,6 +2422,7 @@ impl Ui {
             Push::Meta { agent, model, effort } => self.apply_meta(&agent, model, effort),
             Push::Notice(n) => self.push(Item::Info(n)),
             Push::Err(e) => self.push(Item::Error(e)),
+            Push::Busy(_) => {}
         }
     }
 }
@@ -2399,6 +2431,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let (login_tx, mut login_rx) = unbounded_channel();
     let (tab_tx, mut tab_rx) = unbounded_channel();
     let (opened_tx, mut opened_rx) = unbounded_channel();
+    let (shell_tx, mut shell_rx) = unbounded_channel::<String>();
     let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
     let app = App { rt, session: Arc::new(Mutex::new(Session::mirror(vec![]))), turn };
     let mut ui = Ui {
@@ -2438,6 +2471,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         next_tab_id: 1,
         tab_tx,
         opened_tx,
+        shell_tx,
         strip: tabs::Strip::default(),
     };
     ui.forward(0, pushes);
@@ -2488,6 +2522,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 }
             },
             Some(o) = opened_rx.recv() => ui.tab_opened(o),
+            Some(text) = shell_rx.recv() => ui.push(Item::Assistant { text, thinking: String::new(), done: true }),
             Some(m) = login_rx.recv() => ui.on_login(m),
             _ = tick.tick() => {
                 if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {

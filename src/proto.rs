@@ -39,6 +39,8 @@ pub enum Req {
     Reload,
     McpConnect(String),
     McpStatus,
+    /// Is an agent run active in any session? Answered with `Push::Busy`.
+    Busy,
     Shutdown,
 }
 
@@ -66,4 +68,5 @@ pub enum Push {
     Meta { agent: String, model: String, effort: String },
     Notice(String),
     Err(String),
+    Busy(bool),
 }

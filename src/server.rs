@@ -202,6 +202,11 @@ impl Server {
                     let l = self.base.mcp.status();
                     let _ = out.send(Push::Notice(if l.is_empty() { "no MCP servers — add [mcp.<name>] to settings.toml".into() } else { l.join("\n") }));
                 }
+                Req::Busy => {
+                    let lives: Vec<Arc<Live>> = self.lives.lock().unwrap().values().cloned().collect();
+                    let busy = lives.iter().any(|l| l.st.lock().unwrap().run.is_some());
+                    let _ = out.send(Push::Busy(busy));
+                }
                 Req::Shutdown => {
                     let _ = quit.send(());
                 }
@@ -349,7 +354,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
-        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Shutdown => {}
+        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown => {}
     }
 }
 

@@ -1,7 +1,7 @@
 //! Built-in tools. Outputs are compacted for token efficiency (rtk-style).
 
 mod fs;
-mod shell;
+pub mod shell;
 mod web;
 
 use crate::config::Settings;
