@@ -39,7 +39,7 @@ pub struct Settings {
     pub effort: String,
     /// full: show tool calls and thinking; compact: only final answer + one progress line
     pub verbose: String,
-    /// Session tab bar: horizontal (top row) | vertical (left sidebar)
+    /// Session tab bar: horizontal (top row) | vertical (left sidebar) | hidden
     pub tab_orientation: String,
     /// Sidebar width in columns (vertical tab bar only)
     pub tab_width: u16,
@@ -269,7 +269,7 @@ const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>
 model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
-tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
+tab_orientation = "horizontal"   # session tab bar: horizontal | vertical | hidden
 tab_width = 24                   # sidebar width in columns (14-60)
 agent = "Build"
 

@@ -82,7 +82,7 @@ const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Compu
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
     ("/resume", "open a previous session"),
-    ("/session", "session tabs: new | close | <n> | width <n>"),
+    ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/model", "change model"),
     ("/agent", "change agent"),
@@ -788,13 +788,15 @@ impl Ui {
             "/session" => match arg {
                 "" | "new" => self.new_tab(),
                 "close" => self.close_tab(),
+                "hide" => self.set_tab_orientation("hidden"),
+                "show" => self.set_tab_orientation("horizontal"),
                 n if n.starts_with("width") => match n["width".len()..].trim().parse::<u16>() {
                     Ok(w) => self.set_tab_width(w),
                     Err(_) => self.notify(format!("usage: /session width <{}-{}>", tabs::WIDTH_MIN, tabs::WIDTH_MAX)),
                 },
                 n => match n.parse::<usize>() {
                     Ok(n) if (1..=self.tabs.len()).contains(&n) => self.switch_to(n - 1),
-                    _ => self.notify("usage: /session [new | close | <n> | width <n>]"),
+                    _ => self.notify("usage: /session [new | close | hide | show | <n> | width <n>]"),
                 },
             },
             "/tree" => self.open_tree(),
@@ -1241,6 +1243,7 @@ impl Ui {
             }
             KeyCode::Char('n') if alt => self.new_tab(),
             KeyCode::Char('w') if alt => self.close_tab(),
+            KeyCode::Char('b') if alt => self.toggle_tab_bar(),
             KeyCode::PageDown if alt => self.step_tab(1),
             KeyCode::PageUp if alt => self.step_tab(-1),
             KeyCode::Up | KeyCode::Down if !hints.is_empty() && !k.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1712,7 +1715,7 @@ impl Ui {
                 self.update_settings("tools.rtk", v.clone().into(), |s| s.tools.rtk = v);
             }
             5 => {
-                let v = cycle(&["horizontal", "vertical"], &s.tab_orientation);
+                let v = cycle(&["horizontal", "vertical", "hidden"], &s.tab_orientation);
                 self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
             }
             6 => {
@@ -1849,19 +1852,25 @@ impl Ui {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let vertical = self.app.rt.settings.tab_orientation == "vertical";
+        let orientation = self.app.rt.settings.tab_orientation.as_str();
+        let vertical = orientation == "vertical";
+        let hidden = orientation == "hidden";
         let infos = self.tab_infos();
         let width = self.drag.unwrap_or(self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX));
         let (strip_area, area) = if vertical {
             let [a, b] = Layout::horizontal([Constraint::Length(width), Constraint::Min(20)]).areas(f.area());
             (a, b)
+        } else if hidden {
+            (Rect::default(), f.area())
         } else {
             let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(f.area());
             (a, b)
         };
         self.sidebar = if vertical { strip_area } else { Rect::default() };
-        let (lines, strip) = tabs::strip(strip_area, &infos, self.spin, vertical);
-        f.render_widget(Paragraph::new(lines), strip_area);
+        let (lines, strip) = if hidden { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical) };
+        if !hidden {
+            f.render_widget(Paragraph::new(lines), strip_area);
+        }
         self.strip = strip;
         let width = area.width as usize;
         let inner_w = width.saturating_sub(2);
@@ -2523,6 +2532,17 @@ impl Ui {
                 }
             })
             .collect()
+    }
+
+    fn set_tab_orientation(&mut self, v: &str) {
+        let v = v.to_string();
+        self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
+    }
+
+    /// alt+b: hide the tab bar, or bring it back (horizontal).
+    fn toggle_tab_bar(&mut self) {
+        let hidden = self.app.rt.settings.tab_orientation == "hidden";
+        self.set_tab_orientation(if hidden { "horizontal" } else { "hidden" });
     }
 
     fn set_tab_width(&mut self, w: u16) {
