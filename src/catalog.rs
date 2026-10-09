@@ -49,6 +49,13 @@ pub struct Provider {
     pub api_key: String,
 }
 
+impl Provider {
+    /// Wire format for one model. OpenCode Go serves MiniMax over Anthropic Messages and the others over chat completions.
+    pub fn api_for(&self, model: &str) -> Api {
+        if self.id == "opencode-go" && model.starts_with("minimax") { Api::Anthropic } else { self.api }
+    }
+}
+
 const BUILTIN: &[(&str, &str, Api, &str, &[&str], Option<OAuthKind>, &str)] = &[
     ("anthropic", "Anthropic", Api::Anthropic, "https://api.anthropic.com", &["ANTHROPIC_API_KEY"], Some(OAuthKind::Anthropic), "anthropic"),
     ("openai", "OpenAI", Api::OpenAiResponses, "https://api.openai.com/v1", &["OPENAI_API_KEY"], None, "openai"),
@@ -67,8 +74,8 @@ const BUILTIN: &[(&str, &str, Api, &str, &[&str], Option<OAuthKind>, &str)] = &[
     ("moonshotai", "Moonshot", Api::OpenAiChat, "https://api.moonshot.ai/v1", &["MOONSHOT_API_KEY"], None, "moonshotai"),
     ("huggingface", "Hugging Face", Api::OpenAiChat, "https://router.huggingface.co/v1", &["HF_TOKEN"], None, "huggingface"),
     ("opencode", "OpenCode Zen", Api::OpenAiChat, "https://opencode.ai/zen/v1", &["OPENCODE_API_KEY"], None, "opencode"),
+    // One provider for every Go model: MiniMax speaks Anthropic Messages, the rest chat completions (see Provider::api_for).
     ("opencode-go", "OpenCode Go", Api::OpenAiChat, "https://opencode.ai/zen/go/v1", &["OPENCODE_API_KEY"], None, "opencode-go"),
-    ("opencode-go-anthropic", "OpenCode Go (Anthropic)", Api::Anthropic, "https://opencode.ai/zen/go", &["OPENCODE_API_KEY"], None, "opencode-go"),
     ("ollama-cloud", "Ollama Cloud", Api::OpenAiChat, "https://ollama.com/v1", &["OLLAMA_API_KEY"], None, "ollama-cloud"),
     ("ollama", "Ollama (local)", Api::OpenAiChat, "http://localhost:11434/v1", &[], None, ""),
     ("lmstudio", "LM Studio (local)", Api::OpenAiChat, "http://127.0.0.1:1234/v1", &[], None, "lmstudio"),
@@ -235,10 +242,6 @@ impl Catalog {
             .unwrap_or_default();
         if p.api == Api::Codex {
             out.retain(|m| m.id.starts_with("gpt-5") || m.id.starts_with("gpt-6") || m.id.contains("codex"));
-        }
-        // shortcut: MiniMax-only filter, shared catalog slug; upgrade to a per-provider model list if more Anthropic-style models appear
-        if p.id == "opencode-go-anthropic" {
-            out.retain(|m| m.id.starts_with("minimax"));
         }
         for m in &mut out {
             m.provider = p.id.clone();

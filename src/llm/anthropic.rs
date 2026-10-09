@@ -137,8 +137,10 @@ pub async fn stream(
     }
 
     let base = creds.base_url.as_deref().unwrap_or(&p.base_url);
+    // Some bases already carry the /v1 of their API (OpenCode Go: .../zen/go/v1/messages).
+    let url = if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") };
     let mut rb = client
-        .post(format!("{base}/v1/messages"))
+        .post(url)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
@@ -150,6 +152,9 @@ pub async fn stream(
     } else {
         rb.header("x-api-key", &creds.token)
     };
+    if p.id.starts_with("opencode") {
+        rb = rb.header("x-opencode-session", req.session_id);
+    }
     let resp = send(rb.json(&body)).await?;
     let mut sse = Sse::new(resp);
 

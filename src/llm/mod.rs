@@ -63,7 +63,7 @@ pub async fn complete(
     let req = Request { messages: &messages, ..req };
     let mut attempt = 0;
     loop {
-        let res = match provider.api {
+        let res = match provider.api_for(&req.model.id) {
             Api::Anthropic => anthropic::stream(client, provider, &creds, &req, on).await,
             Api::OpenAiChat => openai_chat::stream(client, provider, &creds, &req, on).await,
             Api::OpenAiResponses | Api::Codex => openai_resp::stream(client, provider, &creds, &req, on).await,

@@ -105,6 +105,10 @@ pub async fn stream(
     if p.id == "openrouter" {
         rb = rb.header("HTTP-Referer", "https://github.com/theta-cli").header("X-Title", "theta");
     }
+    if p.id.starts_with("opencode") {
+        // OpenCode Go rejects requests without a session id (400 MissingSessionID).
+        rb = rb.header("x-opencode-session", req.session_id);
+    }
     let resp = send(rb.json(&body)).await?;
     let mut sse = Sse::new(resp);
 
