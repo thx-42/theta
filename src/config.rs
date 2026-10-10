@@ -117,6 +117,8 @@ pub struct TaskModels {
     pub compaction: String,
     pub title: String,
     pub subagent: String,
+    /// Reasoning effort of subagents; empty = the spawning agent's effort
+    pub subagent_effort: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,6 +336,7 @@ agent = "Build"
 compaction = "anthropic/claude-haiku-5-5"
 title = "anthropic/claude-haiku-5-5"
 subagent = ""
+subagent_effort = ""                   # "" = effort of the spawning agent
 
 # Model and effort per agent (override the agent file's model/effort; CLI flags still win)
 # [agents.Build]

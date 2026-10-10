@@ -372,7 +372,13 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         .filter(|_| named)
         .or_else(|| parent.agent.subagent_model.clone())
         .unwrap_or(rt.task_model("subagent", &parent.model).await);
-    let effort = agents::effort_of(&agent, &rt.settings).filter(|_| named).unwrap_or_else(|| parent.effort.clone());
+    // call argument > named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
+    let asked = args.get("effort").and_then(|v| v.as_str()).map(str::to_lowercase).filter(|e| ["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()));
+    let effort = asked
+        .or_else(|| agents::effort_of(&agent, &rt.settings).filter(|_| named))
+        .or_else(|| parent.agent.subagent_effort.clone())
+        .or_else(|| Some(rt.settings.models.subagent_effort.clone()).filter(|e| !e.is_empty()))
+        .unwrap_or_else(|| parent.effort.clone());
     let mut s = Session::new(&rt.cwd);
     s.path = crate::config::home().join("cache/subagents").join(format!("{}.jsonl", s.id));
     s.add_msg(Msg::user(prompt), None)?;

@@ -110,7 +110,7 @@ pub fn all_defs() -> Vec<ToolDef> {
 
 pub fn task_def(agents: &[String]) -> ToolDef {
     def("task", &format!("Delegate a self-contained task to a subagent with a fresh context. It returns only its final report, which keeps your context small. Use for broad searches, research, or independent work. Agents: {}.", agents.join(", ")),
-        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return at once with a job id; the report arrives in a later message and you can keep working"}},"required":["description","prompt"]}))
+        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"],"description":"Reasoning effort for this subagent; omit to use the configured default"},"background":{"type":"boolean","description":"Return at once with a job id; the report arrives in a later message and you can keep working"}},"required":["description","prompt"]}))
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {

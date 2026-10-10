@@ -153,6 +153,7 @@ cannot: modifier des fichiers        # optionnel
 model: anthropic/claude-opus-5-5     # optionnel
 effort: high                         # optionnel
 subagent_model: anthropic/claude-haiku-5-5   # optionnel, modèle des subagents lancés par cet agent
+subagent_effort: low                 # optionnel, effort des subagents lancés par cet agent
 tools: read, grep, find, ls, task    # optionnel, défaut = tous
 delegate: all                        # optionnel, peut spawner des agents qui écrivent
 ---
@@ -172,6 +173,8 @@ effort = "high"
 ```
 
 Ces valeurs se règlent aussi dans `/settings`, onglet **Models** (modèle et effort par agent, modèles compaction / titre / subagent). `tab` change d'onglet dans ce panneau.
+
+Effort d'un subagent, du plus prioritaire au moins : argument `effort` de l'appel `task` > `[agents.<nom>]` de l'agent ciblé > `subagent_effort` de l'agent qui lance > `[models] subagent_effort` > effort de l'agent qui lance. Réglable dans `/settings`, onglet **Models** (*Subagent effort*).
 
 Priorité : `-m` / `--agent` en ligne de commande > `[agents.<nom>]` > frontmatter de l'agent > `model` / `effort` globaux. Valable au démarrage, au changement d'agent (`tab`) et pour les subagents lancés par `task` avec `agent`.
 
@@ -284,6 +287,7 @@ Compaction automatique au-delà de `compaction.threshold` (80 % par défaut) de 
 compaction = "anthropic/claude-haiku-5-5"
 title = "anthropic/claude-haiku-5-5"   # nommage auto des sessions
 subagent = ""                          # "" = modèle principal
+subagent_effort = ""                   # "" = effort de l'agent qui lance le subagent
 ```
 
 Un modèle de tâche sans identifiants retombe sur le modèle principal.

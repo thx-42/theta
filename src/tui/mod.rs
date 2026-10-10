@@ -1725,6 +1725,7 @@ impl Ui {
                     ("Compaction model".into(), or_main(&s.models.compaction)),
                     ("Session-title model".into(), or_main(&s.models.title)),
                     ("Subagent model".into(), or_main(&s.models.subagent)),
+                    ("Subagent effort".into(), if s.models.subagent_effort.is_empty() { "(same as agent)".into() } else { s.models.subagent_effort.clone() }),
                 ];
                 for a in self.app.rt.agents.iter() {
                     let cfg = s.agent(&a.name).cloned().unwrap_or_default();
@@ -1745,11 +1746,15 @@ impl Ui {
         let s = self.app.rt.settings.clone();
         if view.tab == SettingsTab::Models {
             let n = view.sel;
-            let agent_row = n.checked_sub(5).map(|r| (r / 2, r % 2 == 0));
+            let agent_row = n.checked_sub(6).map(|r| (r / 2, r % 2 == 0));
             match (n, agent_row) {
                 (1, _) => {
                     let e = cycle(&["low", "medium", "high", "xhigh", "max"], &self.app.turn.effort);
                     self.set_effort(&e);
+                }
+                (5, _) => {
+                    let e = cycle(&["", "low", "medium", "high", "xhigh", "max"], &s.models.subagent_effort);
+                    self.update_settings("models.subagent_effort", e.clone().into(), |s| s.models.subagent_effort = e);
                 }
                 (0, _) | (2..=4, _) | (_, Some((_, true))) => {
                     self.settings_back = Some(view);
@@ -1758,7 +1763,7 @@ impl Ui {
                         2 => self.open_models(Target::Compaction),
                         3 => self.open_models(Target::Title),
                         4 => self.open_models(Target::Subagent),
-                        _ => self.open_models(Target::Agent((n - 5) / 2)),
+                        _ => self.open_models(Target::Agent((n - 6) / 2)),
                     }
                 }
                 (_, Some((i, false))) => {

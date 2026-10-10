@@ -34,6 +34,8 @@ pub struct Agent {
     pub effort: Option<String>,
     /// Model for subagents spawned by this agent
     pub subagent_model: Option<String>,
+    /// Effort for subagents spawned by this agent
+    pub subagent_effort: Option<String>,
     /// Allowed tools (None = all)
     pub tools: Option<Vec<String>>,
     /// May spawn any agent as a subagent (`delegate: all`); otherwise only read-only ones, unless it has every tool.
@@ -51,6 +53,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
         model: None,
         effort: None,
         subagent_model: None,
+        subagent_effort: None,
         tools: None,
         delegate_all: false,
         prompt: text.trim().to_string(),
@@ -72,6 +75,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
             "model" => a.model = Some(v),
             "effort" => a.effort = Some(v),
             "subagent_model" => a.subagent_model = Some(v),
+            "subagent_effort" => a.subagent_effort = Some(v),
             "delegate" => a.delegate_all = v.eq_ignore_ascii_case("all"),
             "tools" => a.tools = Some(v.trim_matches(['[', ']']).split(',').map(|t| t.trim().trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect()),
             _ => {}
