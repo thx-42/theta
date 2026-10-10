@@ -423,6 +423,8 @@ struct Ui {
     interrupted: bool,
     /// Tabs being reopened at start; they must not take focus while this counts down.
     restoring: usize,
+    /// Session ids being opened because another client opened them (not yet attached).
+    opening: Vec<String>,
     started: Instant,
     elapsed: Duration,
     counts: Counts,
@@ -875,7 +877,7 @@ impl Ui {
             "/remote" => {
                 self.remote_asked = true;
                 match arg {
-                    "" => self.remote.send(Req::RemoteStart),
+                    "" => self.remote.send(Req::RemoteStart { cwd: self.app.rt.cwd.clone() }),
                     "stop" => self.remote.send(Req::RemoteStop),
                     "status" => self.remote.send(Req::RemoteStatus),
                     _ => self.notify("usage: /remote [stop|status]"),
@@ -1535,7 +1537,17 @@ impl Ui {
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
-            Overlay::Help | Overlay::Report(..) => {}
+            Overlay::Help => {}
+            Overlay::Report(title, lines) => {
+                // The link code is typed on another device: `c` puts it on the clipboard and keeps the overlay.
+                if title == "θ remote" && matches!(k.code, KeyCode::Char('c')) {
+                    if let RemoteState::Code { code, .. } = &self.remote_state {
+                        let ok = clipboard(code);
+                        self.notify(if ok { "code copied" } else { "no clipboard tool found" });
+                    }
+                    self.overlay = Some(Overlay::Report(title, lines));
+                }
+            }
             Overlay::Jobs(mut v) => {
                 let viewing = v.view.is_some();
                 match (viewing, k.code) {
@@ -2608,7 +2620,44 @@ impl Ui {
         });
     }
 
+    /// Session id of tab `i`: the active tab's state lives in `Ui`, the others are parked in their view.
+    fn tab_session_id(&self, i: usize) -> Option<String> {
+        let s = match &self.tabs[i].view {
+            Some(v) => v.session.clone(),
+            None => self.app.session.clone(),
+        };
+        let s = s.lock().unwrap();
+        s.has_messages().then(|| s.id.clone())
+    }
+
+    /// Another client (the web UI) opened or closed tabs of this project: do the same here.
+    fn on_tabs(&mut self, cwd: &std::path::Path, opened: Vec<String>, closed: Vec<String>) {
+        if cwd != self.app.rt.cwd || self.restoring > 0 {
+            return;
+        }
+        for id in closed {
+            if let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_session_id(i).as_deref() == Some(&id)) {
+                self.close_at(i);
+            }
+        }
+        for id in opened {
+            let have = (0..self.tabs.len()).any(|i| self.tab_session_id(i).as_deref() == Some(&id));
+            if have || self.opening.contains(&id) {
+                continue;
+            }
+            self.opening.push(id.clone());
+            let (tx, cwd) = (self.opened_tx.clone(), self.app.rt.cwd.clone());
+            tokio::spawn(async move {
+                let _ = tx.send(crate::client::open(Where::Resume(id), cwd, None, None).await.map_err(|e| format!("{e:#}")));
+            });
+        }
+    }
+
     fn tab_opened(&mut self, opened: Opened) {
+        match &opened {
+            Ok((_, _, snap)) => self.opening.retain(|i| *i != snap.session_id),
+            Err(_) => self.opening.clear(),
+        }
         let restored = self.restoring > 0;
         self.restoring = self.restoring.saturating_sub(1);
         self.open_tab(opened);
@@ -2758,6 +2807,12 @@ impl Ui {
     }
 
     fn on_tab_push(&mut self, id: u64, p: Option<Push>) {
+        // Link and tab changes concern the whole TUI, whichever tab's connection carried them.
+        match p {
+            Some(Push::Tabs { cwd, opened, closed }) => return self.on_tabs(&cwd, opened, closed),
+            Some(Push::Remote { state, url }) => return self.on_remote(state, &url),
+            _ => {}
+        }
         let Some(i) = self.tabs.iter().position(|t| t.id == id) else { return };
         match (i == self.cur, p) {
             (true, Some(p)) => self.on_push(p),
@@ -2821,6 +2876,7 @@ impl Ui {
                     format!("  code   {}", code),
                     format!("  open   {}/link", url.trim_end_matches('/')),
                     String::new(),
+                    "  press c to copy the code".into(),
                     format!("  Valid for {} min. Anyone with the code can run tools on this machine:", expires_in / 60),
                     "  only enter it yourself. `/remote stop` cuts the link.".into(),
                 ];
@@ -2859,7 +2915,7 @@ impl Ui {
             Push::Err(e) => self.push(Item::Error(e)),
             Push::Busy(_) => {}
             Push::Remote { state, url } => self.on_remote(state, &url),
-            Push::Overview(_) => {} // web clients only
+            Push::Overview(_) | Push::Tabs { .. } => {} // web clients / handled in on_tab_push
             Push::Jobs(l) => self.jobs = l,
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay
@@ -2897,6 +2953,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         esc_at: None,
         interrupted: false,
         restoring: 0,
+        opening: vec![],
         started: Instant::now(),
         elapsed: Duration::ZERO,
         counts: Counts::default(),

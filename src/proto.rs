@@ -56,7 +56,8 @@ pub enum Req {
     JobOutput(String),
     Shutdown,
     /// Link this daemon to theta-server so a browser can drive it (answered with `Push::Remote`). Local clients only.
-    RemoteStart,
+    /// `cwd` is the project the browser opens first: the one the user is working in.
+    RemoteStart { cwd: PathBuf },
     /// Drop the link to theta-server. Local clients only.
     RemoteStop,
     /// Ask for the current link state. Local clients only.
@@ -96,6 +97,8 @@ pub struct ModelBrief {
 pub struct Overview {
     pub cwd: PathBuf,
     pub version: String,
+    /// Session ids of the tabs open in `cwd` (shared with the TUI), in tab order.
+    pub open: Vec<String>,
     pub projects: Vec<PathBuf>,
     pub sessions: Vec<SessionBrief>,
     pub agents: Vec<AgentBrief>,
@@ -151,4 +154,6 @@ pub enum Push {
     JobOutput { id: String, text: String },
     Remote { state: RemoteState, url: String },
     Overview(Box<Overview>),
+    /// Tabs of `cwd` were opened or closed by another client: mirror it. Sent to every client.
+    Tabs { cwd: PathBuf, opened: Vec<String>, closed: Vec<String> },
 }

@@ -39,6 +39,8 @@ struct RemoteLink {
     task: Option<(tokio::task::JoinHandle<()>, Arc<Notify>)>,
     state: RemoteState,
     url: String,
+    /// Project the browser opens first (the TUI that started the link).
+    cwd: Option<PathBuf>,
 }
 
 pub(crate) struct Server {
@@ -50,6 +52,8 @@ pub(crate) struct Server {
     remote: Mutex<RemoteLink>,
     /// `Push::Remote` updates for local clients.
     remote_bus: broadcast::Sender<Push>,
+    /// `Push::Tabs`: a client opened or closed tabs; every other client mirrors it.
+    pub(crate) tabs_bus: broadcast::Sender<Push>,
 }
 
 pub async fn serve() -> Result<()> {
@@ -77,6 +81,7 @@ pub async fn serve() -> Result<()> {
         lives: Default::default(),
         remote: Default::default(),
         remote_bus: broadcast::channel(16).0,
+        tabs_bus: broadcast::channel(64).0,
     });
     let (quit_tx, mut quit_rx) = unbounded_channel::<()>();
     loop {
@@ -216,11 +221,17 @@ impl Server {
     /// virtual channel of the relay (`quit` unset, already filtered by `relay::allowed`).
     pub(crate) async fn run_connection(self: Arc<Self>, mut reqs: UnboundedReceiver<Req>, out: UnboundedSender<Push>, quit: Option<UnboundedSender<()>>) {
         let local = quit.is_some();
+        // Local clients get link and tab changes; relayed channels get tabs once, from the relay itself.
         let mut remote_fwd = local.then(|| {
-            let mut rx = self.remote_bus.subscribe();
+            let (mut remote_rx, mut tabs_rx) = (self.remote_bus.subscribe(), self.tabs_bus.subscribe());
             let out = out.clone();
             tokio::spawn(async move {
-                while let Ok(p) = rx.recv().await {
+                loop {
+                    let p = tokio::select! {
+                        Ok(p) = remote_rx.recv() => p,
+                        Ok(p) = tabs_rx.recv() => p,
+                        else => break,
+                    };
                     if out.send(p).is_err() {
                         break;
                     }
@@ -246,7 +257,15 @@ impl Server {
                     }
                 }
                 Req::Reload => self.reload().await,
-                Req::SaveTabs { cwd, open } => update_tabs(&cwd, |t| t.open = open),
+                Req::SaveTabs { cwd, open } => {
+                    let mut before = Vec::new();
+                    update_tabs(&cwd, |t| before = std::mem::replace(&mut t.open, open.clone()));
+                    let opened: Vec<String> = open.iter().filter(|i| !before.contains(i)).cloned().collect();
+                    let closed: Vec<String> = before.into_iter().filter(|i| !open.contains(i)).collect();
+                    if !opened.is_empty() || !closed.is_empty() {
+                        let _ = self.tabs_bus.send(Push::Tabs { cwd, opened, closed });
+                    }
+                }
                 Req::Seen => {
                     if let Some(live) = &current {
                         let (cwd, id) = {
@@ -285,10 +304,10 @@ impl Server {
                         });
                     });
                 }
-                Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus if !local => {
+                Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus if !local => {
                     let _ = out.send(Push::Err("not allowed remotely".into()));
                 }
-                Req::RemoteStart => self.remote_start(),
+                Req::RemoteStart { cwd } => self.remote_start(cwd),
                 Req::RemoteStop => self.remote_stop(),
                 Req::RemoteStatus => {
                     let (state, url) = {
@@ -314,11 +333,11 @@ impl Server {
     }
 
     async fn overview(&self, cwd: Option<PathBuf>) -> Result<Overview> {
-        let cwd = cwd.unwrap_or_else(|| self.base.cwd.clone());
+        let cwd = cwd.or_else(|| self.remote.lock().unwrap().cwd.clone()).unwrap_or_else(|| self.base.cwd.clone());
         let rt = self.runtime_for(&cwd).await?;
         let running: Vec<String> = self.lives.lock().unwrap().iter().filter(|(_, l)| l.st.lock().unwrap().run.is_some()).map(|(id, _)| id.clone()).collect();
         let dir = cwd.clone();
-        let (sessions, projects) = tokio::task::spawn_blocking(move || (session::list(&dir), session::projects())).await?;
+        let (sessions, projects, open) = tokio::task::spawn_blocking(move || (session::list(&dir), session::projects(), session::load_tabs(&dir).open)).await?;
         let sessions = sessions
             .into_iter()
             .map(|i| {
@@ -336,7 +355,7 @@ impl Server {
             models.extend(rt.catalog.models_of(p).into_iter().map(|m| ModelBrief { key: m.key(), provider: p.name.clone(), context: m.context, reasoning: m.reasoning }));
         }
         let efforts = ["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec();
-        Ok(Overview { cwd, version: crate::update::VERSION.into(), projects, sessions, agents, models, efforts })
+        Ok(Overview { cwd, version: crate::update::VERSION.into(), open, projects, sessions, agents, models, efforts })
     }
 
     /// Records the link state and tells the local clients.
@@ -352,8 +371,9 @@ impl Server {
         let _ = self.remote_bus.send(Push::Remote { state, url });
     }
 
-    fn remote_start(self: &Arc<Self>) {
+    fn remote_start(self: &Arc<Self>, cwd: PathBuf) {
         let mut r = self.remote.lock().unwrap();
+        r.cwd = Some(cwd);
         if r.task.as_ref().is_some_and(|(h, _)| !h.is_finished()) {
             let _ = self.remote_bus.send(Push::Remote { state: r.state.clone(), url: r.url.clone() });
             return;
@@ -555,7 +575,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
-        Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
+        Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
     }
 }
 

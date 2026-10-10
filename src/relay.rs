@@ -97,6 +97,14 @@ struct Relayed<'a> {
     push: &'a Push,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 enum Outcome {
     Stopped,
     Dropped(String),
@@ -156,6 +164,18 @@ async fn session(srv: &Arc<Server>, url: &str, host: &str, token: &mut Option<St
     }
 
     let (out_tx, mut out_rx) = unbounded_channel::<(u32, Push)>();
+    // Tab changes made elsewhere (the TUI) reach the browser once, on the control channel.
+    let _tabs_fwd = {
+        let mut rx = srv.tabs_bus.subscribe();
+        let out = out_tx.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            while let Ok(p) = rx.recv().await {
+                if out.send((0, p)).is_err() {
+                    break;
+                }
+            }
+        }))
+    };
     let mut chans: HashMap<u32, UnboundedSender<Req>> = HashMap::new();
     let mut ping = interval(Duration::from_secs(30));
     let mut code_deadline: Option<Instant> = None;
@@ -288,7 +308,7 @@ mod tests {
     fn allow_list_blocks_control_requests() {
         assert!(allowed(&Req::Interrupt));
         assert!(allowed(&Req::Send("hi".into(), vec![])));
-        for r in [Req::Shutdown, Req::Reload, Req::RemoteStart, Req::RemoteStop, Req::RemoteStatus, Req::McpConnect("x".into())] {
+        for r in [Req::Shutdown, Req::Reload, Req::RemoteStart { cwd: ".".into() }, Req::RemoteStop, Req::RemoteStatus, Req::McpConnect("x".into())] {
             assert!(!allowed(&r), "{r:?}");
         }
     }
