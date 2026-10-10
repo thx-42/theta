@@ -48,15 +48,33 @@ pub fn allowed(req: &Req) -> bool {
     )
 }
 
-/// `https://host` → `wss://host/ws/daemon`. Plain `http://` is only accepted for loopback.
+/// Plain `http://` is for development only: loopback and private-network addresses.
+fn is_local_host(host: &str) -> bool {
+    use std::net::IpAddr;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// `https://host` → `wss://host/ws/daemon`. Plain `http://` is only accepted for local hosts.
 pub fn ws_url(base: &str) -> Result<String, String> {
     let base = base.trim().trim_end_matches('/');
     let (scheme, rest) = base.split_once("://").ok_or("remote url must start with https://")?;
-    let host = rest.split(['/', ':']).next().unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
     let secure = match scheme {
         "https" | "wss" => true,
-        "http" | "ws" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => false,
-        "http" | "ws" => return Err("plain http is only allowed for localhost".into()),
+        "http" | "ws" if is_local_host(host) => false,
+        "http" | "ws" => return Err("plain http is only allowed for localhost and private network addresses".into()),
         _ => return Err(format!("unsupported scheme `{scheme}`")),
     };
     Ok(format!("{}://{rest}/ws/daemon", if secure { "wss" } else { "ws" }))
@@ -260,7 +278,9 @@ mod tests {
     fn ws_url_forms() {
         assert_eq!(ws_url("https://theta.sputnk.net/").unwrap(), "wss://theta.sputnk.net/ws/daemon");
         assert_eq!(ws_url("http://localhost:8080").unwrap(), "ws://localhost:8080/ws/daemon");
+        assert_eq!(ws_url("http://192.168.1.141:8080").unwrap(), "ws://192.168.1.141:8080/ws/daemon");
         assert!(ws_url("http://example.com").is_err());
+        assert!(ws_url("http://8.8.8.8").is_err());
         assert!(ws_url("theta.sputnk.net").is_err());
     }
 
