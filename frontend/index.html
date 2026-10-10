@@ -8,139 +8,99 @@
   <meta property="og:title" content="θ theta — harness de coding agent léger en Rust">
   <meta property="og:description" content="Petit, configurable, économe en tokens. Colle une commande, code avec ton agent.">
   <meta property="og:type" content="website">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b0b12'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%23e879f9' font-family='Georgia,serif'%3E%CE%B8%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2307060b'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%238b5cf6' font-family='monospace'%3E%CE%B8%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-  <div class="bg" aria-hidden="true">
-    <div class="blob blob-a"></div>
-    <div class="blob blob-b"></div>
-    <div class="gridlines"></div>
-    <div class="theta-watermark" aria-hidden="true">θ</div>
-  </div>
-
   <header class="nav">
-    <a class="brand" href="#top" aria-label="theta — retour en haut">
-      <span class="brand-mark">θ</span>
-      <span class="brand-name">theta</span>
-      <span class="brand-tag">v0.1.0</span>
-    </a>
+    <a class="brand" href="#top" aria-label="theta — retour en haut">θ theta</a>
     <nav class="nav-links" aria-label="Navigation principale">
-      <a href="#demo">démo</a>
       <a href="#features">features</a>
       <a href="#providers">providers</a>
-      <a href="#installer">installer</a>
+      <a href="#install">install</a>
+      <a href="https://github.com/thx-42/theta" target="_blank" rel="noopener">github↗</a>
     </nav>
-    <a class="btn btn-ghost" href="https://github.com/thx-42/theta" target="_blank" rel="noopener">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-      GitHub
-    </a>
   </header>
 
   <main id="top">
-    <!-- HERO -->
-    <section class="hero">
-      <p class="pill"><span class="pulse" aria-hidden="true"></span> harness de coding agent · léger · en Rust</p>
-      <h1><span class="theta-giant" aria-hidden="true">θ</span> <span class="grad">theta</span></h1>
-      <p class="tagline">Petit, configurable, <strong>économe en tokens</strong>.<br>Ton terminal devient une équipe&nbsp;: un agent qui code, pendant que tu sirotes ton café.</p>
-
-      <div class="install-hero" id="installer-rapide">
-        <p class="install-label"><span aria-hidden="true">$</span> colle ça dans ton terminal, c'est tout</p>
-        <div class="install-box" role="group" aria-label="Commande d'installation de theta">
-          <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash</code>
-          <button class="btn btn-copy" id="copy-btn" type="button" aria-live="polite">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            <span id="copy-label">copier</span>
-          </button>
+    <section class="hero" aria-label="présentation theta">
+      <pre id="ascii-bg" aria-hidden="true"></pre>
+      <div class="hero-inner">
+<pre class="logo" aria-label="logo ascii theta">        _   _          _
+       | |_| |__   ___| |_ __ _
+       | __| '_ \ / _ \ __/ _` |
+       | |_| | | |  __/ || (_| |
+        \__|_| |_|\___|\__\__,_|</pre>
+        <p class="tagline">harness de coding agent léger, écrit en Rust. petit · configurable · économe en tokens.</p>
+        <div class="install-hero">
+          <div class="install-box" role="group" aria-label="Commande d installation de theta">
+            <span class="dollar" aria-hidden="true">$</span><code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash</code><button class="copy" id="copy-btn" type="button">[ copier ]</button>
+          </div>
+          <p class="hint">linux · macos / x86_64 · arm64 / sha256 vérifié / → ~/.local/bin</p>
+          <pre class="flow" aria-label="flux : theta login puis theta puis theta print">theta login ──▶ theta ──▶ theta -p "…"</pre>
         </div>
-        <p class="install-hint">binaire pré-compilé vérifié <span class="sha">sha256</span> · Linux &amp; macOS · x86_64 &amp; arm64 &nbsp;→&nbsp; installé dans <code>~/.local/bin</code></p>
-      </div>
-
-      <div class="next-steps" aria-label="Et ensuite">
-        <div class="step"><span class="step-n">1</span><code>theta login</code><span>choisis ton provider</span></div>
-        <div class="step-arrow" aria-hidden="true">→</div>
-        <div class="step"><span class="step-n">2</span><code>theta</code><span>TUI plein écran</span></div>
-        <div class="step-arrow" aria-hidden="true">→</div>
-        <div class="step"><span class="step-n">3</span><code>theta -p "…"</code><span>mode print, sans interaction</span></div>
       </div>
     </section>
 
-    <!-- DEMO -->
-    <section class="demo" id="demo">
-      <div class="section-head">
-        <p class="kicker">démo</p>
-        <h2>Ça ressemble à quoi&nbsp;?</h2>
-        <p class="sub">Un terminal, une phrase, et θ s'occupe du reste.</p>
-      </div>
-      <div class="term" role="img" aria-label="Démonstration animée : l'utilisateur demande à theta d'expliquer src/main.rs, l'agent lit le fichier et répond.">
-        <div class="term-bar">
-          <span class="dot r" aria-hidden="true"></span><span class="dot y" aria-hidden="true"></span><span class="dot g" aria-hidden="true"></span>
-          <span class="term-title">theaux — theta</span>
-          <span class="term-live"><span class="pulse" aria-hidden="true"></span> agent en ligne</span>
-        </div>
-        <div class="term-body" id="term-body" aria-hidden="true">
-          <div class="line"><span class="prompt">$</span> <span id="typed"></span><span class="caret" id="caret"></span></div>
-          <div class="term-out" id="term-out"></div>
-        </div>
-        <noscript>
-          <div class="term-body"><div class="line"><span class="prompt">$</span> theta -p "explique src/main.rs"</div>
-          <div class="line dim">⟳ read src/main.rs · grep main( · todo 2 tâches</div>
-          <div class="line ok">✔ src/main.rs : point d'entrée — parse les args (clap), démarre le daemon, ouvre la TUI.</div></div>
-        </noscript>
-      </div>
-    </section>
+    <div class="sep" aria-hidden="true">────────────────────────────────────────────────────────────────</div>
 
-    <!-- FEATURES -->
     <section id="features">
-      <div class="section-head">
-        <p class="kicker">features</p>
-        <h2>Petit dehors, costaud dedans</h2>
-        <p class="sub">Tout ce qui est ci-dessous vient du README — rien d'inventé, que du vérifiable.</p>
-      </div>
+      <h2><span class="hash">##</span> features</h2>
+      <p class="sub">Tout ce qui est ci-dessous vient du README — rien d inventé, que du vérifiable.</p>
       <div class="cards">
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">🖥️</div>
+<pre class="ascii" aria-hidden="true">┌─────┐      ┌────────┐
+│ tui │ &lt;──&gt; │ daemon │
+└─────┘      └────────┘
+  ~/.theta/theta.sock</pre>
           <h3>TUI + daemon qui ne dort jamais</h3>
-          <p>Client plein écran + daemon en arrière-plan (<code>~/.theta/theta.sock</code>). Ferme ton terminal&nbsp;: rien ne s'arrête. Plusieurs terminaux peuvent s'attacher à la même session, en direct.</p>
+          <p>Client plein écran + daemon en arrière-plan (<code>~/.theta/theta.sock</code>). Ferme ton shell : rien ne s arrête. Plusieurs shells peuvent s attacher à la même session, en direct.</p>
         </article>
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">🪶</div>
+<pre class="ascii" aria-hidden="true">tokens ▓▓▓░░░░░ 30%
+cache on · compact 80%</pre>
           <h3>Sobre en tokens</h3>
-          <p>Relecture intelligente, chemins relatifs, prompt caching Anthropic, compaction auto à 80&nbsp;% de la fenêtre. Chaque token compte — θ les compte pour toi.</p>
+          <p>Relecture intelligente, chemins relatifs, prompt caching Anthropic, compaction auto à 80 % de la fenêtre. Chaque token compte — θ les compte pour toi.</p>
         </article>
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">📜</div>
+<pre class="ascii" aria-hidden="true">SOUL.md
+├── agents/ build · plan
+└── skills/ $nom · auto</pre>
           <h3>SOUL, agents &amp; skills</h3>
-          <p><code>SOUL.md</code> s'applique à tous les agents. <code>Build</code> code, <code>Plan</code> planifie puis passe la main. Les skills en <code>.md</code> s'injectent avec <code>$nom</code> — ou tout seuls si <code>auto</code>.</p>
+          <p><code>SOUL.md</code> s applique à tous les agents. <code>Build</code> code, <code>Plan</code> planifie puis passe la main. Les skills en <code>.md</code> s injectent avec <code>$nom</code> — ou tout seuls si <code>auto</code>.</p>
         </article>
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">🔌</div>
+<pre class="ascii" aria-hidden="true">mcp ── stdio · http
+tools mcp__srv__tool
+/mcp ● ○ ✗</pre>
           <h3>MCP natif</h3>
-          <p>Serveurs MCP stdio + HTTP dans <code>settings.toml</code>, tools <code>mcp__serveur__tool</code>, login OAuth 2.1 PKCE. <code>/mcp</code> te dit qui est connecté&nbsp;: ● ○ ✗.</p>
+          <p>Serveurs MCP stdio + HTTP dans <code>settings.toml</code>, tools <code>mcp__serveur__tool</code>, login OAuth 2.1 PKCE. <code>/mcp</code> te dit qui est connecté : ● ○ ✗.</p>
         </article>
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">🗂️</div>
+<pre class="ascii" aria-hidden="true">tabs [1] [2●] [3]
+└─▶ bifurque · e réédite
+alt+n · append-only</pre>
           <h3>Onglets &amp; arbre de conversation</h3>
-          <p>Sessions en onglets (<code>alt+n</code>, spinner quand ça bosse, <code>●</code> quand c'est prêt). Arbre append-only&nbsp;: bifurque, réédite avec <code>e</code>, ne perds jamais une idée.</p>
+          <p>Sessions en onglets (<code>alt+n</code>, spinner quand ça bosse, <code>●</code> quand c est prêt). Arbre append-only : bifurque, réédite avec <code>e</code>, ne perds jamais une idée.</p>
         </article>
         <article class="card reveal">
-          <div class="emoji" aria-hidden="true">🧰</div>
+<pre class="ascii" aria-hidden="true">bash · task · todo
+web_search · web_fetch
+ask · handoff plan→build</pre>
           <h3>Des tools qui taffent</h3>
           <p><code>bash</code> compacté via rtk, <code>task</code> pour les subagents à contexte neuf, <code>web_search</code> / <code>web_fetch</code>, <code>todo</code>, <code>handoff</code> Plan → Build, <code>ask</code> quand il hésite.</p>
         </article>
       </div>
     </section>
 
-    <!-- PROVIDERS -->
+    <div class="sep" aria-hidden="true">────────────────────────────────────────────────────────────────</div>
+
     <section id="providers">
-      <div class="section-head">
-        <p class="kicker">providers</p>
-        <h2>Branche ce que tu paies déjà</h2>
-        <p class="sub">Abonnement OAuth, clé API ou modèle local — <code>theta login</code> te guide, le catalogue vient de <a href="https://models.dev" target="_blank" rel="noopener">models.dev</a>.</p>
-      </div>
+      <h2><span class="hash">##</span> providers</h2>
+      <p class="sub">Abonnement OAuth, clé API ou modèle local — <code>theta login</code> te guide, le catalogue vient de <a href="https://models.dev" target="_blank" rel="noopener">models.dev</a>.</p>
       <div class="prov-grid">
         <article class="prov reveal">
-          <h3>🎟️ Abonnement <span class="dim">(OAuth)</span></h3>
+          <h3><span class="tag">[oauth]</span> abonnement</h3>
           <ul>
             <li>Anthropic Claude Pro / Max</li>
             <li>ChatGPT (Codex)</li>
@@ -148,7 +108,7 @@
           </ul>
         </article>
         <article class="prov reveal">
-          <h3>🔑 Clé API</h3>
+          <h3><span class="tag">[key]</span> clé API</h3>
           <ul class="cols">
             <li>Anthropic</li><li>OpenAI</li><li>Google Gemini</li><li>OpenRouter</li>
             <li>Groq</li><li>xAI</li><li>Mistral</li><li>DeepSeek</li>
@@ -157,73 +117,63 @@
           </ul>
         </article>
         <article class="prov reveal">
-          <h3>🏠 Local</h3>
+          <h3><span class="tag">[local]</span> local</h3>
           <ul>
             <li>Ollama</li>
             <li>LM Studio</li>
             <li>Tout endpoint OpenAI-compatible</li>
           </ul>
-          <p class="dim small">Identifiants dans <code>~/.theta/auth.json</code> (0600). Variables d'env supportées&nbsp;: <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>GEMINI_API_KEY</code>…</p>
         </article>
       </div>
+      <p class="sub small">Identifiants dans <code>~/.theta/auth.json</code> (0600). Variables d env supportées : <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>GEMINI_API_KEY</code>…</p>
     </section>
 
-    <!-- INSTALL -->
-    <section id="installer">
-      <div class="section-head">
-        <p class="kicker">installation</p>
-        <h2>En route en 30 secondes</h2>
-        <p class="sub">Le script demande&nbsp;: binaire pré-compilé (rapide) ou compilation depuis les sources.</p>
+    <div class="sep" aria-hidden="true">────────────────────────────────────────────────────────────────</div>
+
+    <section id="install">
+      <h2><span class="hash">##</span> install</h2>
+      <p class="sub">Le script demande : binaire pré-compilé (rapide) ou compilation depuis les sources.</p>
+      <div class="tabs" role="tablist" aria-label="Méthodes d installation">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="bin" id="tab-bin" type="button">[ binaire ]</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="src" id="tab-src" type="button" tabindex="-1">[ sources ]</button>
       </div>
-      <div class="tabs" role="tablist" aria-label="Méthodes d'installation">
-        <button class="tab active" role="tab" aria-selected="true" data-tab="bin" id="tab-bin" type="button">⚡ binaire (recommandé)</button>
-        <button class="tab" role="tab" aria-selected="false" data-tab="src" id="tab-src" type="button">🦀 depuis les sources</button>
-      </div>
-      <div class="tab-panels">
-        <div class="panel active" data-panel="bin" role="tabpanel" aria-labelledby="tab-bin">
-          <div class="cmd"><code>curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash</code><button class="mini-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash" type="button" aria-label="Copier la commande binaire">copier</button></div>
+      <div class="panels">
+        <div class="panel active" data-panel="bin" role="tabpanel" aria-labelledby="tab-bin" tabindex="0">
+          <div class="cmd"><span class="dollar" aria-hidden="true">$</span><code>curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash</code><button class="mini-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash" type="button" aria-label="Copier la commande binaire">[ copier ]</button></div>
           <ul class="notes">
             <li>sha256 vérifié, installe dans <code>~/.local/bin</code> (<code>THETA_PREFIX</code> pour changer).</li>
-            <li>Si <code>~/.local/bin</code> n'est pas dans ton <code>PATH</code> : <code>export PATH="$HOME/.local/bin:$PATH"</code></li>
+            <li>Si <code>~/.local/bin</code> n est pas dans ton <code>PATH</code> : <code>export PATH="$HOME/.local/bin:$PATH"</code></li>
           </ul>
         </div>
-        <div class="panel" data-panel="src" role="tabpanel" aria-labelledby="tab-src">
-          <div class="cmd"><code>curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash -s -- install --source</code><button class="mini-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash -s -- install --source" type="button" aria-label="Copier la commande source">copier</button></div>
+        <div class="panel" data-panel="src" role="tabpanel" aria-labelledby="tab-src" tabindex="0" hidden>
+          <div class="cmd"><span class="dollar" aria-hidden="true">$</span><code>curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash -s -- install --source</code><button class="mini-copy" data-copy="curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash -s -- install --source" type="button" aria-label="Copier la commande source">[ copier ]</button></div>
           <ul class="notes">
             <li>Nécessite <code>cargo</code> + <code>git</code>. Depuis un clone : <code>./install.sh install --source</code>.</li>
           </ul>
         </div>
       </div>
       <div class="after-grid">
-        <div class="after"><p class="after-k">ensuite</p><div class="cmd"><code>theta login</code><button class="mini-copy" data-copy="theta login" type="button" aria-label="Copier theta login">copier</button></div></div>
-        <div class="after"><p class="after-k">puis</p><div class="cmd"><code>theta</code><button class="mini-copy" data-copy="theta" type="button" aria-label="Copier theta">copier</button></div></div>
-        <div class="after"><p class="after-k">ou direct</p><div class="cmd"><code>theta -p "explique src/main.rs"</code><button class="mini-copy" data-copy='theta -p "explique src/main.rs"' type="button" aria-label="Copier la commande print">copier</button></div></div>
+        <div class="after"><p class="after-k">ensuite</p><div class="cmd"><code>theta login</code><button class="mini-copy" data-copy="theta login" type="button" aria-label="Copier theta login">[ copier ]</button></div></div>
+        <div class="after"><p class="after-k">puis</p><div class="cmd"><code>theta</code><button class="mini-copy" data-copy="theta" type="button" aria-label="Copier theta">[ copier ]</button></div></div>
+        <div class="after"><p class="after-k">ou direct</p><div class="cmd"><code>theta -p "explique src/main.rs"</code><button class="mini-copy" data-copy='theta -p "explique src/main.rs"' type="button" aria-label="Copier la commande print">[ copier ]</button></div></div>
       </div>
       <details class="lifecycle">
-        <summary>🔄 mises à jour &amp; désinstallation</summary>
+        <summary>mises à jour &amp; désinstallation</summary>
         <div class="cmds">
-          <div class="cmd"><code>theta update</code><span class="dim small">depuis θ lui-même (--check, --force)</span></div>
-          <div class="cmd"><code>./install.sh status</code><span class="dim small">version installée vs dispo</span></div>
-          <div class="cmd"><code>./install.sh uninstall</code><span class="dim small">retire le binaire, garde ~/.theta</span></div>
+          <div class="cmd"><code>theta update</code><span class="note">depuis θ lui-même (--check, --force)</span></div>
+          <div class="cmd"><code>./install.sh status</code><span class="note">version installée vs dispo</span></div>
+          <div class="cmd"><code>./install.sh uninstall</code><span class="note">retire le binaire, garde ~/.theta</span></div>
         </div>
       </details>
-    </section>
-
-    <!-- CTA -->
-    <section class="cta">
-      <p class="cta-theta" aria-hidden="true">θ</p>
-      <h2>Allez, un copier-coller et on code.</h2>
-      <div class="cmd big"><code>curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash</code></div>
-      <div class="cta-row">
-        <button class="btn btn-primary" id="copy-btn-2" type="button">copier la commande</button>
-        <a class="btn btn-ghost" href="https://github.com/thx-42/theta" target="_blank" rel="noopener">voir le code →</a>
-      </div>
     </section>
   </main>
 
   <footer>
-    <p><span class="brand-mark sm">θ</span> <strong>theta</strong> — harness de coding agent léger en Rust.</p>
-    <p class="dim small">Repo&nbsp;: <a href="https://github.com/thx-42/theta">github.com/thx-42/theta</a> · Chaque push sur <code>main</code> publie une release (Linux/macOS, x86_64/arm64).</p>
+<pre class="theta-box" aria-hidden="true">╭───╮
+│ θ │
+╰───╯</pre>
+    <p><strong>theta</strong> — harness de coding agent léger en Rust.</p>
+    <p class="small">repo : <a href="https://github.com/thx-42/theta">github.com/thx-42/theta</a> · chaque push sur <code>main</code> publie une release (Linux/macOS, x86_64/arm64).</p>
   </footer>
 
   <script src="./script.js" defer></script>

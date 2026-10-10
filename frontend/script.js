@@ -1,23 +1,112 @@
-// θ theta — interactions du site, zéro dépendance.
+// theta — interactions, zero dependance.
 (function () {
   "use strict";
 
   var INSTALL_CMD = "curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash";
   var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  /* ---------- copie presse-papiers ---------- */
-  function flash(btn, labelEl, idleText) {
-    var old = labelEl ? labelEl.textContent : btn.textContent;
-    if (labelEl) labelEl.textContent = "copié ✔";
-    else btn.textContent = "copié ✔";
-    setTimeout(function () {
-      if (labelEl) labelEl.textContent = idleText || old;
-      else btn.textContent = idleText || old;
-    }, 1600);
+  /* ---------- plasma ascii du header ---------- */
+  var bg = document.getElementById("ascii-bg");
+  var hero = bg ? bg.closest(".hero") : null;
+  var RAMP = " .:-=+*#%@";
+  var CELL_W = 7.2;
+  var CELL_H = 12;
+  var cols = 0;
+  var rows = 0;
+  var running = true;
+  var rafId = 0;
+  var last = 0;
+  var t = 0;
+
+  function measure() {
+    if (!hero) return;
+    var w = hero.clientWidth || window.innerWidth;
+    var h = hero.clientHeight || 400;
+    cols = Math.max(10, Math.ceil(w / CELL_W));
+    rows = Math.max(10, Math.ceil(h / CELL_H));
   }
 
-  function copyText(text, btn, labelEl, idleText) {
-    function done() { flash(btn, labelEl, idleText); }
+  function frame(tt) {
+    var out = "";
+    var n = RAMP.length - 1;
+    for (var y = 0; y < rows; y++) {
+      for (var x = 0; x < cols; x++) {
+        var v = Math.sin(x * 0.3 + tt) + Math.sin(y * 0.25 - tt * 0.7) + Math.sin((x + y) * 0.15 + tt * 0.5);
+        var idx = Math.floor(((v + 3) / 6) * n);
+        if (idx < 0) idx = 0;
+        else if (idx > n) idx = n;
+        out += RAMP.charAt(idx);
+      }
+      if (y < rows - 1) out += "\n";
+    }
+    return out;
+  }
+
+  function paint() {
+    if (bg) bg.textContent = frame(t);
+  }
+
+  function loop(now) {
+    rafId = 0;
+    if (!running || document.hidden) return;
+    if (now - last >= 1000 / 12) {
+      last = now;
+      t += 0.12;
+      paint();
+    }
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function start() {
+    if (reduceMotion || !bg) return;
+    if (rafId) return;
+    last = 0;
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  if (bg && hero) {
+    measure();
+    if (reduceMotion) {
+      paint();
+    } else {
+      paint();
+      start();
+      if ("IntersectionObserver" in window) {
+        new IntersectionObserver(function (entries) {
+          running = entries[0].isIntersecting && !document.hidden;
+          if (running) start();
+        }, { threshold: 0 }).observe(hero);
+      }
+      document.addEventListener("visibilitychange", function () {
+        running = !document.hidden;
+        if (running) start();
+      });
+      var rzT = 0;
+      window.addEventListener("resize", function () {
+        clearTimeout(rzT);
+        rzT = setTimeout(function () {
+          measure();
+          if (reduceMotion) paint();
+        }, 200);
+      });
+    }
+  }
+
+  /* ---------- copie presse-papiers ---------- */
+  function flash(btn, idle) {
+    var old = idle || btn.textContent;
+    btn.textContent = "[ copié ✔ ]";
+    setTimeout(function () { btn.textContent = old; }, 1600);
+  }
+
+  function copyText(text, btn) {
+    function done() { flash(btn); }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, function () { fallback(); });
     } else {
@@ -38,111 +127,54 @@
   }
 
   var copyBtn = document.getElementById("copy-btn");
-  var copyLabel = document.getElementById("copy-label");
   if (copyBtn) {
     copyBtn.addEventListener("click", function () {
-      copyText(INSTALL_CMD, copyBtn, copyLabel, "copier");
-    });
-  }
-  var copyBtn2 = document.getElementById("copy-btn-2");
-  if (copyBtn2) {
-    copyBtn2.addEventListener("click", function () {
-      copyText(INSTALL_CMD, copyBtn2, null, "copier la commande");
+      copyText(INSTALL_CMD, copyBtn);
     });
   }
   document.querySelectorAll(".mini-copy").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      copyText(btn.getAttribute("data-copy") || "", btn, null, "copier");
+      copyText(btn.getAttribute("data-copy") || "", btn);
     });
   });
 
   /* ---------- onglets install ---------- */
   document.querySelectorAll(".tabs").forEach(function (tabs) {
-    var tabBtns = tabs.querySelectorAll(".tab");
-    tabBtns.forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        tabBtns.forEach(function (b) {
-          b.classList.remove("active");
-          b.setAttribute("aria-selected", "false");
-        });
-        btn.classList.add("active");
-        btn.setAttribute("aria-selected", "true");
-        var name = btn.getAttribute("data-tab");
-        document.querySelectorAll(".panel").forEach(function (p) {
-          p.classList.toggle("active", p.getAttribute("data-panel") === name);
-        });
+    var tabBtns = Array.prototype.slice.call(tabs.querySelectorAll('[role="tab"]'));
+    var panels = document.querySelectorAll(".panel");
+    function select(btn) {
+      tabBtns.forEach(function (b) {
+        var on = b === btn;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-selected", on ? "true" : "false");
+        b.tabIndex = on ? 0 : -1;
+      });
+      var name = btn.getAttribute("data-tab");
+      panels.forEach(function (p) {
+        var on = p.getAttribute("data-panel") === name;
+        p.classList.toggle("active", on);
+        if (on) p.removeAttribute("hidden");
+        else p.setAttribute("hidden", "");
+      });
+    }
+    tabBtns.forEach(function (btn, i) {
+      btn.addEventListener("click", function () { select(btn); });
+      btn.addEventListener("keydown", function (e) {
+        var j = -1;
+        if (e.key === "ArrowRight") j = (i + 1) % tabBtns.length;
+        else if (e.key === "ArrowLeft") j = (i - 1 + tabBtns.length) % tabBtns.length;
+        else if (e.key === "Home") j = 0;
+        else if (e.key === "End") j = tabBtns.length - 1;
+        if (j >= 0) {
+          e.preventDefault();
+          tabBtns[j].focus();
+          select(tabBtns[j]);
+        }
       });
     });
   });
 
-  /* ---------- démo terminal ---------- */
-  var typed = document.getElementById("typed");
-  var caret = document.getElementById("caret");
-  var termOut = document.getElementById("term-out");
-  var termBody = document.getElementById("term-body");
-
-  var userCmd = 'theta -p "explique src/main.rs"';
-  var outLines = [
-    { cls: "tool", text: "⟳  read src/main.rs · grep main( · todo 2 tâches" },
-    { cls: "ok", text: "✔ src/main.rs : point d'entrée — parse les args (clap), démarre le daemon, ouvre la TUI." },
-    { cls: "dim", text: "2 read · 0 write · 1 cmd · 3 tools · ~1,2k tokens" }
-  ];
-
-  function renderInstant() {
-    if (!typed || !termOut) return;
-    typed.textContent = userCmd;
-    if (caret) caret.style.display = "none";
-    termOut.innerHTML = "";
-    outLines.forEach(function (l) {
-      var div = document.createElement("div");
-      div.className = "line show " + l.cls;
-      div.textContent = l.text;
-      termOut.appendChild(div);
-    });
-  }
-
-  function renderAnimated() {
-    if (!typed || !termOut) return;
-    var i = 0;
-    var typeTimer = setInterval(function () {
-      typed.textContent = userCmd.slice(0, ++i);
-      if (i >= userCmd.length) {
-        clearInterval(typeTimer);
-        if (caret) caret.style.display = "none";
-        showLines(0);
-      }
-    }, 45);
-    function showLines(n) {
-      if (n >= outLines.length) return;
-      var l = outLines[n];
-      var div = document.createElement("div");
-      div.className = "line " + l.cls;
-      div.textContent = l.text;
-      termOut.appendChild(div);
-      requestAnimationFrame(function () { div.classList.add("show"); });
-      setTimeout(function () { showLines(n + 1); }, 650);
-    }
-  }
-
-  if (termBody) {
-    if (reduceMotion) {
-      renderInstant();
-    } else if ("IntersectionObserver" in window) {
-      var started = false;
-      var io = new IntersectionObserver(function (entries) {
-        if (entries[0].isIntersecting && !started) {
-          started = true;
-          renderAnimated();
-          io.disconnect();
-        }
-      }, { threshold: 0.35 });
-      io.observe(termBody);
-    } else {
-      renderAnimated();
-    }
-  }
-
-  /* ---------- reveal on scroll ---------- */
+  /* ---------- reveal au scroll ---------- */
   var reveals = document.querySelectorAll(".reveal");
   if (reduceMotion || !("IntersectionObserver" in window)) {
     reveals.forEach(function (el) { el.classList.add("visible"); });
