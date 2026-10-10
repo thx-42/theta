@@ -61,6 +61,47 @@ pub enum Req {
     RemoteStop,
     /// Ask for the current link state. Local clients only.
     RemoteStatus,
+    /// What a client needs to start: projects, the sessions of `cwd` (default: the daemon's), agents, models.
+    /// Answered with `Push::Overview`.
+    Overview { cwd: Option<PathBuf> },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionBrief {
+    pub id: String,
+    pub title: String,
+    pub updated: u64,
+    pub messages: usize,
+    /// An agent run is active in it right now.
+    pub running: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBrief {
+    pub name: String,
+    pub description: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelBrief {
+    /// `provider/model`, the value `Req::SetModel` takes.
+    pub key: String,
+    pub provider: String,
+    pub context: u64,
+    pub reasoning: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Overview {
+    pub cwd: PathBuf,
+    pub version: String,
+    pub projects: Vec<PathBuf>,
+    pub sessions: Vec<SessionBrief>,
+    pub agents: Vec<AgentBrief>,
+    /// Models of the providers that are logged in.
+    pub models: Vec<ModelBrief>,
+    pub efforts: Vec<String>,
 }
 
 /// State of the outbound link to theta-server.
@@ -109,4 +150,5 @@ pub enum Push {
     Jobs(Vec<JobInfo>),
     JobOutput { id: String, text: String },
     Remote { state: RemoteState, url: String },
+    Overview(Box<Overview>),
 }

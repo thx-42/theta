@@ -42,6 +42,7 @@ pub fn allowed(req: &Req) -> bool {
             | Req::Leaf(_)
             | Req::McpStatus
             | Req::Busy
+            | Req::Overview { .. }
             | Req::JobKill(_)
             | Req::JobOutput(_)
     )

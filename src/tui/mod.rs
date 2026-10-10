@@ -2859,6 +2859,7 @@ impl Ui {
             Push::Err(e) => self.push(Item::Error(e)),
             Push::Busy(_) => {}
             Push::Remote { state, url } => self.on_remote(state, &url),
+            Push::Overview(_) => {} // web clients only
             Push::Jobs(l) => self.jobs = l,
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay

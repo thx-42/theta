@@ -129,6 +129,34 @@ pub fn list(cwd: &Path) -> Vec<Info> {
     out
 }
 
+/// Directories that have sessions, most recently used first. Read from each session file's first entry,
+/// since the directory slug is lossy.
+pub fn projects() -> Vec<PathBuf> {
+    let Ok(dirs) = std::fs::read_dir(config::home().join("sessions")) else { return vec![] };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for d in dirs.filter_map(|e| e.ok()) {
+        let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+        let newest = files.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "jsonl")).filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).max();
+        let Some((mtime, file)) = newest else { continue };
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let cwd = text.lines().next().and_then(|l| serde_json::from_str::<Entry>(l).ok()).and_then(|e| match e.kind {
+            Kind::Session { cwd } => Some(PathBuf::from(cwd)),
+            _ => None,
+        });
+        if let Some(cwd) = cwd.filter(|c| c.is_dir()) {
+            found.push((mtime, cwd));
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (_, c) in found {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl Session {
     pub fn new(cwd: &Path) -> Session {
         let id = new_id();

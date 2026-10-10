@@ -1,7 +1,7 @@
 //! Background daemon: owns sessions, agent runs and MCP connections; any number of TUI clients attach over a unix socket.
 
 use crate::agent::{self, Event, Runtime, Steer, Turn};
-use crate::proto::{Push, RemoteState, Req, Snapshot, Target, socket_path};
+use crate::proto::{AgentBrief, ModelBrief, Overview, Push, RemoteState, Req, SessionBrief, Snapshot, Target, socket_path};
 use crate::session::{self, Session};
 use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
@@ -276,6 +276,15 @@ impl Server {
                         let _ = q.send(());
                     }
                 }
+                Req::Overview { cwd } => {
+                    let (srv, out) = (self.clone(), out.clone());
+                    tokio::spawn(async move {
+                        let _ = out.send(match srv.overview(cwd).await {
+                            Ok(o) => Push::Overview(Box::new(o)),
+                            Err(e) => Push::Err(format!("{e:#}")),
+                        });
+                    });
+                }
                 Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus if !local => {
                     let _ = out.send(Push::Err("not allowed remotely".into()));
                 }
@@ -302,6 +311,32 @@ impl Server {
         if let Some(f) = remote_fwd.take() {
             f.abort();
         }
+    }
+
+    async fn overview(&self, cwd: Option<PathBuf>) -> Result<Overview> {
+        let cwd = cwd.unwrap_or_else(|| self.base.cwd.clone());
+        let rt = self.runtime_for(&cwd).await?;
+        let running: Vec<String> = self.lives.lock().unwrap().iter().filter(|(_, l)| l.st.lock().unwrap().run.is_some()).map(|(id, _)| id.clone()).collect();
+        let dir = cwd.clone();
+        let (sessions, projects) = tokio::task::spawn_blocking(move || (session::list(&dir), session::projects())).await?;
+        let sessions = sessions
+            .into_iter()
+            .map(|i| {
+                let id = i.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                SessionBrief { running: running.contains(&id), id, title: i.title, updated: i.updated, messages: i.messages }
+            })
+            .collect();
+        let agents = rt.agents.iter().map(|a| AgentBrief { name: a.name.clone(), description: a.description.clone(), scope: a.scope.label().into() }).collect();
+        let mut models = Vec::new();
+        for p in rt.catalog.providers.iter() {
+            let local = p.env.is_empty() && p.oauth.is_none();
+            if rt.auth.status(p).await.is_none() && !(local && !p.models.is_empty()) {
+                continue;
+            }
+            models.extend(rt.catalog.models_of(p).into_iter().map(|m| ModelBrief { key: m.key(), provider: p.name.clone(), context: m.context, reasoning: m.reasoning }));
+        }
+        let efforts = ["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec();
+        Ok(Overview { cwd, version: crate::update::VERSION.into(), projects, sessions, agents, models, efforts })
     }
 
     /// Records the link state and tells the local clients.
@@ -520,7 +555,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
-        Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus => {}
+        Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
     }
 }
 
