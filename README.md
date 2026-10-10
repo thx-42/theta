@@ -142,14 +142,37 @@ Priorité : `-m` / `--agent` en ligne de commande > `[agents.<nom>]` > frontmatt
 | Tool | Rôle |
 |---|---|
 | `read` `write` `edit` `ls` `find` `grep` | fichiers ; `grep`/`find` respectent `.gitignore`, résultats groupés |
-| `bash` | shell ; commandes réécrites via **rtk** si installé, sortie compactée (ANSI, répétitions, troncature au milieu + log complet sauvegardé) |
+| `bash` | shell ; commandes réécrites via **rtk** si installé, sortie compactée (ANSI, répétitions, troncature au milieu + log complet sauvegardé). `background: true` lance la commande en job de fond et rend la main tout de suite |
 | `todo` | liste de tâches affichée au-dessus de la saisie |
 | `web_search` | Exa MCP par défaut (sans clé) ; `firecrawl` / `brave` / `tavily` / `duckduckgo` ; repli DuckDuckGo |
 | `web_fetch` | page → texte compact |
-| `task` | subagent à contexte neuf, renvoie seulement son rapport final |
+| `task` | subagent à contexte neuf, renvoie seulement son rapport final. `background: true` : il tourne en job de fond |
+| `job_output` `job_kill` | sortie / arrêt d'un job de fond (shell, lint ou subagent) par id |
 | `list_agents` | liste les agents (tâche, `can`, `cannot` du frontmatter) pour choisir une cible de handoff. Réservé aux agents qui le listent dans `tools` |
 | `handoff` | propose de passer à un autre agent (Plan → Build) ; si oui, Build enchaîne dans la même conversation. Réservé aux agents qui le listent dans `tools` |
 | `ask` | pose une question à l'utilisateur : choix multiple, oui/non ou texte libre (réponse libre toujours possible) |
+
+### Jobs de fond, linter et hooks
+
+**Jobs.** Les shells (`bash` avec `background: true`), les subagents (`task` avec `background: true`) et les linters tournent à côté du thread principal. `/jobs` (ou `alt+j`) liste les jobs de la session : `entrée` affiche la sortie en direct, `k` arrête le job. La barre d'état affiche `⚙ n` tant que des jobs tournent. Quand un job se termine, son résultat est mis en file et l'agent le lit à son prochain step (ou au prochain message) ; aucun tour n'est lancé automatiquement. Les jobs ne survivent pas à l'arrêt du daemon.
+
+**Linter.** Quand l'agent quitte un fichier modifié pour en modifier un autre (ou termine son tour), le linter du type du premier fichier tourne en fond. Sans retour (code 0, sortie vide), rien n'est envoyé à l'agent. Theta embarque une liste de linters par langage (ruff, eslint, clippy, go vet, shellcheck, rubocop, yamllint…) ; `[linters]` la complète ou la remplace, `""` désactive une extension. `{file}` est remplacé par le chemin. `/linters` montre pour chaque linter s'il est installé (`✗ … absent` sinon) ; un linter absent est signalé une fois dans `/jobs` et le lint est ignoré.
+
+```toml
+[linters]
+py = "ruff check {file}"
+rs = "cargo clippy --quiet"
+```
+
+**Hooks.** Commandes shell autour de chaque message de l'utilisateur, dans le dossier du projet, timeout 30 s. Variables : `THETA_SESSION`, `THETA_CWD`, `THETA_HOOK`, et `THETA_STATUS` (`done` ou `error`) pour `post_message`. Un run interrompu ne déclenche pas `post_message`.
+
+```toml
+[hooks]
+pre_message = ["./scripts/check-message.sh"]   # message sur stdin ; exit != 0 le rejette ; stdout est ajouté comme contexte
+post_message = ["notify-send theta"]           # dernière réponse sur stdin ; sortie ignorée
+```
+
+Ces commandes viennent de `settings.toml`, y compris celui du projet (`<projet>/.theta/settings.toml`) : elles s'exécutent avec tes droits, comme les serveurs MCP. Ne lance pas un agent dans un dépôt dont tu ne fais pas confiance aux réglages.
 
 Économies de tokens : relecture d'un fichier inchangé → simple notice ; chemins relatifs ; diff visibles dans l'UI mais pas renvoyés au modèle ; prompt caching Anthropic (tools, system, 2 derniers tours).
 
@@ -191,9 +214,9 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 
 `/` affiche les commandes et `$` les skills : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` incomplet, `enter` complète d'abord). Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
-Commandes : `/new /resume /session /tree /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
+Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
 
-**Onglets** : `/session` ouvre une nouvelle session dans un onglet (même agent et modèle), `/session close` ferme l'onglet courant (un run en cours est interrompu), `/session <n>` y va. Chaque onglet a sa propre session ; les onglets en arrière-plan continuent de tourner. La barre est toujours visible, avec un spinner pendant qu'un agent travaille, `●` quand un onglet en arrière-plan a fini (ou attend une réponse), `!` en cas d'erreur. Les raccourcis sont en `alt` : `ctrl+tab` et `ctrl+shift+t` sont pris par les émulateurs (Warp…). Sur macOS Terminal / iTerm, `alt` doit envoyer Meta (Option comme Alt/Meta dans les réglages du terminal). `tab_orientation = "horizontal"` (défaut) ou `"vertical"` (barre latérale) dans `settings.toml` ou `/settings`. En vertical, chaque onglet est une carte de 3 lignes : titre, agent · modèle, étape en cours ou statut. Largeur de la barre : `tab_width` (14 à 60, défaut 24), réglable dans `/settings` ou avec `/session width <n>`.
+**Onglets** : `/session` ouvre une nouvelle session dans un onglet (même agent et modèle), `/session close` ferme l'onglet courant (un run en cours est interrompu), `/session <n>` y va. Chaque onglet a sa propre session ; les onglets en arrière-plan continuent de tourner. La barre est toujours visible, avec un spinner pendant qu'un agent travaille, `●` quand un onglet en arrière-plan a fini (ou attend une réponse), `!` en cas d'erreur. Les raccourcis sont en `alt` : `ctrl+tab` et `ctrl+shift+t` sont pris par les émulateurs (Warp…). Sur macOS Terminal / iTerm, `alt` doit envoyer Meta (Option comme Alt/Meta dans les réglages du terminal). `tab_orientation = "horizontal"` (défaut), `"vertical"` (barre latérale) ou `"hidden"` (barre cachée) dans `settings.toml` ou `/settings`. `/session hide` cache la barre, `/session show` la remet en horizontal (ou `alt+b` pour basculer). En vertical, glisse le bord droit de la barre pour changer sa largeur. En vertical, chaque onglet est une carte de 3 lignes : titre, agent · modèle, étape en cours ou statut. Largeur de la barre : `tab_width` (14 à 60, défaut 24), réglable dans `/settings` ou avec `/session width <n>`.
 
 **Arbre** (`ctrl+t`) : une ligne par message utilisateur, les branches n'apparaissent qu'aux bifurcations. `enter` reprend après ce tour (le prochain message crée une branche), `e` réédite le message pour créer une branche sœur. Tout est conservé dans le fichier de session (JSONL append-only, chaque entrée pointe vers son parent).
 

@@ -3,7 +3,7 @@
 use crate::agent::{self, Event, Runtime, Steer, Turn};
 use crate::proto::{Push, Req, Snapshot, Target, socket_path};
 use crate::session::{self, Session};
-use crate::types::Msg;
+use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -138,6 +138,11 @@ impl Server {
         rt.todos = Default::default();
         rt.read_cache = Default::default();
         rt.asks = Default::default();
+        rt.jobs = Default::default();
+        let jobs_sink = bus.clone();
+        rt.jobs.on_change(move |l| {
+            let _ = jobs_sink.send(Push::Jobs(l));
+        });
         let turn = crate::make_turn(&rt, agent, model)?;
         let live = Arc::new(Live {
             session: Arc::new(Mutex::new(session)),
@@ -268,6 +273,7 @@ fn subscribe(live: &Arc<Live>, out: &UnboundedSender<Push>) -> tokio::task::Join
         running: st.run.is_some(),
         replay: st.replay.clone(),
         todos: st.rt.todos.lock().unwrap().clone(),
+        jobs: st.rt.jobs.list(),
     };
     drop(s);
     let _ = out.send(Push::Snapshot(Box::new(snap)));
@@ -293,23 +299,45 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
         let _ = out.send(Push::Err(m.into()));
     };
     match req {
-        Req::Send(text) => {
-            let mut st = live.st.lock().unwrap();
-            if st.run.is_some() {
-                return err("agent is running");
+        Req::Send(text, images) => {
+            let (hooks, cwd) = {
+                let st = live.st.lock().unwrap();
+                if st.run.is_some() {
+                    return err("agent is running");
+                }
+                (st.rt.settings.hooks.clone(), st.rt.cwd.clone())
+            };
+            if hooks.pre_message.is_empty() {
+                return send(live, text, String::new(), images, out);
             }
-            let expanded = crate::skills::expand(&st.rt.skills, &text);
-            if let Err(e) = live.session.lock().unwrap().add_msg(Msg::user(expanded), None) {
-                return err(&format!("{e:#}"));
+            // Hooks are slow and must not hold the state lock: send once they have answered.
+            let (live, out) = (live.clone(), out.clone());
+            let session = live.session.lock().unwrap().id.clone();
+            tokio::spawn(async move {
+                match crate::hooks::pre(&hooks, &text, &session, &cwd).await {
+                    Ok(extra) => send(&live, text, extra, images, &out),
+                    Err(e) => {
+                        let _ = out.send(Push::Err(e));
+                    }
+                }
+            });
+        }
+        Req::JobKill(id) => {
+            if !live.st.lock().unwrap().rt.jobs.kill(&id) {
+                err(&format!("no running job `{id}`"));
             }
-            let _ = live.bus.send(Push::Event(Event::User(text)));
-            launch_turn(live, &mut st);
+        }
+        Req::JobOutput(id) => {
+            let found = live.st.lock().unwrap().rt.jobs.output(&id, None);
+            if let Some((text, _)) = found {
+                let _ = out.send(Push::JobOutput { id, text });
+            }
         }
         Req::Steer(text) => {
             if live.st.lock().unwrap().run.is_some() {
                 live.steer.lock().unwrap().push_back(text);
             } else {
-                handle(live, Req::Send(text), out);
+                handle(live, Req::Send(text, vec![]), out);
             }
         }
         Req::Interrupt => interrupt(live),
@@ -387,6 +415,28 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
     }
+}
+
+/// Add a user message (plus `extra` context from the pre-message hooks, hidden from the chat) and start the run.
+fn send(live: &Arc<Live>, text: String, extra: String, images: Vec<Block>, out: &UnboundedSender<Push>) {
+    let mut st = live.st.lock().unwrap();
+    if st.run.is_some() {
+        let _ = out.send(Push::Err("agent is running".into()));
+        return;
+    }
+    let mut expanded = crate::skills::expand(&st.rt.skills, &text);
+    if !extra.is_empty() {
+        expanded = format!("{expanded}\n\n{extra}");
+    }
+    let mut content: Vec<Block> = if expanded.is_empty() { vec![] } else { vec![Block::Text { text: expanded }] };
+    content.extend(images);
+    let msg = Msg { role: Role::User, content, model: None };
+    if let Err(e) = live.session.lock().unwrap().add_msg(msg, None) {
+        let _ = out.send(Push::Err(format!("{e:#}")));
+        return;
+    }
+    let _ = live.bus.send(Push::Event(Event::User(text)));
+    launch_turn(live, &mut st);
 }
 
 /// Agent, plus the model and effort that agent implies (same rules the TUI used before the split).
@@ -475,6 +525,16 @@ where
             }
             let _ = live.bus.send(Push::Event(ev.clone()));
             if matches!(ev, Event::Done) {
+                if !st.rt.settings.hooks.post_message.is_empty() {
+                    let reply = live.session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
+                    let (hooks, cwd, session) = (st.rt.settings.hooks.clone(), st.rt.cwd.clone(), live.session.lock().unwrap().id.clone());
+                    let (bus, status) = (live.bus.clone(), if errored { "error" } else { "done" });
+                    tokio::spawn(async move {
+                        for e in crate::hooks::post(&hooks, &reply, status, &session, &cwd).await {
+                            let _ = bus.send(Push::Notice(e));
+                        }
+                    });
+                }
                 after_run(&live, &mut st);
                 return;
             }

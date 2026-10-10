@@ -9,6 +9,9 @@ mod catalog;
 mod client;
 mod compact;
 mod config;
+mod hooks;
+mod jobs;
+mod lint;
 mod llm;
 mod proto;
 mod server;
@@ -105,6 +108,7 @@ pub async fn build_runtime(cwd: std::path::PathBuf) -> Result<agent::Runtime> {
         todos: Default::default(),
         read_cache: Default::default(),
         asks: Default::default(),
+        jobs: Default::default(),
     })
 }
 

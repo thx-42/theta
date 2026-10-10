@@ -123,7 +123,7 @@ async fn download(http: &reqwest::Client, url: &str, ink: &Ink, face: &str) -> R
     Ok(buf)
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 

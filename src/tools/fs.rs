@@ -72,6 +72,7 @@ pub fn write(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let old = std::fs::read_to_string(&path).ok();
     std::fs::write(&path, content)?;
     ctx.read_cache.lock().unwrap().retain(|k, _| !k.starts_with(&path.display().to_string()));
+    crate::lint::edited(ctx, &path);
     let lines = content.lines().count();
     let display = old.as_deref().map(|o| diff(o, content));
     Ok(ToolOut {
@@ -123,6 +124,7 @@ pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     }
     std::fs::write(&path, &text)?;
     ctx.read_cache.lock().unwrap().retain(|k, _| !k.starts_with(&path.display().to_string()));
+    crate::lint::edited(ctx, &path);
     let d = diff(&original, &text);
     let (plus, minus) = d.lines().fold((0, 0), |(p, m), l| {
         if l.starts_with('+') { (p + 1, m) } else if l.starts_with('-') { (p, m + 1) } else { (p, m) }

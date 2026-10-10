@@ -1,8 +1,10 @@
 //! Wire protocol between the TUI client and the background daemon: one JSON value per line over a unix socket.
 
 use crate::agent::Event;
+use crate::jobs::JobInfo;
 use crate::session::Entry;
 use crate::tools::Todo;
+use crate::types::Block;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -24,7 +26,8 @@ pub enum Target {
 pub enum Req {
     /// Subscribe this connection to a session (replaces the previous one) and get a `Push::Snapshot`.
     Attach { target: Target, cwd: PathBuf, agent: Option<String>, model: Option<String> },
-    Send(String),
+    /// Text and attached images (`Block::Image`) of a new user message.
+    Send(String, Vec<Block>),
     /// Message for a run in progress: it joins the conversation at the agent's next step. Idle: same as `Send`.
     Steer(String),
     /// Open tabs of `cwd`, in tab order, so the next start can reopen them.
@@ -47,6 +50,10 @@ pub enum Req {
     McpStatus,
     /// Is an agent run active in any session? Answered with `Push::Busy`.
     Busy,
+    /// Stop a background job of the attached session.
+    JobKill(String),
+    /// Ask for a job's output; answered with `Push::JobOutput`.
+    JobOutput(String),
     Shutdown,
 }
 
@@ -62,6 +69,8 @@ pub struct Snapshot {
     /// Events of the step in flight (streamed text, tool progress, open questions).
     pub replay: Vec<Event>,
     pub todos: Vec<Todo>,
+    #[serde(default)]
+    pub jobs: Vec<JobInfo>,
 }
 
 /// Daemon → client.
@@ -75,4 +84,7 @@ pub enum Push {
     Notice(String),
     Err(String),
     Busy(bool),
+    /// Background jobs of the session changed (started, ended or killed).
+    Jobs(Vec<JobInfo>),
+    JobOutput { id: String, text: String },
 }
