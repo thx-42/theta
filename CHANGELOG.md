@@ -1,10 +1,13 @@
 # Changelog
 
-## Non publié
+## 0.3.0
 
 ### Nouveautés
 - **Jobs de fond.** `bash` et `task` acceptent `background: true` et rendent la main avec un id. Nouveaux outils `job_output` et `job_kill`. `/jobs` (ou `alt+j`) liste les jobs de la session, affiche la sortie en direct (`entrée`) et arrête un job (`k`) pendant que l'agent continue. La fin d'un job est lue par l'agent à son prochain step.
 - **Linter de fond.** Linters embarqués par langage (ruff, eslint, clippy, go vet, shellcheck…), complétés ou remplacés par `[linters]`. `/linters` indique ceux qui sont installés ; un linter absent est signalé dans `/jobs`. Le linter du fichier tourne en fond quand l'agent passe à un autre fichier ou termine son tour, et n'envoie un retour que s'il a quelque chose à dire.
+- **Agent Auto.** Orchestrateur autonome : il planifie avec toi (questions via `ask`, validation du plan), puis exécute de bout en bout sans s'arrêter entre les étapes. Il n'écrit pas de code lui-même : des sous-agents `Build` écrivent, des sous-agents `Plan` relisent, il corrige jusqu'à ce que ce soit propre. S'il s'arrête avec des todos non terminés, il est relancé (3 fois max).
+- **Délégation encadrée.** Un agent à outils read-only (Plan) ne peut spawner que des agents read-only ; seul un agent `delegate: all` (Auto) peut déléguer l'écriture. Un sous-agent ne peut jamais spawner de sous-agent.
+- **Agents livrés mis à jour.** `~/.theta/agents/.shipped` suit la version livrée de Build, Plan et Auto. Un agent non modifié est remplacé par la nouvelle version ; un agent modifié est conservé, la nouvelle version est écrite en `<Agent>.md.new` et son diff est affiché une fois sur un terminal.
 - **Hooks de message.** Section `[hooks]` : `pre_message` (peut rejeter le message ou ajouter du contexte) et `post_message` (à la fin du run).
 
 ## 0.2.0

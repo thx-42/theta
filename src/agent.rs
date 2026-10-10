@@ -116,7 +116,7 @@ impl Runtime {
     pub fn tools_for(&self, agent: &Agent, depth: u8) -> Vec<ToolDef> {
         let mut defs = tools::all_defs();
         if depth == 0 {
-            defs.push(tools::task_def(&self.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>()));
+            defs.push(tools::task_def(&self.agents.iter().filter(|a| agents::can_spawn(agent, a)).map(|a| a.name.clone()).collect::<Vec<_>>()));
         }
         defs.extend(self.mcp.defs());
         defs.retain(|d| !self.settings.tools.disabled.contains(&d.name));
@@ -205,6 +205,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let session_id = session.lock().unwrap().id.clone();
     let ctx = rt.tool_ctx(&session_id);
     let mut overflow_retry = false;
+    let mut nudges = 0u8;
     let mut compact_failed = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
@@ -247,6 +248,12 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         let _ = tx.send(Event::Step { usage: resp.usage.clone(), model: model.key() });
         if calls.is_empty() {
             if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
+                continue;
+            }
+            // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
+            if turn.depth == 0 && turn.agent.delegate_all && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
+                nudges += 1;
+                session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
                 continue;
             }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
@@ -351,9 +358,14 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
 /// `log` (background jobs) receives one line per tool call the subagent makes.
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).context("prompt required")?;
+    anyhow::ensure!(parent.depth == 0, "subagents cannot spawn subagents");
     let named = args.get("agent").is_some();
     let agent = match args.get("agent").and_then(|v| v.as_str()) {
-        Some(name) => agents::find(&rt.agents, name).with_context(|| format!("unknown agent `{name}`"))?.clone(),
+        Some(name) => {
+            let a = agents::find(&rt.agents, name).with_context(|| format!("unknown agent `{name}`"))?;
+            anyhow::ensure!(agents::can_spawn(&parent.agent, a), "{} is read-only: it can only spawn read-only agents", parent.agent.name);
+            a.clone()
+        }
         None => parent.agent.clone(),
     };
     let model = agents::model_of(&agent, &rt.settings)

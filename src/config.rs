@@ -265,19 +265,60 @@ pub fn bootstrap() -> Result<()> {
     if !soul.exists() {
         std::fs::write(&soul, crate::agents::DEFAULT_SOUL)?;
     }
-    let build = h.join("agents/Build.md");
-    if !build.exists() {
-        std::fs::write(&build, crate::agents::DEFAULT_BUILD)?;
-    }
-    let plan = h.join("agents/Plan.md");
-    if !plan.exists() {
-        std::fs::write(&plan, crate::agents::DEFAULT_PLAN)?;
-    }
+    sync_agents(&h.join("agents"));
     let settings = global_settings_path();
     if !settings.exists() {
         std::fs::write(&settings, DEFAULT_SETTINGS)?;
     }
     Ok(())
+}
+
+/// Install the shipped agents. `.shipped` records the hash of the version last written (or offered):
+/// an agent still equal to it is replaced silently; an edited one is kept, the new version goes
+/// next to it as `<name>.md.new` and its diff is shown once on a terminal.
+fn sync_agents(dir: &Path) {
+    use crate::update::sha256;
+    use std::io::IsTerminal;
+    let manifest = dir.join(".shipped");
+    let mut shipped: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&manifest)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(n, h)| (n.to_string(), h.to_string())))
+        .collect();
+    let before = shipped.clone();
+    for (name, new) in [("Build", crate::agents::DEFAULT_BUILD), ("Plan", crate::agents::DEFAULT_PLAN), ("Auto", crate::agents::DEFAULT_AUTO)] {
+        let (path, new_hash) = (dir.join(format!("{name}.md")), sha256(new.as_bytes()));
+        let Ok(cur) = std::fs::read_to_string(&path) else {
+            if std::fs::write(&path, new).is_ok() {
+                shipped.insert(name.into(), new_hash);
+            }
+            continue;
+        };
+        let old = shipped.get(name).cloned();
+        let cur_hash = sha256(cur.as_bytes());
+        if cur_hash == new_hash {
+            shipped.insert(name.into(), new_hash);
+        } else if old.as_deref() == Some(&cur_hash) {
+            // untouched since we wrote it
+            if std::fs::write(&path, new).is_ok() {
+                shipped.insert(name.into(), new_hash);
+                eprintln!("theta: agent {name} updated to the new version");
+            }
+        } else if old.as_deref() != Some(&new_hash) {
+            // edited (or unknown origin) and the shipped version changed: propose the diff
+            let proposed = dir.join(format!("{name}.md.new"));
+            if std::fs::write(&proposed, new).is_ok() && std::io::stderr().is_terminal() {
+                eprintln!("theta: agent {name} has a new version, but you edited {}. Diff:", path.display());
+                let _ = std::process::Command::new("diff").arg("-u").arg(&path).arg(&proposed).stdout(std::process::Stdio::from(std::io::stderr())).status();
+                eprintln!("theta: keep yours, or apply with `mv {} {}`", proposed.display(), path.display());
+                shipped.insert(name.into(), new_hash);
+            }
+        }
+    }
+    if shipped != before {
+        let text: String = shipped.iter().map(|(n, h)| format!("{n} {h}\n")).collect();
+        let _ = std::fs::write(&manifest, text);
+    }
 }
 
 const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>/.theta/settings.toml
@@ -346,3 +387,33 @@ backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo
 # models = ["qwen3-coder"]
 # context = 128000
 "#;
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_agents_update_unless_edited() {
+        let dir = std::env::temp_dir().join(format!("theta-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sync_agents(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), crate::agents::DEFAULT_PLAN);
+        // Pretend the shipped Plan was an older text we wrote: untouched => replaced.
+        let old = "old plan";
+        std::fs::write(dir.join("Plan.md"), old).unwrap();
+        let hash = crate::update::sha256(old.as_bytes());
+        let m = std::fs::read_to_string(dir.join(".shipped")).unwrap();
+        let line = m.lines().find(|l| l.starts_with("Plan ")).unwrap().to_string();
+        std::fs::write(dir.join(".shipped"), m.replace(&line, &format!("Plan {hash}"))).unwrap();
+        sync_agents(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), crate::agents::DEFAULT_PLAN);
+        // Edited by the user and shipped version changed: kept, proposal written aside.
+        std::fs::write(dir.join("Plan.md"), "mine").unwrap();
+        std::fs::write(dir.join(".shipped"), m.replace(&line, "Plan 0000")).unwrap();
+        sync_agents(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md.new")).unwrap(), crate::agents::DEFAULT_PLAN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

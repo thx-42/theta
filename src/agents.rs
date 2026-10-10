@@ -36,6 +36,8 @@ pub struct Agent {
     pub subagent_model: Option<String>,
     /// Allowed tools (None = all)
     pub tools: Option<Vec<String>>,
+    /// May spawn any agent as a subagent (`delegate: all`); otherwise only read-only ones, unless it has every tool.
+    pub delegate_all: bool,
     pub prompt: String,
 }
 
@@ -50,6 +52,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
         effort: None,
         subagent_model: None,
         tools: None,
+        delegate_all: false,
         prompt: text.trim().to_string(),
     };
     let Some(rest) = text.strip_prefix("---") else { return a };
@@ -69,6 +72,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
             "model" => a.model = Some(v),
             "effort" => a.effort = Some(v),
             "subagent_model" => a.subagent_model = Some(v),
+            "delegate" => a.delegate_all = v.eq_ignore_ascii_case("all"),
             "tools" => a.tools = Some(v.trim_matches(['[', ']']).split(',').map(|t| t.trim().trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect()),
             _ => {}
         }
@@ -116,6 +120,20 @@ pub fn catalog(agents: &[Agent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Read-only = an explicit tool list with nothing that writes files, runs commands or reaches MCP.
+pub fn is_readonly(a: &Agent) -> bool {
+    a.tools.as_ref().is_some_and(|t| t.iter().all(|e| {
+        let e = e.to_lowercase();
+        !matches!(e.as_str(), "write" | "edit" | "bash") && !e.starts_with("mcp") && !e.ends_with('*')
+    }))
+}
+
+/// Subagents never gain write access the parent lacks: a read-only parent (Plan) can only spawn
+/// read-only agents, unless it opts in with `delegate: all` (Auto).
+pub fn can_spawn(parent: &Agent, target: &Agent) -> bool {
+    parent.tools.is_none() || parent.delegate_all || !is_readonly(parent) || is_readonly(target)
 }
 
 pub fn find<'a>(agents: &'a [Agent], name: &str) -> Option<&'a Agent> {
@@ -231,6 +249,32 @@ You are theta in planning mode. You do not edit files or run commands. Your job 
 Stay brief. Never ask what you can find out yourself. Do not start coding.
 "#;
 
+pub const DEFAULT_AUTO: &str = r#"---
+name: Auto
+description: Autonomous orchestrator — plans with the user, then runs Build and Plan subagents end to end until the task is done and verified
+can: read and search code, search the web, ask the user, keep a todo list, delegate to Build (write) and Plan (review) subagents
+cannot: edit project files or run shell commands itself
+tools: read, grep, find, ls, todo, write_plan, web_search, web_fetch, ask, task, list_agents, job_output, job_kill
+delegate: all
+---
+You are theta in auto mode. You never write code yourself: you orchestrate subagents. Only you can spawn them; they cannot spawn others.
+
+Phase 1 — Plan with the user (the only phase where you stop for the user):
+1. Read the relevant code. Resolve what you can yourself.
+2. Ask (`ask`, one question per call, concrete options) only for decisions that are really the user's.
+3. Write the plan: a `todo` list of small, verifiable steps, saved with `write_plan`. Summarize it and call `ask` (yes_no) for validation. Revise until the user validates.
+
+Phase 2 — Execute, without stopping:
+Once validated, run the whole plan end to end. Do not stop, summarize or ask for confirmation between steps. Mark todos done as you go.
+- Build: call `task` with agent `Build` and a full, self-contained prompt (files, approach, what must not change, how to verify). Independent steps can use `background`.
+- Review: after each built step, call `task` with agent `Plan` to review the changes and the verification output. Ask for concrete defects only.
+- Fix: send each defect back to a `Build` subagent, then review again. Repeat until clean.
+- Check each report against the code yourself before you trust it.
+- Replan only if reality breaks the plan. Ask the user again only if blocked on a decision that is really theirs.
+
+Phase 3 — Report, only when every todo is done and verified: what changed, what was verified, what is left.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +291,16 @@ mod tests {
         let b = parse("plain prompt", "Plain", Scope::Global);
         assert_eq!((b.name.as_str(), b.prompt.as_str()), ("Plain", "plain prompt"));
         assert!(chrono_date().starts_with("20"));
+    }
+
+    #[test]
+    fn readonly_parent_spawns_readonly_only() {
+        let plan = parse(DEFAULT_PLAN, "Plan", Scope::Global);
+        let auto = parse(DEFAULT_AUTO, "Auto", Scope::Global);
+        let build = parse(DEFAULT_BUILD, "Build", Scope::Builtin);
+        assert!(is_readonly(&plan) && is_readonly(&auto) && !is_readonly(&build));
+        assert!(can_spawn(&plan, &plan) && !can_spawn(&plan, &build));
+        assert!(can_spawn(&auto, &build) && can_spawn(&build, &build));
     }
 
     #[test]
