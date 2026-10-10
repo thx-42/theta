@@ -51,6 +51,7 @@ pub struct Settings {
     pub compaction: Compaction,
     pub tools: ToolSettings,
     pub web: WebSettings,
+    pub remote: RemoteSettings,
     pub skills: SkillSettings,
     /// MCP servers, keyed by name (`[mcp.<name>]`)
     pub mcp: BTreeMap<String, McpServer>,
@@ -74,6 +75,7 @@ impl Default for Settings {
             compaction: Compaction::default(),
             tools: ToolSettings::default(),
             web: WebSettings::default(),
+            remote: RemoteSettings::default(),
             skills: SkillSettings::default(),
             mcp: BTreeMap::new(),
             providers: BTreeMap::new(),
@@ -191,6 +193,19 @@ pub struct WebSettings {
 impl Default for WebSettings {
     fn default() -> Self {
         WebSettings { backend: "exa".into() }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    /// theta-server base URL used by `/remote`. `THETA_REMOTE_URL` overrides it.
+    pub url: String,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        RemoteSettings { url: "https://theta.sputnk.net".into() }
     }
 }
 
@@ -382,6 +397,10 @@ auto = []                # always injected, e.g. ["caveman", "ponytail"]
 
 [web]
 backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo
+
+# Server behind `/remote` (browser control). THETA_REMOTE_URL overrides it.
+# [remote]
+# url = "https://theta.sputnk.net"
 
 # Custom OpenAI-compatible provider:
 # [providers.local]

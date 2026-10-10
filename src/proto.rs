@@ -55,6 +55,27 @@ pub enum Req {
     /// Ask for a job's output; answered with `Push::JobOutput`.
     JobOutput(String),
     Shutdown,
+    /// Link this daemon to theta-server so a browser can drive it (answered with `Push::Remote`). Local clients only.
+    RemoteStart,
+    /// Drop the link to theta-server. Local clients only.
+    RemoteStop,
+    /// Ask for the current link state. Local clients only.
+    RemoteStatus,
+}
+
+/// State of the outbound link to theta-server.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum RemoteState {
+    #[default]
+    Off,
+    Connecting,
+    /// Waiting for the user to type `code` on the server's link page.
+    Code { code: String, expires_in: u64 },
+    Linked,
+    /// Connection lost, retrying.
+    Offline(String),
+    /// The server refused the link.
+    Error(String),
 }
 
 /// Everything a client needs to show a session it just attached to.
@@ -87,4 +108,5 @@ pub enum Push {
     /// Background jobs of the session changed (started, ended or killed).
     Jobs(Vec<JobInfo>),
     JobOutput { id: String, text: String },
+    Remote { state: RemoteState, url: String },
 }

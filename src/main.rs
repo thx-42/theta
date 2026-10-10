@@ -14,6 +14,7 @@ mod jobs;
 mod lint;
 mod llm;
 mod proto;
+mod relay;
 mod server;
 mod session;
 mod tools;

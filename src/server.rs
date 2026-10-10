@@ -1,7 +1,7 @@
 //! Background daemon: owns sessions, agent runs and MCP connections; any number of TUI clients attach over a unix socket.
 
 use crate::agent::{self, Event, Runtime, Steer, Turn};
-use crate::proto::{Push, Req, Snapshot, Target, socket_path};
+use crate::proto::{Push, RemoteState, Req, Snapshot, Target, socket_path};
 use crate::session::{self, Session};
 use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc::{UnboundedSender, unbounded_channel}};
+use tokio::sync::{Notify, broadcast, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}};
 
 const BTW_SYSTEM: &str = "Answer the side question using the conversation as context. Be brief. Do not use tools and do not continue the conversation.";
 
@@ -33,12 +33,23 @@ struct Live {
     steer: Steer,
 }
 
-struct Server {
+/// The outbound link to theta-server (see `relay.rs`).
+#[derive(Default)]
+struct RemoteLink {
+    task: Option<(tokio::task::JoinHandle<()>, Arc<Notify>)>,
+    state: RemoteState,
+    url: String,
+}
+
+pub(crate) struct Server {
     /// Owner of the state shared by every session: auth, http client, MCP connections.
     base: Runtime,
     /// One runtime per project directory (settings, agents and skills differ per project).
     runtimes: Mutex<HashMap<PathBuf, Runtime>>,
     lives: Mutex<HashMap<String, Arc<Live>>>,
+    remote: Mutex<RemoteLink>,
+    /// `Push::Remote` updates for local clients.
+    remote_bus: broadcast::Sender<Push>,
 }
 
 pub async fn serve() -> Result<()> {
@@ -60,7 +71,13 @@ pub async fn serve() -> Result<()> {
     let base = crate::build_runtime(std::env::current_dir()?).await?;
     let mcp = base.mcp.clone();
     tokio::spawn(async move { mcp.connect_all().await });
-    let srv = Arc::new(Server { runtimes: Mutex::new(HashMap::from([(base.cwd.clone(), base.clone())])), base, lives: Default::default() });
+    let srv = Arc::new(Server {
+        runtimes: Mutex::new(HashMap::from([(base.cwd.clone(), base.clone())])),
+        base,
+        lives: Default::default(),
+        remote: Default::default(),
+        remote_bus: broadcast::channel(16).0,
+    });
     let (quit_tx, mut quit_rx) = unbounded_channel::<()>();
     loop {
         tokio::select! {
@@ -180,11 +197,39 @@ impl Server {
                 }
             }
         });
-        let mut lines = BufReader::new(rd).lines();
+        let (req_tx, reqs) = unbounded_channel::<Req>();
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(rd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(req) = serde_json::from_str::<Req>(&line) else { continue };
+                if req_tx.send(req).is_err() {
+                    break;
+                }
+            }
+        });
+        self.run_connection(reqs, out, Some(quit)).await;
+        reader.abort();
+        writer.abort();
+    }
+
+    /// Serves one client: a local socket (`quit` set, may control the daemon and the remote link) or a
+    /// virtual channel of the relay (`quit` unset, already filtered by `relay::allowed`).
+    pub(crate) async fn run_connection(self: Arc<Self>, mut reqs: UnboundedReceiver<Req>, out: UnboundedSender<Push>, quit: Option<UnboundedSender<()>>) {
+        let local = quit.is_some();
+        let mut remote_fwd = local.then(|| {
+            let mut rx = self.remote_bus.subscribe();
+            let out = out.clone();
+            tokio::spawn(async move {
+                while let Ok(p) = rx.recv().await {
+                    if out.send(p).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         let mut current: Option<Arc<Live>> = None;
         let mut forward: Option<tokio::task::JoinHandle<()>> = None;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(req) = serde_json::from_str::<Req>(&line) else { continue };
+        while let Some(req) = reqs.recv().await {
             match req {
                 Req::Attach { target, cwd, agent, model } => {
                     if let Some(f) = forward.take() {
@@ -227,7 +272,21 @@ impl Server {
                     let _ = out.send(Push::Busy(busy));
                 }
                 Req::Shutdown => {
-                    let _ = quit.send(());
+                    if let Some(q) = &quit {
+                        let _ = q.send(());
+                    }
+                }
+                Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus if !local => {
+                    let _ = out.send(Push::Err("not allowed remotely".into()));
+                }
+                Req::RemoteStart => self.remote_start(),
+                Req::RemoteStop => self.remote_stop(),
+                Req::RemoteStatus => {
+                    let (state, url) = {
+                        let r = self.remote.lock().unwrap();
+                        (r.state.clone(), r.url.clone())
+                    };
+                    let _ = out.send(Push::Remote { state, url });
                 }
                 req => match &current {
                     Some(live) => handle(live, req, &out),
@@ -240,7 +299,54 @@ impl Server {
         if let Some(f) = forward {
             f.abort();
         }
-        writer.abort();
+        if let Some(f) = remote_fwd.take() {
+            f.abort();
+        }
+    }
+
+    /// Records the link state and tells the local clients.
+    pub(crate) fn set_remote(&self, state: RemoteState) {
+        let url = {
+            let mut r = self.remote.lock().unwrap();
+            if r.state == state {
+                return;
+            }
+            r.state = state.clone();
+            r.url.clone()
+        };
+        let _ = self.remote_bus.send(Push::Remote { state, url });
+    }
+
+    fn remote_start(self: &Arc<Self>) {
+        let mut r = self.remote.lock().unwrap();
+        if r.task.as_ref().is_some_and(|(h, _)| !h.is_finished()) {
+            let _ = self.remote_bus.send(Push::Remote { state: r.state.clone(), url: r.url.clone() });
+            return;
+        }
+        let url = std::env::var("THETA_REMOTE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or_else(|| config::load(&self.base.project).ok().map(|s| s.remote.url))
+            .unwrap_or_else(|| config::RemoteSettings::default().url);
+        r.url = url.clone();
+        r.state = RemoteState::Connecting;
+        let _ = self.remote_bus.send(Push::Remote { state: RemoteState::Connecting, url: url.clone() });
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(crate::relay::run(self.clone(), url, stop.clone()));
+        r.task = Some((task, stop));
+    }
+
+    fn remote_stop(&self) {
+        let task = self.remote.lock().unwrap().task.take();
+        if let Some((handle, stop)) = task {
+            stop.notify_one();
+            // The task says goodbye to the server and exits; do not wait on a stuck socket.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                handle.abort();
+            });
+        }
+        self.set_remote(RemoteState::Off);
     }
 }
 
@@ -414,6 +520,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
+        Req::RemoteStart | Req::RemoteStop | Req::RemoteStatus => {}
     }
 }
 

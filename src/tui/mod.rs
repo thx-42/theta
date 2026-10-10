@@ -12,7 +12,7 @@ use crate::client::Remote;
 use tabs::{Tab, TabStatus, View};
 use crate::config;
 use crate::jobs::{JobInfo, Kind as JobKind, Status as JobStatus};
-use crate::proto::{Push, Req, Snapshot, Target as Where};
+use crate::proto::{Push, RemoteState, Req, Snapshot, Target as Where};
 use crate::session::{self, Kind, Session};
 use crate::tools::{self, Kind as ToolKind, Todo};
 use crate::types::{Block, Msg, Role};
@@ -89,6 +89,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/linters", "linters per language and whether they are installed"),
+    ("/remote", "control theta from a browser: (none) | stop | status"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
@@ -429,6 +430,9 @@ struct Ui {
     overlay: Option<Overlay>,
     todos: Vec<Todo>,
     jobs: Vec<JobInfo>,
+    /// Link to theta-server, shared by every tab; `remote_asked` = this TUI ran `/remote` and wants the code shown.
+    remote_state: RemoteState,
+    remote_asked: bool,
     cost: f64,
     ctx_tokens: u64,
     quit_armed: Option<Instant>,
@@ -868,6 +872,15 @@ impl Ui {
             "/stats" => self.report("Stats", |rt| Box::pin(async move { tokio::task::spawn_blocking(move || crate::usage::stats(&rt.catalog)).await.unwrap_or_default() })),
             "/copy" => self.copy_last(),
             "/jobs" => self.open_jobs(),
+            "/remote" => {
+                self.remote_asked = true;
+                match arg {
+                    "" => self.remote.send(Req::RemoteStart),
+                    "stop" => self.remote.send(Req::RemoteStop),
+                    "status" => self.remote.send(Req::RemoteStatus),
+                    _ => self.notify("usage: /remote [stop|status]"),
+                }
+            }
             "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -2096,6 +2109,11 @@ impl Ui {
         if live > 0 {
             left.push(Span::styled(format!(" · ⚙ {live}"), theme::accent()));
         }
+        match &self.remote_state {
+            RemoteState::Linked => left.push(Span::styled(" · ⇄ remote", theme::accent())),
+            RemoteState::Code { .. } => left.push(Span::styled(" · ⇄ waiting for browser", theme::dim())),
+            _ => {}
+        }
         let ctx_max = self.model_ctx();
         let pct = if ctx_max > 0 { self.ctx_tokens * 100 / ctx_max } else { 0 };
         let title = self.app.session.lock().unwrap().title.clone().unwrap_or_default();
@@ -2787,6 +2805,44 @@ impl Ui {
         self.invalidate_all();
     }
 
+    fn on_remote(&mut self, state: RemoteState, url: &str) {
+        let had_code = matches!(self.remote_state, RemoteState::Code { .. });
+        self.remote_state = state.clone();
+        let is_code_overlay = matches!(&self.overlay, Some(Overlay::Report(t, _)) if t == "θ remote");
+        if is_code_overlay && !matches!(state, RemoteState::Code { .. }) {
+            self.overlay = None;
+        }
+        if !self.remote_asked {
+            return;
+        }
+        match state {
+            RemoteState::Code { code, expires_in } => {
+                let lines = vec![
+                    format!("  code   {}", code),
+                    format!("  open   {}/link", url.trim_end_matches('/')),
+                    String::new(),
+                    format!("  Valid for {} min. Anyone with the code can run tools on this machine:", expires_in / 60),
+                    "  only enter it yourself. `/remote stop` cuts the link.".into(),
+                ];
+                self.overlay = Some(Overlay::Report("θ remote".into(), lines));
+            }
+            RemoteState::Linked => {
+                self.remote_asked = false;
+                self.notify("remote: browser connected (/remote stop to disconnect)");
+            }
+            RemoteState::Off => {
+                self.remote_asked = false;
+                self.notify("remote: off");
+            }
+            RemoteState::Offline(e) if !had_code => self.notify(format!("remote: link lost ({e}), retrying")),
+            RemoteState::Error(e) => {
+                self.remote_asked = false;
+                self.notify(format!("remote: {e}"));
+            }
+            RemoteState::Offline(_) | RemoteState::Connecting => {}
+        }
+    }
+
     fn on_push(&mut self, p: Push) {
         match p {
             Push::Snapshot(s) => self.on_snapshot(*s),
@@ -2802,6 +2858,7 @@ impl Ui {
             Push::Notice(n) => self.push(Item::Info(n)),
             Push::Err(e) => self.push(Item::Error(e)),
             Push::Busy(_) => {}
+            Push::Remote { state, url } => self.on_remote(state, &url),
             Push::Jobs(l) => self.jobs = l,
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay
@@ -2846,6 +2903,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         overlay: None,
         todos: vec![],
         jobs: snap.jobs.clone(),
+        remote_state: RemoteState::Off,
+        remote_asked: false,
         cost: 0.0,
         ctx_tokens: 0,
         quit_armed: None,
