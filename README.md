@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/thx-42/theta/main/install.sh | bash
 |  |  |
 |---|---|
 | **TUI + daemon** | Client plein écran et daemon en arrière-plan. Ferme ton shell : rien ne s'arrête. Plusieurs terminaux s'attachent à la même session, en direct. |
-| **Sobre en tokens** | Relecture intelligente, chemins relatifs, prompt caching Anthropic, compaction auto à 80 % de la fenêtre. |
+| **Sobre en tokens** | Relecture intelligente, chemins relatifs, prompt caching Anthropic, compaction auto à 80 % de la fenêtre, plafonnée à 150k tokens. |
 | **Agents** | `Build` code, `Plan` planifie sans coder, `Auto` orchestre de bout en bout avec des sous-agents. Les tiens sont des fichiers `.md`. |
 | **SOUL & skills** | `SOUL.md` s'applique à tous les agents. Les skills s'injectent avec `$nom`, ou tout seuls en `auto`. |
 | **MCP natif** | Serveurs stdio + HTTP, OAuth 2.1 PKCE, tools `mcp__serveur__tool`. |
@@ -174,7 +174,7 @@ effort = "high"
 
 Ces valeurs se règlent aussi dans `/settings`, onglet **Models** (modèle et effort par agent, modèles compaction / titre / subagent). `tab` change d'onglet dans ce panneau.
 
-Effort d'un subagent, du plus prioritaire au moins : argument `effort` de l'appel `task` > `[agents.<nom>]` de l'agent ciblé > `subagent_effort` de l'agent qui lance > `[models] subagent_effort` > effort de l'agent qui lance. Réglable dans `/settings`, onglet **Models** (*Subagent effort*).
+Effort d'un subagent, du plus prioritaire au moins : `[agents.<nom>]` de l'agent ciblé > `subagent_effort` de l'agent qui lance > `[models] subagent_effort` > effort de l'agent qui lance. Réglable dans `/settings`, onglet **Models** (*Subagent effort*).
 
 Priorité : `-m` / `--agent` en ligne de commande > `[agents.<nom>]` > frontmatter de l'agent > `model` / `effort` globaux. Valable au démarrage, au changement d'agent (`tab`) et pour les subagents lancés par `task` avec `agent`.
 
@@ -182,18 +182,20 @@ Priorité : `-m` / `--agent` en ligne de commande > `[agents.<nom>]` > frontmatt
 
 | Tool | Rôle |
 |---|---|
-| `read` `write` `edit` `ls` `find` `grep` | fichiers ; `grep`/`find` respectent `.gitignore`, résultats groupés |
+| `read` `write` `edit` `grep` | fichiers ; `grep` respecte `.gitignore`, résultats groupés |
+| `ls` `find` | listing et recherche de fichiers. Réservés aux agents qui les listent dans `tools` (Plan, Auto) ; Build passe par `bash` |
 | `bash` | shell ; commandes réécrites via **rtk** si installé, sortie compactée (ANSI, répétitions, troncature au milieu + log complet sauvegardé). `background: true` lance la commande en job de fond |
 | `todo` | liste de tâches affichée au-dessus de la saisie |
 | `web_search` | Exa MCP par défaut (sans clé) ; `firecrawl` / `brave` / `tavily` / `duckduckgo` ; repli DuckDuckGo |
 | `web_fetch` | page → texte compact |
 | `task` | subagent à contexte neuf, renvoie seulement son rapport final. `background: true` : il tourne en job de fond |
-| `job_output` `job_kill` | sortie / arrêt d'un job de fond (shell, lint ou subagent) par id |
+| `job` | jobs de fond (shell, lint, subagent) : `action` = `list`, `output` (+ `id`), `kill` (+ `id`), `wait` (rapports de subagents, `mode` any/all) |
 | `list_agents` | liste les agents (tâche, `can`, `cannot`) pour choisir une cible de handoff. Réservé aux agents qui le listent dans `tools` |
 | `handoff` | propose de passer à un autre agent (Plan → Build) ; si oui, Build enchaîne dans la même conversation. Réservé aux agents qui le listent dans `tools` |
-| `ask` | pose une question : choix multiple, oui/non ou texte libre (réponse libre toujours possible) |
+| `write_plan` | écrit le plan de la session. Réservé aux agents qui le listent dans `tools` |
+| `ask` | pose une question : choix multiple, oui/non ou texte libre (réponse libre toujours possible). Réservé aux agents qui le listent dans `tools` |
 
-Économies de tokens : relecture d'un fichier inchangé → simple notice ; chemins relatifs ; diff visibles dans l'UI mais pas renvoyés au modèle ; prompt caching Anthropic (tools, system, 2 derniers tours).
+Économies de tokens : jeu d'outils par défaut réduit (read, write, edit, bash, grep, job, todo, web, task) ; sorties plafonnées (~300 lignes, 24 Ko par lecture) ; outils MCP non envoyés aux subagents sans entrée `tools:` explicite ; relecture d'un fichier inchangé → simple notice ; chemins relatifs ; diff visibles dans l'UI mais pas renvoyés au modèle ; prompt caching Anthropic (tools, system, 2 derniers tours).
 
 <details>
 <summary><b>Jobs de fond, linter et hooks</b></summary>
@@ -282,7 +284,7 @@ Skills fournis dans `.theta/skills/` (actifs quand theta tourne dans ce repo) : 
 
 ### Contexte
 
-Compaction automatique au-delà de `compaction.threshold` (80 % par défaut) de la fenêtre : les anciens tours sont résumés par le **modèle de compaction**, les ~20k derniers tokens sont gardés tels quels. `/compact` force. Chaque tâche a son modèle :
+Compaction automatique au-delà de `compaction.threshold` (80 % par défaut) de la fenêtre, ou de `compaction.max_tokens` (150000 par défaut, 0 = pas de plafond) si c'est plus bas : les anciens tours sont résumés par le **modèle de compaction**, les ~20k derniers tokens sont gardés tels quels. `/compact` force. Chaque tâche a son modèle :
 
 ```toml
 [models]

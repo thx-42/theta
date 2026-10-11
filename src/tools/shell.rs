@@ -128,7 +128,7 @@ pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     if super::b(args, "background") {
         let (run, cwd, timeout) = (effective.clone(), ctx.cwd.clone(), n(args, "timeout").map(Duration::from_secs));
         let id = ctx.jobs.spawn(crate::jobs::Kind::Shell, cmd.clone(), false, move |out| Box::pin(async move { run_into(&run, &cwd, &out, timeout).await }));
-        return Ok(ToolOut::ok(format!("started background job {id}: {cmd}\nIts end is reported in a later message; use job_output to look at it, job_kill to stop it.")));
+        return Ok(ToolOut::ok(format!("started background job {id}: {cmd}\nIts end is reported in a later message; use `job` (output, kill) to look at it or stop it.")));
     }
     let timeout = n(args, "timeout").unwrap_or(ctx.settings.tools.bash_timeout).max(1);
     let mut child = spawn_sh(&effective, &ctx.cwd)?;

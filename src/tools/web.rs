@@ -153,7 +153,7 @@ pub async fn fetch(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("only http(s) URLs");
     }
-    let max = n(args, "max_chars").unwrap_or(20_000) as usize;
+    let max = n(args, "max_chars").unwrap_or(12_000) as usize;
     let r = ctx
         .http
         .get(url)

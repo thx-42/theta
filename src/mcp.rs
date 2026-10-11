@@ -434,7 +434,11 @@ impl Registry {
             .map(|(n, cfg)| {
                 let kind = if cfg.url.is_empty() { "stdio" } else { "http" };
                 match slots.get(n) {
-                    Some(Slot { client: Some(c), .. }) => format!("● {n} ({kind}) · {} tools", c.tools.len()),
+                    Some(Slot { client: Some(c), .. }) => {
+                        // Rough cost of sending the definitions on every request (~4 bytes per token).
+                        let bytes: usize = c.tools.iter().map(|t| t.name.len() + t.description.len() + t.schema.to_string().len()).sum();
+                        format!("● {n} ({kind}) · {} tools · ~{} tokens/request", c.tools.len(), bytes / 4)
+                    }
                     Some(Slot { error: Some(e), .. }) if e.starts_with("unauthorized") => format!("○ {n} ({kind}) · needs login: /mcp login {n}"),
                     Some(Slot { error: Some(e), .. }) => format!("✗ {n} ({kind}) · {e}"),
                     _ => format!("✗ {n} ({kind})"),

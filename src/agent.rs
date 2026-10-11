@@ -124,10 +124,11 @@ impl Runtime {
         defs.retain(|d| !self.settings.tools.disabled.contains(&d.name));
         match &agent.tools {
             Some(allow) => defs.retain(|d| allow.iter().any(|a| allows(a, &d.name))),
-            None => defs.retain(|d| !matches!(d.name.as_str(), "handoff" | "list_agents")), // opt-in: only agents that list it
+            // No list: the lean default set. Opt-in tools and, for subagents, MCP tools (their schemas are costly) need an explicit `tools:` entry.
+            None => defs.retain(|d| !tools::OPT_IN.contains(&d.name.as_str()) && !(depth > 0 && d.name.starts_with("mcp__"))),
         }
         if depth > 0 {
-            defs.retain(|d| !matches!(d.name.as_str(), "todo" | "ask" | "handoff" | "list_agents" | "jobs" | "wait")); // the todo panel and the user belong to the main agent
+            defs.retain(|d| !matches!(d.name.as_str(), "todo" | "ask" | "handoff" | "list_agents")); // the todo panel and the user belong to the main agent
         }
         defs
     }
@@ -144,7 +145,11 @@ impl Runtime {
 
 /// Does an `tools:` entry allow tool `name`? Exact, `prefix*`, or an MCP server name (`mcp__github`).
 fn allows(entry: &str, name: &str) -> bool {
-    let (e, n) = (entry.to_lowercase(), name.to_lowercase());
+    let mut e = entry.to_lowercase();
+    if matches!(e.as_str(), "jobs" | "wait" | "job_output" | "job_kill") {
+        e = "job".into(); // the four job tools were merged into `job`
+    }
+    let n = name.to_lowercase();
     e == n || e.strip_suffix('*').is_some_and(|p| n.starts_with(p)) || (e.starts_with("mcp__") && n.starts_with(&format!("{e}__")))
 }
 
@@ -304,7 +309,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "wait" {
+                let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -390,7 +395,7 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
             }
         })
     });
-    tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use job_output to look at it, job_kill to stop it."))
+    tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use `job` (output, kill) to look at it or stop it."))
 }
 
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
@@ -411,10 +416,9 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         .filter(|_| named)
         .or_else(|| parent.agent.subagent_model.clone())
         .unwrap_or(rt.task_model("subagent", &parent.model).await);
-    // call argument > named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
-    let asked = args.get("effort").and_then(|v| v.as_str()).map(str::to_lowercase).filter(|e| ["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()));
-    let effort = asked
-        .or_else(|| agents::effort_of(&agent, &rt.settings).filter(|_| named))
+    // named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
+    let effort = agents::effort_of(&agent, &rt.settings)
+        .filter(|_| named)
         .or_else(|| parent.agent.subagent_effort.clone())
         .or_else(|| Some(rt.settings.models.subagent_effort.clone()).filter(|e| !e.is_empty()))
         .unwrap_or_else(|| parent.effort.clone());
@@ -482,6 +486,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn old_job_tool_names_allow_job() {
+        assert!(allows("wait", "job") && allows("job_output", "job") && !allows("wait", "bash"));
+    }
+
+    #[tokio::test]
+    async fn default_tool_set_is_lean() {
+        let rt = test_rt().await;
+        let build = agents::discover(std::path::Path::new("/nonexistent")).remove(0);
+        let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
+        assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
+        assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
+    }
 
     #[test]
     fn repairs_dangling_calls() {

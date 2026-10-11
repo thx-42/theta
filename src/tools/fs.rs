@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 const MAX_LINE: usize = 2000;
+/// A read stops here even when lines remain: it ends with the `offset=` hint to continue.
+const MAX_READ_BYTES: usize = 24_000;
 
 /// Path as the model should see it: relative to cwd when inside it.
 fn rel(ctx: &ToolCtx, p: &std::path::Path) -> String {
@@ -29,7 +31,7 @@ pub fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     }
     let text = String::from_utf8_lossy(&bytes);
     let offset = n(args, "offset").unwrap_or(1).max(1) as usize;
-    let max = ctx.settings.tools.max_lines.max(50) * 5;
+    let max = ctx.settings.tools.max_lines.max(50) * 3 / 2;
     let limit = n(args, "limit").map(|l| l as usize).unwrap_or(max).min(max);
     let ranged = args.get("offset").is_some() || args.get("limit").is_some();
     let key = format!("{}:{offset}:{limit}", path.display());
@@ -46,9 +48,13 @@ pub fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     if offset > total.max(1) {
         bail!("offset {offset} beyond end of file ({total} lines)");
     }
-    let end = (offset - 1 + limit).min(total);
+    let mut end = (offset - 1 + limit).min(total);
     let mut out = String::new();
-    for l in &lines[offset - 1..end] {
+    for (i, l) in lines[offset - 1..end].iter().enumerate() {
+        if out.len() > MAX_READ_BYTES {
+            end = offset - 1 + i;
+            break;
+        }
         if l.len() > MAX_LINE {
             out.push_str(&l[..l.floor_char_boundary(MAX_LINE)]);
             out.push_str("…[line truncated]");

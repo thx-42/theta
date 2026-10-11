@@ -131,11 +131,13 @@ pub struct Compaction {
     pub threshold: f64,
     /// Recent tokens kept verbatim after compaction.
     pub keep_recent_tokens: u64,
+    /// Absolute ceiling (tokens) for the trigger, so huge windows do not grow unbounded; 0 = none.
+    pub max_tokens: u64,
 }
 
 impl Default for Compaction {
     fn default() -> Self {
-        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000 }
+        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000, max_tokens: 150_000 }
     }
 }
 
@@ -154,7 +156,7 @@ pub struct ToolSettings {
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 400, disabled: vec![] }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![] }
     }
 }
 
@@ -378,11 +380,12 @@ subagent_effort = ""                   # "" = effort of the spawning agent
 enabled = true
 threshold = 0.8
 keep_recent_tokens = 20000
+max_tokens = 150000      # compact at the lower of threshold x window and this; 0 = no ceiling
 
 [tools]
 rtk = "auto"             # route shell commands through rtk when installed
 bash_timeout = 120
-max_lines = 400
+max_lines = 300
 disabled = []
 
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
