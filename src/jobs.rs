@@ -78,6 +78,10 @@ struct Inner {
     last_edit: Mutex<Option<PathBuf>>,
     /// Linter binaries already reported absent.
     missing: Mutex<Vec<String>>,
+    /// Wakes `wait` when a subagent job ends or is killed.
+    ended: tokio::sync::Notify,
+    /// Subagent jobs ended so far (`wait` any compares it with its value at call time).
+    agents_ended: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Default)]
@@ -125,7 +129,7 @@ impl Jobs {
     }
 
     fn finish(&self, id: &str, code: i32, quiet_ok: bool) {
-        let note = {
+        let (note, agent) = {
             let mut jobs = self.0.jobs.lock().unwrap();
             let Some(j) = jobs.iter_mut().find(|j| j.info.id == id) else { return };
             if j.info.status != Status::Running {
@@ -135,12 +139,46 @@ impl Jobs {
             j.info.ended = Some(now());
             j.abort = None;
             let body = crate::tools::shell::compact(&j.out.text());
-            (!(quiet_ok && code == 0 && body.trim().is_empty())).then(|| note(&j.info, &body))
+            ((!(quiet_ok && code == 0 && body.trim().is_empty())).then(|| note(&j.info, &body)), j.info.kind == Kind::Agent)
         };
         if let Some(n) = note {
             self.0.pending.lock().unwrap().push(n);
         }
         self.changed();
+        self.agent_ended(agent);
+    }
+
+    fn agent_ended(&self, agent: bool) {
+        if agent {
+            self.0.agents_ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.ended.notify_one();
+        }
+    }
+
+    /// Subagent jobs still running.
+    pub fn running_agents(&self) -> usize {
+        self.0.jobs.lock().unwrap().iter().filter(|j| j.info.kind == Kind::Agent && j.info.status == Status::Running).count()
+    }
+
+    /// Block until a subagent job ends (`all`: until none runs). Returns at once when none runs.
+    pub async fn wait(&self, all: bool) {
+        self.wait_since(all, self.ended_count()).await;
+    }
+
+    /// Subagent jobs ended so far: a snapshot to pass to `wait_since`.
+    pub fn ended_count(&self) -> usize {
+        self.0.agents_ended.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Like `wait`, but "any" means: one ended since the `start` snapshot (survives a cancelled and re-polled wait).
+    pub async fn wait_since(&self, all: bool, start: usize) {
+        loop {
+            let running = self.running_agents();
+            if running == 0 || (!all && self.ended_count() != start) {
+                return;
+            }
+            self.0.ended.notified().await;
+        }
     }
 
     /// Stop a running job. False when it does not exist or already ended.
@@ -153,10 +191,12 @@ impl Jobs {
                 }
                 j.info.status = Status::Killed;
                 j.info.ended = Some(now());
+                j.info.kind == Kind::Agent
             })
         };
-        if found.is_some() {
+        if let Some(agent) = found {
             self.changed();
+            self.agent_ended(agent);
         }
         found.is_some()
     }
@@ -244,6 +284,19 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains(&loud) && notes[0].contains("failed (exit 3)") && notes[0].ends_with("hi"));
         assert!(jobs.take_pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_any_returns_at_first_end_all_when_none_left() {
+        let jobs = Jobs::default();
+        let slow = |ms| move |_: Out| -> Work { Box::pin(async move { tokio::time::sleep(std::time::Duration::from_millis(ms)).await; 0 }) };
+        jobs.spawn(Kind::Agent, "fast".into(), false, slow(20));
+        jobs.spawn(Kind::Agent, "slow".into(), false, slow(300));
+        jobs.wait(false).await;
+        assert_eq!(jobs.running_agents(), 1);
+        jobs.wait(true).await;
+        assert_eq!(jobs.running_agents(), 0);
+        jobs.wait(true).await; // nothing running: returns at once
     }
 
     #[tokio::test]

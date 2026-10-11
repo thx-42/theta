@@ -12,7 +12,7 @@ use crate::client::Remote;
 use tabs::{Tab, TabStatus, View};
 use crate::config;
 use crate::jobs::{JobInfo, Kind as JobKind, Status as JobStatus};
-use crate::proto::{Push, Req, Snapshot, Target as Where};
+use crate::proto::{Push, RemoteState, Req, Snapshot, Target as Where};
 use crate::session::{self, Kind, Session};
 use crate::tools::{self, Kind as ToolKind, Todo};
 use crate::types::{Block, Msg, Role};
@@ -21,7 +21,7 @@ use anyhow::Result;
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -89,6 +89,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/linters", "linters per language and whether they are installed"),
+    ("/remote", "control theta from a browser: (none) | stop | status"),
+    ("/ssh", "run tools on a server: <ssh arguments> | off"),
+    ("/cd", "browse the ssh server's folders: (none) opens the explorer | <dir>"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
@@ -296,9 +299,24 @@ struct JobsView {
     polled: Instant,
 }
 
+/// Left arrow on an empty prompt: subagents and shell commands of this session, newest first.
+struct ActivityView {
+    sel: usize,
+}
+
+/// `/cd`: folders of the ssh host; enter goes in, backspace goes up.
+struct DirView {
+    cwd: String,
+    /// `..` first, then directories (ending in `/`), then files.
+    entries: Vec<String>,
+    sel: usize,
+}
+
 enum Overlay {
     Pick(Picker),
+    Dir(DirView),
     Jobs(JobsView),
+    Activity(ActivityView),
     Tree(tree::TreeView),
     Settings(SettingsView),
     Help,
@@ -418,10 +436,14 @@ struct Ui {
     images: Vec<Block>,
     /// First Esc of a double press; the second one within 2s stops the agent.
     esc_at: Option<Instant>,
+    /// Ctrl+x was pressed: the next key is a leader command.
+    leader: bool,
     /// The last run was stopped by the user.
     interrupted: bool,
     /// Tabs being reopened at start; they must not take focus while this counts down.
     restoring: usize,
+    /// Session ids being opened because another client opened them (not yet attached).
+    opening: Vec<String>,
     started: Instant,
     elapsed: Duration,
     counts: Counts,
@@ -429,6 +451,11 @@ struct Ui {
     overlay: Option<Overlay>,
     todos: Vec<Todo>,
     jobs: Vec<JobInfo>,
+    /// Link to theta-server, shared by every tab; `remote_asked` = this TUI ran `/remote` and wants the code shown.
+    remote_state: RemoteState,
+    remote_asked: bool,
+    /// Host the tools of this session run on (`/ssh`).
+    ssh: Option<crate::proto::SshInfo>,
     cost: f64,
     ctx_tokens: u64,
     quit_armed: Option<Instant>,
@@ -868,6 +895,18 @@ impl Ui {
             "/stats" => self.report("Stats", |rt| Box::pin(async move { tokio::task::spawn_blocking(move || crate::usage::stats(&rt.catalog)).await.unwrap_or_default() })),
             "/copy" => self.copy_last(),
             "/jobs" => self.open_jobs(),
+            "/remote" => {
+                self.remote_asked = true;
+                match arg {
+                    "" => self.remote.send(Req::RemoteStart { cwd: self.app.rt.cwd.clone() }),
+                    "stop" => self.remote.send(Req::RemoteStop),
+                    "status" => self.remote.send(Req::RemoteStatus),
+                    _ => self.notify("usage: /remote [stop|status]"),
+                }
+            }
+            "/ssh" => self.remote.send(Req::Ssh(arg.to_string())),
+            "/cd" if arg.is_empty() => self.remote.send(Req::Ls(String::new())),
+            "/cd" => self.remote.send(Req::Cd(arg.to_string())),
             "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -877,6 +916,25 @@ impl Ui {
 
     fn open_jobs(&mut self) {
         self.overlay = Some(Overlay::Jobs(JobsView { sel: 0, view: None, text: String::new(), polled: Instant::now() }));
+    }
+
+    /// Subagent and shell tool calls, newest first: (kind, state (None = running, Some(ok)), label, output).
+    fn activity(&self) -> Vec<(&'static str, Option<bool>, String, String)> {
+        self.items
+            .iter()
+            .rev()
+            .filter_map(|it| match it {
+                Item::Tool { name, summary, state, out, .. } if name == "task" || name == "bash" => {
+                    let kind = if name == "task" { "agent" } else { "shell" };
+                    let done = match state {
+                        ToolState::Running => None,
+                        ToolState::Done { ok } => Some(*ok),
+                    };
+                    Some((kind, done, summary.clone(), out.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Refresh the output shown in `/jobs` about once a second.
@@ -1291,7 +1349,28 @@ impl Ui {
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.cmd_sel = 0;
         }
+        // Leader (ctrl+x) then one key: vim-like, no Option/Alt needed.
+        if std::mem::take(&mut self.leader) {
+            match k.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let n = c as usize - '1' as usize;
+                    if n < self.tabs.len() { self.switch_to(n) } else { self.notify(format!("no tab {c}")) }
+                }
+                KeyCode::Char('n') => self.new_tab(),
+                KeyCode::Char('w') => self.close_tab(),
+                KeyCode::Char('b') => self.toggle_tab_bar(),
+                KeyCode::Char('j') => self.open_jobs(),
+                KeyCode::Char('h') => self.step_tab(-1),
+                KeyCode::Char('l') => self.step_tab(1),
+                _ => self.notify("leader: unknown key"),
+            }
+            return;
+        }
         match k.code {
+            KeyCode::Char('x') if ctrl => {
+                self.leader = true;
+                self.notify("leader: n w b j h l 1-9");
+            }
             // Tab keys: alt, because ctrl+tab and ctrl+shift+t belong to terminal emulators such as Warp.
             KeyCode::Char(c @ '1'..='9') if alt => {
                 let n = c as usize - '1' as usize;
@@ -1333,6 +1412,9 @@ impl Ui {
                 } else {
                     self.scroll_top = None;
                 }
+            }
+            KeyCode::Left if self.input.text.is_empty() && self.images.is_empty() => {
+                self.overlay = Some(Overlay::Activity(ActivityView { sel: 0 }));
             }
             KeyCode::Char('o') if ctrl => self.toggle_verbose(),
             KeyCode::Char('t') if ctrl => self.open_tree(),
@@ -1522,7 +1604,40 @@ impl Ui {
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
-            Overlay::Help | Overlay::Report(..) => {}
+            Overlay::Help => {}
+            Overlay::Report(title, lines) => {
+                // The link code is typed on another device: `c` puts it on the clipboard and keeps the overlay.
+                if title == "θ remote" && matches!(k.code, KeyCode::Char('c')) {
+                    if let RemoteState::Code { code, .. } = &self.remote_state {
+                        let ok = clipboard(code);
+                        self.notify(if ok { "code copied" } else { "no clipboard tool found" });
+                    }
+                    self.overlay = Some(Overlay::Report(title, lines));
+                }
+            }
+            Overlay::Dir(mut v) => {
+                let last = v.entries.len().saturating_sub(1);
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Up => v.sel = v.sel.saturating_sub(1),
+                    KeyCode::Down => v.sel = (v.sel + 1).min(last),
+                    KeyCode::PageUp => v.sel = v.sel.saturating_sub(10),
+                    KeyCode::PageDown => v.sel = (v.sel + 10).min(last),
+                    KeyCode::Home => v.sel = 0,
+                    KeyCode::End => v.sel = last,
+                    KeyCode::Backspace | KeyCode::Left => self.remote.send(Req::Cd("..".into())),
+                    KeyCode::Char('~') => self.remote.send(Req::Cd("~".into())),
+                    KeyCode::Enter | KeyCode::Right => {
+                        if let Some(e) = v.entries.get(v.sel)
+                            && let Some(dir) = e.strip_suffix('/').or((e == "..").then_some(".."))
+                        {
+                            self.remote.send(Req::Cd(dir.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Dir(v));
+            }
             Overlay::Jobs(mut v) => {
                 let viewing = v.view.is_some();
                 match (viewing, k.code) {
@@ -1546,6 +1661,23 @@ impl Ui {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::Jobs(v));
+            }
+            Overlay::Activity(mut v) => {
+                let rows = self.activity();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Up => v.sel = v.sel.saturating_sub(1),
+                    KeyCode::Down => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
+                    KeyCode::Enter => {
+                        if let Some((kind, _, label, out)) = rows.into_iter().nth(v.sel) {
+                            let lines = if out.is_empty() { vec!["(no output yet)".to_string()] } else { out.lines().map(String::from).collect() };
+                            self.overlay = Some(Overlay::Report(format!("θ {kind} · {label}"), lines));
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Activity(v));
             }
             Overlay::Ask(mut a) => {
                 let free = a.options.len();
@@ -1725,6 +1857,7 @@ impl Ui {
                     ("Compaction model".into(), or_main(&s.models.compaction)),
                     ("Session-title model".into(), or_main(&s.models.title)),
                     ("Subagent model".into(), or_main(&s.models.subagent)),
+                    ("Subagent effort".into(), if s.models.subagent_effort.is_empty() { "(same as agent)".into() } else { s.models.subagent_effort.clone() }),
                 ];
                 for a in self.app.rt.agents.iter() {
                     let cfg = s.agent(&a.name).cloned().unwrap_or_default();
@@ -1745,11 +1878,15 @@ impl Ui {
         let s = self.app.rt.settings.clone();
         if view.tab == SettingsTab::Models {
             let n = view.sel;
-            let agent_row = n.checked_sub(5).map(|r| (r / 2, r % 2 == 0));
+            let agent_row = n.checked_sub(6).map(|r| (r / 2, r % 2 == 0));
             match (n, agent_row) {
                 (1, _) => {
                     let e = cycle(&["low", "medium", "high", "xhigh", "max"], &self.app.turn.effort);
                     self.set_effort(&e);
+                }
+                (5, _) => {
+                    let e = cycle(&["", "low", "medium", "high", "xhigh", "max"], &s.models.subagent_effort);
+                    self.update_settings("models.subagent_effort", e.clone().into(), |s| s.models.subagent_effort = e);
                 }
                 (0, _) | (2..=4, _) | (_, Some((_, true))) => {
                     self.settings_back = Some(view);
@@ -1758,7 +1895,7 @@ impl Ui {
                         2 => self.open_models(Target::Compaction),
                         3 => self.open_models(Target::Title),
                         4 => self.open_models(Target::Subagent),
-                        _ => self.open_models(Target::Agent((n - 5) / 2)),
+                        _ => self.open_models(Target::Agent((n - 6) / 2)),
                     }
                 }
                 (_, Some((i, false))) => {
@@ -1954,16 +2091,16 @@ impl Ui {
         }
         self.strip = strip;
         let width = area.width as usize;
-        let inner_w = width.saturating_sub(2);
-        let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
+        let (input_lines, cursor) = self.input.layout(width.saturating_sub(2));
         let chips = u16::from(!self.images.is_empty());
-        let input_h = (input_lines.len().min(8) + 2) as u16 + chips;
+        let input_h = input_lines.len().min(8) as u16 + chips + 2;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
-        let [chat, todo_area, progress, input_area, status] = Layout::vertical([
+        let [chat, todo_area, progress, _gap, input_area, status] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(todo_h),
             Constraint::Length(if show_progress { 1 } else { 0 }),
+            Constraint::Length(1),
             Constraint::Length(input_h),
             Constraint::Length(1),
         ])
@@ -2017,7 +2154,9 @@ impl Ui {
                 }
                 let tok = self.out_tokens + self.stream_chars as u64 / 4;
                 let tok = if tok >= 1000 { format!("{:.1}k", tok as f64 / 1000.0) } else { tok.to_string() };
-                spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · esc to interrupt)  "), theme::dim()));
+                spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · "), theme::dim()));
+                spans.push(Span::styled("esc", Style::default().fg(Color::White)));
+                spans.push(Span::styled(" to interrupt)  ", theme::dim()));
                 spans.extend(self.counts.spans());
                 if !matches!(self.status.as_str(), "thinking" | "writing") && !self.status.starts_with("compacting") && !self.status.starts_with("waiting") {
                     let st: String = self.status.chars().take(width / 3).collect();
@@ -2033,10 +2172,10 @@ impl Ui {
         }
 
         // input
-        let border = if self.running { theme::dim() } else { theme::accent() };
-        let block = UiBlock::bordered().border_type(BorderType::Rounded).border_style(border);
-        let inner = block.inner(input_area);
-        f.render_widget(block, input_area);
+        // Lighter band with one blank row above and below the text.
+        let band = Style::default().bg(Color::Indexed(237));
+        f.render_widget(UiBlock::default().style(band), input_area);
+        let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
         let skip = cursor.0.saturating_sub(7);
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
@@ -2051,7 +2190,7 @@ impl Ui {
         if self.input.text.is_empty() && self.images.is_empty() {
             il = vec![Line::from(vec![Span::styled("› ", theme::accent()), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
         }
-        f.render_widget(Paragraph::new(il), inner);
+        f.render_widget(Paragraph::new(il).style(band), inner);
         if self.overlay.is_none() {
             f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + chips + (cursor.0 - skip) as u16));
         }
@@ -2061,16 +2200,18 @@ impl Ui {
         if self.overlay.is_none() && !m.is_empty() {
             {
                 let sel = self.cmd_sel.min(m.len() - 1);
-                let max = 10.min(input_area.y.saturating_sub(2) as usize).max(1);
+                let max = 10.min(input_area.y as usize).max(1);
                 let start = sel.saturating_sub(max - 1);
-                let h = m.len().min(max) as u16 + 2;
-                let r = Rect { x: input_area.x + 1, y: input_area.y.saturating_sub(h), width: 60.min(area.width.saturating_sub(2)), height: h };
+                let h = m.len().min(max) as u16;
+                let full = f.area().width;
+                let r = Rect { x: 0, y: input_area.y.saturating_sub(h), width: full, height: h };
                 f.render_widget(Clear, r);
                 let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
-                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(theme::accent())), Span::styled(format!(" {d}"), st.patch(theme::dim()))])
+                    let pad = " ".repeat((full as usize).saturating_sub(12 + d.width()));
+                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(Style::default().fg(ratatui::style::Color::White))), Span::styled(format!(" {d}{pad}"), st.patch(theme::dim()))])
                 }).collect();
-                f.render_widget(Paragraph::new(lines).block(UiBlock::bordered().border_type(BorderType::Rounded).border_style(theme::dim())), r);
+                f.render_widget(Paragraph::new(lines), r);
             }
         }
 
@@ -2087,9 +2228,17 @@ impl Ui {
         if !self.verbose() {
             left.push(Span::styled(" · compact", theme::dim()));
         }
+        if let Some(s) = &self.ssh {
+            left.push(Span::styled(format!(" · ⇢ {}:{}", s.host, s.cwd), theme::accent()));
+        }
         let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
         if live > 0 {
             left.push(Span::styled(format!(" · ⚙ {live}"), theme::accent()));
+        }
+        match &self.remote_state {
+            RemoteState::Linked => left.push(Span::styled(" · ⇄ remote", theme::accent())),
+            RemoteState::Code { .. } => left.push(Span::styled(" · ⇄ waiting for browser", theme::dim())),
+            _ => {}
         }
         let ctx_max = self.model_ctx();
         let pct = if ctx_max > 0 { self.ctx_tokens * 100 / ctx_max } else { 0 };
@@ -2121,6 +2270,7 @@ impl Ui {
         const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
         let accent = theme::accent();
+        let white = Style::default().fg(Color::White);
         let mut out: Vec<Line<'static>> = LOGO
             .iter()
             .enumerate()
@@ -2137,6 +2287,9 @@ impl Ui {
         out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));
         out.push(Line::from(vec![Span::styled("  model  ", theme::dim()), Span::raw(self.app.turn.model.clone())]));
         out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(self.app.rt.cwd.display().to_string())]));
+        if let Some(s) = &self.ssh {
+            out.push(Line::from(vec![Span::styled("  ssh    ", theme::dim()), Span::raw(format!("{}:{}", s.host, s.cwd))]));
+        }
         if let Some((p, _)) = self.app.rt.catalog.resolve(&self.app.turn.model) {
             let local = p.env.is_empty() && p.oauth.is_none();
             if !local && futures::executor::block_on(self.app.rt.auth.status(&p)).is_none() {
@@ -2146,13 +2299,13 @@ impl Ui {
         }
         out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
         out.push(Line::from(vec![
-            Span::styled("  /help", accent),
+            Span::styled("  /help", white),
             Span::styled(" commands  ·  ", theme::dim()),
-            Span::styled("tab", accent),
+            Span::styled("tab", white),
             Span::styled(" agent  ·  ", theme::dim()),
-            Span::styled("ctrl+p", accent),
+            Span::styled("ctrl+p", white),
             Span::styled(" model  ·  ", theme::dim()),
-            Span::styled("ctrl+t", accent),
+            Span::styled("ctrl+t", white),
             Span::styled(" tree", theme::dim()),
         ]));
         let mut top = vec![Line::default(); h.saturating_sub(out.len()) / 2];
@@ -2165,8 +2318,10 @@ impl Ui {
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 18,
+            Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
+            Overlay::Activity(_) => self.activity().len().max(1) + 3,
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len() + 2,
             Overlay::Settings(v) => self.settings_rows(v.tab).len() + 6,
@@ -2196,6 +2351,40 @@ impl Ui {
                     let col = 5 + a.input.text[..a.input.cur].width();
                     f.set_cursor_position((r.x + 1 + col as u16, r.y + 1 + row as u16));
                 }
+            }
+            Overlay::Dir(v) => {
+                let rows = h.saturating_sub(4) as usize;
+                let top = (v.sel + 1).saturating_sub(rows);
+                let l: Vec<Line> = v.entries.iter().enumerate().skip(top).take(rows).map(|(i, e)| {
+                    let dir = e.ends_with('/') || e == "..";
+                    let st = if i == v.sel { theme::sel() } else if dir { theme::accent() } else { theme::dim() };
+                    Line::from(vec![Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()), Span::styled(e.clone(), st)])
+                }).collect();
+                let name: String = v.cwd.chars().rev().take(iw.saturating_sub(10)).collect::<Vec<_>>().into_iter().rev().collect();
+                f.render_widget(Paragraph::new(l).block(block(&format!("θ {name}")).title_bottom(hint(" ↑↓ select · enter open · ⌫ up · ~ home · esc close "))), r);
+            }
+            Overlay::Activity(v) => {
+                let rows = self.activity();
+                let vis = h.saturating_sub(3) as usize;
+                let top = (v.sel + 1).saturating_sub(vis);
+                let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _))| {
+                    let (mark, st) = match state {
+                        None => ("●", theme::accent()),
+                        Some(true) => ("✓", theme::dim()),
+                        Some(false) => ("✗", theme::err()),
+                    };
+                    let sel = if i == v.sel { theme::sel() } else { Style::default() };
+                    let label: String = label.chars().take(iw.saturating_sub(14)).collect();
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()),
+                        Span::styled(format!("{mark} "), st),
+                        Span::styled(format!("{kind:<6} {label}"), sel),
+                    ])
+                }).collect();
+                if l.is_empty() {
+                    l.push(Line::from(Span::styled(" nothing yet", theme::dim())));
+                }
+                f.render_widget(Paragraph::new(l).block(block("θ activity").title_bottom(hint(" ↑↓ select · enter output · esc close "))), r);
             }
             Overlay::Jobs(v) => {
                 let mut l = Vec::new();
@@ -2275,12 +2464,12 @@ impl Ui {
                     ("pgup pgdn shift+↑↓ wheel", "scroll"),
                     ("ctrl+c ×2 / ctrl+d", "quit"),
                 ] {
-                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), theme::accent()), Span::raw(d)]));
+                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), Style::default().fg(Color::White)), Span::styled(d, theme::dim())]));
                 }
                 l.push(Line::default());
                 l.push(Line::from(Span::styled("Commands", theme::accent().add_modifier(Modifier::BOLD))));
                 for (c, d) in COMMANDS {
-                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), theme::accent()), Span::raw(*d)]));
+                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())]));
                 }
                 f.render_widget(Paragraph::new(l).block(block("θ help")), r);
             }
@@ -2355,9 +2544,22 @@ impl Ui {
     }
 }
 
-/// Key hint drawn as the last line of an overlay body, dimmed.
+/// Key hint drawn as the last line of an overlay body: each "key rest" segment has the key in white, the rest dimmed.
 fn hint(keys: &'static str) -> Line<'static> {
-    Line::from(Span::styled(keys, theme::dim()))
+    let mut spans = Vec::new();
+    for (i, seg) in keys.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", theme::dim()));
+        }
+        let (lead, body) = seg.split_at(seg.len() - seg.trim_start().len());
+        let (key, rest) = body.split_once(' ').map_or((body, ""), |(k, r)| (k, r));
+        spans.push(Span::raw(lead));
+        spans.push(Span::styled(key.to_string(), Style::default().fg(Color::White)));
+        if !rest.is_empty() {
+            spans.push(Span::styled(format!(" {rest}"), theme::dim()));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Rows `text` takes when wrapped at `width` (approximate: by display width, per line).
@@ -2585,7 +2787,44 @@ impl Ui {
         });
     }
 
+    /// Session id of tab `i`: the active tab's state lives in `Ui`, the others are parked in their view.
+    fn tab_session_id(&self, i: usize) -> Option<String> {
+        let s = match &self.tabs[i].view {
+            Some(v) => v.session.clone(),
+            None => self.app.session.clone(),
+        };
+        let s = s.lock().unwrap();
+        s.has_messages().then(|| s.id.clone())
+    }
+
+    /// Another client (the web UI) opened or closed tabs of this project: do the same here.
+    fn on_tabs(&mut self, cwd: &std::path::Path, opened: Vec<String>, closed: Vec<String>) {
+        if cwd != self.app.rt.cwd || self.restoring > 0 {
+            return;
+        }
+        for id in closed {
+            if let Some(i) = (0..self.tabs.len()).find(|&i| self.tab_session_id(i).as_deref() == Some(&id)) {
+                self.close_at(i);
+            }
+        }
+        for id in opened {
+            let have = (0..self.tabs.len()).any(|i| self.tab_session_id(i).as_deref() == Some(&id));
+            if have || self.opening.contains(&id) {
+                continue;
+            }
+            self.opening.push(id.clone());
+            let (tx, cwd) = (self.opened_tx.clone(), self.app.rt.cwd.clone());
+            tokio::spawn(async move {
+                let _ = tx.send(crate::client::open(Where::Resume(id), cwd, None, None).await.map_err(|e| format!("{e:#}")));
+            });
+        }
+    }
+
     fn tab_opened(&mut self, opened: Opened) {
+        match &opened {
+            Ok((_, _, snap)) => self.opening.retain(|i| *i != snap.session_id),
+            Err(_) => self.opening.clear(),
+        }
         let restored = self.restoring > 0;
         self.restoring = self.restoring.saturating_sub(1);
         self.open_tab(opened);
@@ -2735,6 +2974,12 @@ impl Ui {
     }
 
     fn on_tab_push(&mut self, id: u64, p: Option<Push>) {
+        // Link and tab changes concern the whole TUI, whichever tab's connection carried them.
+        match p {
+            Some(Push::Tabs { cwd, opened, closed }) => return self.on_tabs(&cwd, opened, closed),
+            Some(Push::Remote { state, url }) => return self.on_remote(state, &url),
+            _ => {}
+        }
         let Some(i) = self.tabs.iter().position(|t| t.id == id) else { return };
         match (i == self.cur, p) {
             (true, Some(p)) => self.on_push(p),
@@ -2756,6 +3001,7 @@ impl Ui {
         self.apply_meta(&snap.agent, snap.model, snap.effort);
         self.todos = snap.todos;
         self.jobs = snap.jobs;
+        self.ssh = snap.ssh;
         self.asks.clear();
         self.overlay = None;
         self.running = false;
@@ -2782,6 +3028,45 @@ impl Ui {
         self.invalidate_all();
     }
 
+    fn on_remote(&mut self, state: RemoteState, url: &str) {
+        let had_code = matches!(self.remote_state, RemoteState::Code { .. });
+        self.remote_state = state.clone();
+        let is_code_overlay = matches!(&self.overlay, Some(Overlay::Report(t, _)) if t == "θ remote");
+        if is_code_overlay && !matches!(state, RemoteState::Code { .. }) {
+            self.overlay = None;
+        }
+        if !self.remote_asked {
+            return;
+        }
+        match state {
+            RemoteState::Code { code, expires_in } => {
+                let lines = vec![
+                    format!("  code   {}", code),
+                    format!("  open   {}/link", url.trim_end_matches('/')),
+                    String::new(),
+                    "  press c to copy the code".into(),
+                    format!("  Valid for {} min. Anyone with the code can run tools on this machine:", expires_in / 60),
+                    "  only enter it yourself. `/remote stop` cuts the link.".into(),
+                ];
+                self.overlay = Some(Overlay::Report("θ remote".into(), lines));
+            }
+            RemoteState::Linked => {
+                self.remote_asked = false;
+                self.notify("remote: browser connected (/remote stop to disconnect)");
+            }
+            RemoteState::Off => {
+                self.remote_asked = false;
+                self.notify("remote: off");
+            }
+            RemoteState::Offline(e) if !had_code => self.notify(format!("remote: link lost ({e}), retrying")),
+            RemoteState::Error(e) => {
+                self.remote_asked = false;
+                self.notify(format!("remote: {e}"));
+            }
+            RemoteState::Offline(_) | RemoteState::Connecting => {}
+        }
+    }
+
     fn on_push(&mut self, p: Push) {
         match p {
             Push::Snapshot(s) => self.on_snapshot(*s),
@@ -2797,7 +3082,16 @@ impl Ui {
             Push::Notice(n) => self.push(Item::Info(n)),
             Push::Err(e) => self.push(Item::Error(e)),
             Push::Busy(_) => {}
+            Push::Remote { state, url } => self.on_remote(state, &url),
+            Push::Overview(_) | Push::Tabs { .. } => {} // web clients / handled in on_tab_push
             Push::Jobs(l) => self.jobs = l,
+            Push::Ssh(i) => self.ssh = i,
+            Push::Dir { cwd, mut entries } => {
+                entries.sort_by_key(|e| (!e.ends_with('/'), e.to_lowercase()));
+                entries.insert(0, "..".into());
+                let sel = if entries.len() > 1 { 1 } else { 0 };
+                self.overlay = Some(Overlay::Dir(DirView { cwd, entries, sel }));
+            }
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay
                     && v.view.as_deref() == Some(&id)
@@ -2832,8 +3126,10 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         queued: vec![],
         images: vec![],
         esc_at: None,
+        leader: false,
         interrupted: false,
         restoring: 0,
+        opening: vec![],
         started: Instant::now(),
         elapsed: Duration::ZERO,
         counts: Counts::default(),
@@ -2841,6 +3137,9 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         overlay: None,
         todos: vec![],
         jobs: snap.jobs.clone(),
+        remote_state: RemoteState::Off,
+        remote_asked: false,
+        ssh: None,
         cost: 0.0,
         ctx_tokens: 0,
         quit_armed: None,

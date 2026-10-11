@@ -55,6 +55,85 @@ pub enum Req {
     /// Ask for a job's output; answered with `Push::JobOutput`.
     JobOutput(String),
     Shutdown,
+    /// `/ssh <ssh arguments>`: run the file and shell tools of this session on that host. Empty: report the state;
+    /// `off`: back to this machine. Local clients only.
+    Ssh(String),
+    /// Change the host's working directory (`/cd`). Local clients only.
+    Cd(String),
+    /// Ask for the host's current directory (the `/cd` explorer); answered with `Push::Dir`. Local clients only.
+    Ls(String),
+    /// Link this daemon to theta-server so a browser can drive it (answered with `Push::Remote`). Local clients only.
+    /// `cwd` is the project the browser opens first: the one the user is working in.
+    RemoteStart { cwd: PathBuf },
+    /// Drop the link to theta-server. Local clients only.
+    RemoteStop,
+    /// Ask for the current link state. Local clients only.
+    RemoteStatus,
+    /// What a client needs to start: projects, the sessions of `cwd` (default: the daemon's), agents, models.
+    /// Answered with `Push::Overview`.
+    Overview { cwd: Option<PathBuf> },
+}
+
+/// The host a session's tools run on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SshInfo {
+    pub host: String,
+    pub cwd: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionBrief {
+    pub id: String,
+    pub title: String,
+    pub updated: u64,
+    pub messages: usize,
+    /// An agent run is active in it right now.
+    pub running: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBrief {
+    pub name: String,
+    pub description: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelBrief {
+    /// `provider/model`, the value `Req::SetModel` takes.
+    pub key: String,
+    pub provider: String,
+    pub context: u64,
+    pub reasoning: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Overview {
+    pub cwd: PathBuf,
+    pub version: String,
+    /// Session ids of the tabs open in `cwd` (shared with the TUI), in tab order.
+    pub open: Vec<String>,
+    pub projects: Vec<PathBuf>,
+    pub sessions: Vec<SessionBrief>,
+    pub agents: Vec<AgentBrief>,
+    /// Models of the providers that are logged in.
+    pub models: Vec<ModelBrief>,
+    pub efforts: Vec<String>,
+}
+
+/// State of the outbound link to theta-server.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum RemoteState {
+    #[default]
+    Off,
+    Connecting,
+    /// Waiting for the user to type `code` on the server's link page.
+    Code { code: String, expires_in: u64 },
+    Linked,
+    /// Connection lost, retrying.
+    Offline(String),
+    /// The server refused the link.
+    Error(String),
 }
 
 /// Everything a client needs to show a session it just attached to.
@@ -71,6 +150,8 @@ pub struct Snapshot {
     pub todos: Vec<Todo>,
     #[serde(default)]
     pub jobs: Vec<JobInfo>,
+    #[serde(default)]
+    pub ssh: Option<SshInfo>,
 }
 
 /// Daemon → client.
@@ -87,4 +168,12 @@ pub enum Push {
     /// Background jobs of the session changed (started, ended or killed).
     Jobs(Vec<JobInfo>),
     JobOutput { id: String, text: String },
+    /// The session's tools now run on this host (or back on this machine); its directory changed.
+    Ssh(Option<SshInfo>),
+    /// Content of the host's working directory: names, directories end with `/`.
+    Dir { cwd: String, entries: Vec<String> },
+    Remote { state: RemoteState, url: String },
+    Overview(Box<Overview>),
+    /// Tabs of `cwd` were opened or closed by another client: mirror it. Sent to every client.
+    Tabs { cwd: PathBuf, opened: Vec<String>, closed: Vec<String> },
 }

@@ -66,9 +66,9 @@ fn block(s: &Skill) -> String {
     format!("<skill name=\"{}\">\n{}\n</skill>", s.name, s.body)
 }
 
-/// System-prompt section holding every auto skill ("" when none).
-pub fn auto_section(skills: &[Skill]) -> String {
-    let b: Vec<_> = skills.iter().filter(|s| s.auto).map(block).collect();
+/// System-prompt section holding every auto skill, plus the skills named in `extra` ("" when none).
+pub fn auto_section(skills: &[Skill], extra: &[String]) -> String {
+    let b: Vec<_> = skills.iter().filter(|s| s.auto || extra.iter().any(|e| e.eq_ignore_ascii_case(&s.name))).map(block).collect();
     if b.is_empty() { String::new() } else { format!("# Skills (always follow)\n{}", b.join("\n\n")) }
 }
 
@@ -98,7 +98,8 @@ mod tests {
         let a = parse("---\nname: caveman\nauto: true\n---\nBe terse.", "x", Scope::Global);
         let d = parse("---\ndescription: ui\n---\nUse grids.", "design", Scope::Local);
         let all = [a, d];
-        assert_eq!(auto_section(&all), "# Skills (always follow)\n<skill name=\"caveman\">\nBe terse.\n</skill>");
+        assert_eq!(auto_section(&all, &[]), "# Skills (always follow)\n<skill name=\"caveman\">\nBe terse.\n</skill>");
+        assert!(auto_section(&all, &["Design".into()]).contains("Use grids."));
         assert_eq!(expand(&all, "fix $design, costs $5 $caveman"), "<skill name=\"design\">\nUse grids.\n</skill>\n\nfix $design, costs $5 $caveman");
         assert_eq!(expand(&all, "plain"), "plain");
     }

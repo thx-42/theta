@@ -55,7 +55,12 @@ pub fn current_tokens(s: &Session) -> u64 {
 }
 
 pub fn needed(s: &Session, model: &Model, settings: &Settings) -> bool {
-    model.context > 0 && current_tokens(s) as f64 > model.context as f64 * settings.compaction.threshold
+    let c = &settings.compaction;
+    let mut limit = model.context as f64 * c.threshold;
+    if c.max_tokens > 0 {
+        limit = limit.min(c.max_tokens as f64);
+    }
+    model.context > 0 && current_tokens(s) as f64 > limit
 }
 
 pub fn serialize(msgs: &[Msg]) -> String {

@@ -1,7 +1,7 @@
 //! Background daemon: owns sessions, agent runs and MCP connections; any number of TUI clients attach over a unix socket.
 
 use crate::agent::{self, Event, Runtime, Steer, Turn};
-use crate::proto::{Push, Req, Snapshot, Target, socket_path};
+use crate::proto::{AgentBrief, ModelBrief, Overview, Push, RemoteState, Req, SessionBrief, Snapshot, SshInfo, Target, socket_path};
 use crate::session::{self, Session};
 use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc::{UnboundedSender, unbounded_channel}};
+use tokio::sync::{Notify, broadcast, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}};
 
 const BTW_SYSTEM: &str = "Answer the side question using the conversation as context. Be brief. Do not use tools and do not continue the conversation.";
 
@@ -33,12 +33,27 @@ struct Live {
     steer: Steer,
 }
 
-struct Server {
+/// The outbound link to theta-server (see `relay.rs`).
+#[derive(Default)]
+struct RemoteLink {
+    task: Option<(tokio::task::JoinHandle<()>, Arc<Notify>)>,
+    state: RemoteState,
+    url: String,
+    /// Project the browser opens first (the TUI that started the link).
+    cwd: Option<PathBuf>,
+}
+
+pub(crate) struct Server {
     /// Owner of the state shared by every session: auth, http client, MCP connections.
     base: Runtime,
     /// One runtime per project directory (settings, agents and skills differ per project).
     runtimes: Mutex<HashMap<PathBuf, Runtime>>,
     lives: Mutex<HashMap<String, Arc<Live>>>,
+    remote: Mutex<RemoteLink>,
+    /// `Push::Remote` updates for local clients.
+    remote_bus: broadcast::Sender<Push>,
+    /// `Push::Tabs`: a client opened or closed tabs; every other client mirrors it.
+    pub(crate) tabs_bus: broadcast::Sender<Push>,
 }
 
 pub async fn serve() -> Result<()> {
@@ -60,7 +75,14 @@ pub async fn serve() -> Result<()> {
     let base = crate::build_runtime(std::env::current_dir()?).await?;
     let mcp = base.mcp.clone();
     tokio::spawn(async move { mcp.connect_all().await });
-    let srv = Arc::new(Server { runtimes: Mutex::new(HashMap::from([(base.cwd.clone(), base.clone())])), base, lives: Default::default() });
+    let srv = Arc::new(Server {
+        runtimes: Mutex::new(HashMap::from([(base.cwd.clone(), base.clone())])),
+        base,
+        lives: Default::default(),
+        remote: Default::default(),
+        remote_bus: broadcast::channel(16).0,
+        tabs_bus: broadcast::channel(64).0,
+    });
     let (quit_tx, mut quit_rx) = unbounded_channel::<()>();
     loop {
         tokio::select! {
@@ -139,6 +161,7 @@ impl Server {
         rt.read_cache = Default::default();
         rt.asks = Default::default();
         rt.jobs = Default::default();
+        rt.ssh = Default::default();
         let jobs_sink = bus.clone();
         rt.jobs.on_change(move |l| {
             let _ = jobs_sink.send(Push::Jobs(l));
@@ -180,11 +203,45 @@ impl Server {
                 }
             }
         });
-        let mut lines = BufReader::new(rd).lines();
+        let (req_tx, reqs) = unbounded_channel::<Req>();
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(rd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(req) = serde_json::from_str::<Req>(&line) else { continue };
+                if req_tx.send(req).is_err() {
+                    break;
+                }
+            }
+        });
+        self.run_connection(reqs, out, Some(quit)).await;
+        reader.abort();
+        writer.abort();
+    }
+
+    /// Serves one client: a local socket (`quit` set, may control the daemon and the remote link) or a
+    /// virtual channel of the relay (`quit` unset, already filtered by `relay::allowed`).
+    pub(crate) async fn run_connection(self: Arc<Self>, mut reqs: UnboundedReceiver<Req>, out: UnboundedSender<Push>, quit: Option<UnboundedSender<()>>) {
+        let local = quit.is_some();
+        // Local clients get link and tab changes; relayed channels get tabs once, from the relay itself.
+        let mut remote_fwd = local.then(|| {
+            let (mut remote_rx, mut tabs_rx) = (self.remote_bus.subscribe(), self.tabs_bus.subscribe());
+            let out = out.clone();
+            tokio::spawn(async move {
+                loop {
+                    let p = tokio::select! {
+                        Ok(p) = remote_rx.recv() => p,
+                        Ok(p) = tabs_rx.recv() => p,
+                        else => break,
+                    };
+                    if out.send(p).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         let mut current: Option<Arc<Live>> = None;
         let mut forward: Option<tokio::task::JoinHandle<()>> = None;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(req) = serde_json::from_str::<Req>(&line) else { continue };
+        while let Some(req) = reqs.recv().await {
             match req {
                 Req::Attach { target, cwd, agent, model } => {
                     if let Some(f) = forward.take() {
@@ -201,7 +258,15 @@ impl Server {
                     }
                 }
                 Req::Reload => self.reload().await,
-                Req::SaveTabs { cwd, open } => update_tabs(&cwd, |t| t.open = open),
+                Req::SaveTabs { cwd, open } => {
+                    let mut before = Vec::new();
+                    update_tabs(&cwd, |t| before = std::mem::replace(&mut t.open, open.clone()));
+                    let opened: Vec<String> = open.iter().filter(|i| !before.contains(i)).cloned().collect();
+                    let closed: Vec<String> = before.into_iter().filter(|i| !open.contains(i)).collect();
+                    if !opened.is_empty() || !closed.is_empty() {
+                        let _ = self.tabs_bus.send(Push::Tabs { cwd, opened, closed });
+                    }
+                }
                 Req::Seen => {
                     if let Some(live) = &current {
                         let (cwd, id) = {
@@ -227,7 +292,33 @@ impl Server {
                     let _ = out.send(Push::Busy(busy));
                 }
                 Req::Shutdown => {
-                    let _ = quit.send(());
+                    if let Some(q) = &quit {
+                        let _ = q.send(());
+                    }
+                }
+                Req::Overview { cwd } => {
+                    let (srv, out) = (self.clone(), out.clone());
+                    tokio::spawn(async move {
+                        let _ = out.send(match srv.overview(cwd).await {
+                            Ok(o) => Push::Overview(Box::new(o)),
+                            Err(e) => Push::Err(format!("{e:#}")),
+                        });
+                    });
+                }
+                Req::Ssh(_) | Req::Cd(_) | Req::Ls(_) if !local => {
+                    let _ = out.send(Push::Err("not allowed remotely".into()));
+                }
+                Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus if !local => {
+                    let _ = out.send(Push::Err("not allowed remotely".into()));
+                }
+                Req::RemoteStart { cwd } => self.remote_start(cwd),
+                Req::RemoteStop => self.remote_stop(),
+                Req::RemoteStatus => {
+                    let (state, url) = {
+                        let r = self.remote.lock().unwrap();
+                        (r.state.clone(), r.url.clone())
+                    };
+                    let _ = out.send(Push::Remote { state, url });
                 }
                 req => match &current {
                     Some(live) => handle(live, req, &out),
@@ -240,7 +331,81 @@ impl Server {
         if let Some(f) = forward {
             f.abort();
         }
-        writer.abort();
+        if let Some(f) = remote_fwd.take() {
+            f.abort();
+        }
+    }
+
+    async fn overview(&self, cwd: Option<PathBuf>) -> Result<Overview> {
+        let cwd = cwd.or_else(|| self.remote.lock().unwrap().cwd.clone()).unwrap_or_else(|| self.base.cwd.clone());
+        let rt = self.runtime_for(&cwd).await?;
+        let running: Vec<String> = self.lives.lock().unwrap().iter().filter(|(_, l)| l.st.lock().unwrap().run.is_some()).map(|(id, _)| id.clone()).collect();
+        let dir = cwd.clone();
+        let (sessions, projects, open) = tokio::task::spawn_blocking(move || (session::list(&dir), session::projects(), session::load_tabs(&dir).open)).await?;
+        let sessions = sessions
+            .into_iter()
+            .map(|i| {
+                let id = i.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                SessionBrief { running: running.contains(&id), id, title: i.title, updated: i.updated, messages: i.messages }
+            })
+            .collect();
+        let agents = rt.agents.iter().map(|a| AgentBrief { name: a.name.clone(), description: a.description.clone(), scope: a.scope.label().into() }).collect();
+        let mut models = Vec::new();
+        for p in rt.catalog.providers.iter() {
+            let local = p.env.is_empty() && p.oauth.is_none();
+            if rt.auth.status(p).await.is_none() && !(local && !p.models.is_empty()) {
+                continue;
+            }
+            models.extend(rt.catalog.models_of(p).into_iter().map(|m| ModelBrief { key: m.key(), provider: p.name.clone(), context: m.context, reasoning: m.reasoning }));
+        }
+        let efforts = ["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec();
+        Ok(Overview { cwd, version: crate::update::VERSION.into(), open, projects, sessions, agents, models, efforts })
+    }
+
+    /// Records the link state and tells the local clients.
+    pub(crate) fn set_remote(&self, state: RemoteState) {
+        let url = {
+            let mut r = self.remote.lock().unwrap();
+            if r.state == state {
+                return;
+            }
+            r.state = state.clone();
+            r.url.clone()
+        };
+        let _ = self.remote_bus.send(Push::Remote { state, url });
+    }
+
+    fn remote_start(self: &Arc<Self>, cwd: PathBuf) {
+        let mut r = self.remote.lock().unwrap();
+        r.cwd = Some(cwd);
+        if r.task.as_ref().is_some_and(|(h, _)| !h.is_finished()) {
+            let _ = self.remote_bus.send(Push::Remote { state: r.state.clone(), url: r.url.clone() });
+            return;
+        }
+        let url = std::env::var("THETA_REMOTE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .or_else(|| config::load(&self.base.project).ok().map(|s| s.remote.url))
+            .unwrap_or_else(|| config::RemoteSettings::default().url);
+        r.url = url.clone();
+        r.state = RemoteState::Connecting;
+        let _ = self.remote_bus.send(Push::Remote { state: RemoteState::Connecting, url: url.clone() });
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(crate::relay::run(self.clone(), url, stop.clone()));
+        r.task = Some((task, stop));
+    }
+
+    fn remote_stop(&self) {
+        let task = self.remote.lock().unwrap().task.take();
+        if let Some((handle, stop)) = task {
+            stop.notify_one();
+            // The task says goodbye to the server and exits; do not wait on a stuck socket.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                handle.abort();
+            });
+        }
+        self.set_remote(RemoteState::Off);
     }
 }
 
@@ -274,6 +439,7 @@ fn subscribe(live: &Arc<Live>, out: &UnboundedSender<Push>) -> tokio::task::Join
         replay: st.replay.clone(),
         todos: st.rt.todos.lock().unwrap().clone(),
         jobs: st.rt.jobs.list(),
+        ssh: st.rt.ssh.get().map(|h| SshInfo { host: h.name.clone(), cwd: h.cwd() }),
     };
     drop(s);
     let _ = out.send(Push::Snapshot(Box::new(snap)));
@@ -341,6 +507,34 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
         }
         Req::Interrupt => interrupt(live),
+        Req::Ssh(args) => ssh_connect(live, args, out),
+        Req::Cd(path) | Req::Ls(path) if live.st.lock().unwrap().rt.ssh.get().is_none() => {
+            let _ = path;
+            err("not connected over ssh; use /ssh <host> first");
+        }
+        Req::Cd(path) => {
+            let (live, out) = (live.clone(), out.clone());
+            tokio::spawn(async move {
+                let Some(h) = live.st.lock().unwrap().rt.ssh.get() else { return };
+                match h.cd(&path).await {
+                    Ok(cwd) => {
+                        let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd })));
+                        let _ = out.send(dir_push(&h).await);
+                    }
+                    Err(e) => {
+                        let _ = out.send(Push::Err(format!("{e:#}")));
+                    }
+                }
+            });
+        }
+        Req::Ls(_) => {
+            let (out, host) = (out.clone(), live.st.lock().unwrap().rt.ssh.get());
+            if let Some(h) = host {
+                tokio::spawn(async move {
+                    let _ = out.send(dir_push(&h).await);
+                });
+            }
+        }
         Req::Answer { id, text } => {
             let mut st = live.st.lock().unwrap();
             let sender = st.rt.asks.lock().unwrap().remove(&id);
@@ -414,6 +608,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
+        Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
     }
 }
 
@@ -578,6 +773,60 @@ fn after_run(live: &Arc<Live>, st: &mut State) {
         if live.session.lock().unwrap().add_msg(Msg::user(text), None).is_ok() {
             let _ = live.bus.send(Push::Event(Event::User(text.into())));
             launch_turn(live, st);
+        }
+    }
+}
+
+/// What the `/cd` explorer shows: the host's working directory.
+async fn dir_push(h: &crate::ssh::Host) -> Push {
+    let o = h.call("ls", &serde_json::json!({})).await;
+    if o.is_error {
+        return Push::Err(o.content);
+    }
+    // `ls` prints "(empty)" and "[N more entries]" markers: not names.
+    let entries = o.content.lines().filter(|l| !l.starts_with('[') && *l != "(empty)").map(String::from).collect();
+    Push::Dir { cwd: h.cwd(), entries }
+}
+
+/// `/ssh`: connect the session's tools to a host, report the state, or go back to local.
+fn ssh_connect(live: &Arc<Live>, args: String, out: &UnboundedSender<Push>) {
+    let slot = live.st.lock().unwrap().rt.ssh.clone();
+    let args = args.trim().to_string();
+    match args.as_str() {
+        "" => {
+            let _ = out.send(Push::Notice(match slot.get() {
+                Some(h) => format!("ssh: {} ({}) in {}\n/cd to browse, /ssh off to leave", h.name, h.info, h.cwd()),
+                None => "ssh: not connected. /ssh <ssh arguments>, e.g. /ssh user@host or /ssh my-alias".into(),
+            }));
+        }
+        "off" | "stop" => {
+            slot.set(None);
+            let _ = live.bus.send(Push::Ssh(None));
+            let _ = live.bus.send(Push::Notice("ssh: tools run on this machine again".into()));
+        }
+        _ => {
+            let (live, out) = (live.clone(), out.clone());
+            tokio::spawn(async move {
+                let _ = live.bus.send(Push::Notice(format!("ssh: connecting to {args}…")));
+                let (s, bus) = (slot.clone(), live.bus.clone());
+                let on_close = move || {
+                    if crate::ssh::closed(&s) {
+                        let _ = bus.send(Push::Ssh(None));
+                        let _ = bus.send(Push::Err("ssh connection lost; tools run on this machine again. Reconnect with /ssh".into()));
+                    }
+                };
+                match crate::ssh::connect(&crate::ssh::split(&args), on_close).await {
+                    Ok(h) => {
+                        let h = Arc::new(h);
+                        slot.set(Some(h.clone()));
+                        let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd: h.cwd() })));
+                        let _ = live.bus.send(Push::Notice(format!("ssh: connected to {} ({}), in {}\nread, write, edit, ls, find, grep and bash now run there. /cd to browse, /ssh off to leave.", h.name, h.info, h.cwd())));
+                    }
+                    Err(e) => {
+                        let _ = out.send(Push::Err(format!("ssh: {e:#}")));
+                    }
+                }
+            });
         }
     }
 }

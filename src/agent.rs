@@ -71,6 +71,7 @@ pub struct Runtime {
     pub read_cache: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     pub asks: Asks,
     pub jobs: crate::jobs::Jobs,
+    pub ssh: crate::ssh::Slot,
 }
 
 /// What one run needs: who answers, with which model, and which tools.
@@ -110,6 +111,7 @@ impl Runtime {
             read_cache: self.read_cache.clone(),
             session_id: session_id.to_string(),
             jobs: self.jobs.clone(),
+            ssh: self.ssh.clone(),
         }
     }
 
@@ -122,7 +124,8 @@ impl Runtime {
         defs.retain(|d| !self.settings.tools.disabled.contains(&d.name));
         match &agent.tools {
             Some(allow) => defs.retain(|d| allow.iter().any(|a| allows(a, &d.name))),
-            None => defs.retain(|d| !matches!(d.name.as_str(), "handoff" | "list_agents")), // opt-in: only agents that list it
+            // No list: the lean default set. Opt-in tools and, for subagents, MCP tools (their schemas are costly) need an explicit `tools:` entry.
+            None => defs.retain(|d| !tools::OPT_IN.contains(&d.name.as_str()) && !(depth > 0 && d.name.starts_with("mcp__"))),
         }
         if depth > 0 {
             defs.retain(|d| !matches!(d.name.as_str(), "todo" | "ask" | "handoff" | "list_agents")); // the todo panel and the user belong to the main agent
@@ -142,7 +145,11 @@ impl Runtime {
 
 /// Does an `tools:` entry allow tool `name`? Exact, `prefix*`, or an MCP server name (`mcp__github`).
 fn allows(entry: &str, name: &str) -> bool {
-    let (e, n) = (entry.to_lowercase(), name.to_lowercase());
+    let mut e = entry.to_lowercase();
+    if matches!(e.as_str(), "jobs" | "wait" | "job_output" | "job_kill") {
+        e = "job".into(); // the four job tools were merged into `job`
+    }
+    let n = name.to_lowercase();
     e == n || e.strip_suffix('*').is_some_and(|p| n.starts_with(p)) || (e.starts_with("mcp__") && n.starts_with(&format!("{e}__")))
 }
 
@@ -197,10 +204,25 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
     !texts.is_empty()
 }
 
+/// Appended to every subagent's system prompt: the orchestrator reads nothing but the last message.
+/// Hard cap (chars) on a subagent report; reviewers get room for a defect list.
+const REPORT_CAP: usize = 2000;
+
+const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters, terse: what you did, files touched (path:line), verification (command and result), open issues. Never paste code or logs. A reviewer lists each defect on one line as `path:line problem`.";
+
 /// Run until the model answers without tool calls. Appends everything to `session`.
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
-    let system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills));
+    let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
+    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra));
+    if turn.depth > 0 {
+        system.push_str("\n\n");
+        system.push_str(REPORT_RULE);
+    }
+    if let Some(h) = rt.ssh.get() {
+        system.push_str("\n\n");
+        system.push_str(&crate::ssh::prompt_note(&h));
+    }
     let tools = rt.tools_for(&turn.agent, turn.depth);
     let session_id = session.lock().unwrap().id.clone();
     let ctx = rt.tool_ctx(&session_id);
@@ -250,6 +272,25 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
                 continue;
             }
+            // Background subagents still running: sleep until one ends, then read its report (main agent only).
+            if turn.depth == 0 {
+                let mut woke = false;
+                while rt.jobs.running_agents() > 0 {
+                    let start = rt.jobs.ended_count();
+                    // Short ticks: a message the user sends meanwhile is read at once, not at the next job end.
+                    tokio::select! {
+                        _ = rt.jobs.wait_since(false, start) => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                    }
+                    if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
+                        woke = true;
+                        break;
+                    }
+                }
+                if woke {
+                    continue;
+                }
+            }
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
             if turn.depth == 0 && turn.agent.delegate_all && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
                 nudges += 1;
@@ -265,10 +306,13 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             break;
         }
         let futs = calls.into_iter().map(|(id, name, args)| {
-            let (rt, ctx, tx, turn) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone());
+            let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
+                    let pending = || !steer.lock().unwrap().is_empty();
+                    tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
+                } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
                     background_subagent(&rt, &turn, &id, &args, &tx)
                 } else if name == "task" {
                     subagent(&rt, &turn, &id, &args, &tx, None).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
@@ -351,7 +395,7 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
             }
         })
     });
-    tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use job_output to look at it, job_kill to stop it."))
+    tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use `job` (output, kill) to look at it or stop it."))
 }
 
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
@@ -372,10 +416,27 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         .filter(|_| named)
         .or_else(|| parent.agent.subagent_model.clone())
         .unwrap_or(rt.task_model("subagent", &parent.model).await);
-    let effort = agents::effort_of(&agent, &rt.settings).filter(|_| named).unwrap_or_else(|| parent.effort.clone());
-    let mut s = Session::new(&rt.cwd);
-    s.path = crate::config::home().join("cache/subagents").join(format!("{}.jsonl", s.id));
+    // named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
+    let effort = agents::effort_of(&agent, &rt.settings)
+        .filter(|_| named)
+        .or_else(|| parent.agent.subagent_effort.clone())
+        .or_else(|| Some(rt.settings.models.subagent_effort.clone()).filter(|e| !e.is_empty()))
+        .unwrap_or_else(|| parent.effort.clone());
+    let dir = crate::config::home().join("cache/subagents");
+    let mut s = match args.get("resume").and_then(|v| v.as_str()) {
+        // Only transcripts of this cache: the stem of the given path or id, never an arbitrary file.
+        Some(r) => {
+            let stem = std::path::Path::new(r).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            Session::open(&dir.join(format!("{stem}.jsonl"))).with_context(|| format!("no subagent transcript `{r}`"))?
+        }
+        None => {
+            let mut s = Session::new(&rt.cwd);
+            s.path = dir.join(format!("{}.jsonl", s.id));
+            s
+        }
+    };
     s.add_msg(Msg::user(prompt), None)?;
+    let transcript = s.path.display().to_string();
     let session = Arc::new(Mutex::new(s));
     let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel();
     let turn = Turn { agent, model, effort, depth: parent.depth + 1 };
@@ -397,7 +458,13 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let _ = forward.await;
     res?;
     let answer = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
-    Ok(tools::ToolOut::ok(if answer.is_empty() { "(subagent returned no text)".into() } else { answer }))
+    // The 600-char rule is only a prompt: cap what actually enters the orchestrator's context.
+    let answer = match answer.char_indices().nth(REPORT_CAP) {
+        _ if answer.is_empty() => "(subagent returned no text)".into(),
+        Some((i, _)) => format!("{}… [report cut, see transcript]", &answer[..i]),
+        None => answer,
+    };
+    Ok(tools::ToolOut::ok(format!("{answer}\n[transcript: {transcript}]")))
 }
 
 /// Name the session from its first exchange using the title model.
@@ -419,6 +486,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn old_job_tool_names_allow_job() {
+        assert!(allows("wait", "job") && allows("job_output", "job") && !allows("wait", "bash"));
+    }
+
+    #[tokio::test]
+    async fn default_tool_set_is_lean() {
+        let rt = test_rt().await;
+        let build = agents::discover(std::path::Path::new("/nonexistent")).remove(0);
+        let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
+        assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
+        assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
+    }
 
     #[test]
     fn repairs_dangling_calls() {
@@ -447,6 +528,7 @@ mod tests {
             read_cache: Default::default(),
             asks: Default::default(),
             jobs: Default::default(),
+            ssh: Default::default(),
         }
     }
 

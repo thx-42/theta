@@ -51,6 +51,7 @@ pub struct Settings {
     pub compaction: Compaction,
     pub tools: ToolSettings,
     pub web: WebSettings,
+    pub remote: RemoteSettings,
     pub skills: SkillSettings,
     /// MCP servers, keyed by name (`[mcp.<name>]`)
     pub mcp: BTreeMap<String, McpServer>,
@@ -74,6 +75,7 @@ impl Default for Settings {
             compaction: Compaction::default(),
             tools: ToolSettings::default(),
             web: WebSettings::default(),
+            remote: RemoteSettings::default(),
             skills: SkillSettings::default(),
             mcp: BTreeMap::new(),
             providers: BTreeMap::new(),
@@ -117,6 +119,8 @@ pub struct TaskModels {
     pub compaction: String,
     pub title: String,
     pub subagent: String,
+    /// Reasoning effort of subagents; empty = the spawning agent's effort
+    pub subagent_effort: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,11 +131,13 @@ pub struct Compaction {
     pub threshold: f64,
     /// Recent tokens kept verbatim after compaction.
     pub keep_recent_tokens: u64,
+    /// Absolute ceiling (tokens) for the trigger, so huge windows do not grow unbounded; 0 = none.
+    pub max_tokens: u64,
 }
 
 impl Default for Compaction {
     fn default() -> Self {
-        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000 }
+        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000, max_tokens: 150_000 }
     }
 }
 
@@ -150,7 +156,7 @@ pub struct ToolSettings {
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 400, disabled: vec![] }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![] }
     }
 }
 
@@ -172,11 +178,19 @@ impl Default for McpServer {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillSettings {
     /// Skills injected into every system prompt (also: `auto: true` in the skill file).
     pub auto: Vec<String>,
+    /// Skills injected into every subagent's system prompt, on top of `auto` (absent skills are ignored).
+    pub subagent: Vec<String>,
+}
+
+impl Default for SkillSettings {
+    fn default() -> Self {
+        Self { auto: vec![], subagent: vec!["caveman".into(), "ponytail".into()] }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,6 +203,19 @@ pub struct WebSettings {
 impl Default for WebSettings {
     fn default() -> Self {
         WebSettings { backend: "exa".into() }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    /// theta-server base URL used by `/remote`. `THETA_REMOTE_URL` overrides it.
+    pub url: String,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        RemoteSettings { url: "https://theta.sputnk.net".into() }
     }
 }
 
@@ -265,6 +292,11 @@ pub fn bootstrap() -> Result<()> {
     if !soul.exists() {
         std::fs::write(&soul, crate::agents::DEFAULT_SOUL)?;
     }
+    // Per-agent SOUL: written once, never overwritten (yours to edit).
+    let auto_soul = h.join("SOUL.Auto.md");
+    if !auto_soul.exists() {
+        std::fs::write(&auto_soul, crate::agents::DEFAULT_AUTO_SOUL)?;
+    }
     sync_agents(&h.join("agents"));
     let settings = global_settings_path();
     if !settings.exists() {
@@ -334,6 +366,7 @@ agent = "Build"
 compaction = "anthropic/claude-haiku-5-5"
 title = "anthropic/claude-haiku-5-5"
 subagent = ""
+subagent_effort = ""                   # "" = effort of the spawning agent
 
 # Model and effort per agent (override the agent file's model/effort; CLI flags still win)
 # [agents.Build]
@@ -347,16 +380,18 @@ subagent = ""
 enabled = true
 threshold = 0.8
 keep_recent_tokens = 20000
+max_tokens = 150000      # compact at the lower of threshold x window and this; 0 = no ceiling
 
 [tools]
 rtk = "auto"             # route shell commands through rtk when installed
 bash_timeout = 120
-max_lines = 400
+max_lines = 300
 disabled = []
 
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
 [skills]
 auto = []                # always injected, e.g. ["caveman", "ponytail"]
+subagent = ["caveman", "ponytail"]   # also injected into every subagent (token-lean reports)
 
 # MCP servers: `command` (stdio) or `url` (HTTP, `/mcp login <name>` for OAuth). Tools appear as mcp__<name>__<tool>.
 # [mcp.fs]
@@ -379,6 +414,10 @@ auto = []                # always injected, e.g. ["caveman", "ponytail"]
 
 [web]
 backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo
+
+# Server behind `/remote` (browser control). THETA_REMOTE_URL overrides it.
+# [remote]
+# url = "https://theta.sputnk.net"
 
 # Custom OpenAI-compatible provider:
 # [providers.local]
