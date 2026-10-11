@@ -20,6 +20,7 @@ use crate::App;
 use anyhow::Result;
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -485,6 +486,10 @@ struct Ui {
     sidebar: Rect,
     /// Live sidebar width while dragging its divider; saved on release.
     drag: Option<u16>,
+    /// Mouse text selection: anchor and cursor as screen (col, row).
+    sel: Option<((u16, u16), (u16, u16))>,
+    /// Last drawn frame, read to copy the selected text.
+    frame: Buffer,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -2605,11 +2610,13 @@ fn normalize_paste(s: &str) -> String {
 fn clipboard(text: &str) -> bool {
     let cmds: &[&[&str]] = if cfg!(target_os = "macos") { &[&["pbcopy"]] } else { &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "-b", "-i"]] };
     for c in cmds {
-        if let Ok(mut child) = std::process::Command::new(c[0]).args(&c[1..]).stdin(std::process::Stdio::piped()).spawn() {
+        // stderr silenced: xclip's "Can't open display" would print over the TUI and stick
+        if let Ok(mut child) = std::process::Command::new(c[0]).args(&c[1..]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
             use std::io::Write;
             let _ = child.stdin.take().map(|mut s| s.write_all(text.as_bytes()));
-            let _ = child.wait();
-            return true;
+            if child.wait().is_ok_and(|s| s.success()) {
+                return true;
+            }
         }
     }
     false
@@ -2936,6 +2943,59 @@ impl Ui {
         }
     }
 
+    fn sel_start(&mut self, col: u16, row: u16) {
+        self.sel = Some(((col, row), (col, row)));
+    }
+
+    fn sel_drag(&mut self, col: u16, row: u16) {
+        if let Some((_, end)) = &mut self.sel {
+            *end = (col, row);
+        }
+    }
+
+    /// Selected cells in reading order, empty when nothing was dragged.
+    fn sel_range(&self) -> Option<((u16, u16), (u16, u16))> {
+        let (a, b) = self.sel?;
+        let (s, e) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+        (s != e).then_some((s, e))
+    }
+
+    /// Mouse release: copy the selection to the clipboard via OSC 52 (the local terminal's clipboard, also over SSH).
+    fn sel_end(&mut self) {
+        let Some(text) = self.sel_text() else { return };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+        let mut out = std::io::stdout();
+        let _ = std::io::Write::write_all(&mut out, format!("\x1b]52;c;{b64}\x07").as_bytes());
+        let _ = std::io::Write::flush(&mut out);
+    }
+
+    fn sel_text(&self) -> Option<String> {
+        let (s, e) = self.sel_range()?;
+        let width = self.frame.area.width;
+        let lines = (s.1..=e.1).map(|row| {
+            let x0 = if row == s.1 { s.0 } else { 0 };
+            let x1 = if row == e.1 { e.0 } else { width.saturating_sub(1) };
+            let line: String = (x0..=x1).map(|x| self.frame.cell((x, row)).map_or(" ", |c| c.symbol())).collect();
+            line.trim_end().to_string()
+        });
+        Some(lines.collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Reverse the selected cells so the selection shows.
+    fn sel_highlight(&self, buf: &mut Buffer) {
+        let Some((s, e)) = self.sel_range() else { return };
+        let width = buf.area.width;
+        for row in s.1..=e.1 {
+            let x0 = if row == s.1 { s.0 } else { 0 };
+            let x1 = if row == e.1 { e.0 } else { width.saturating_sub(1) };
+            for x in x0..=x1 {
+                if let Some(c) = buf.cell_mut((x, row)) {
+                    c.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+
     /// Mouse on the tab strip: × closes, the title switches, + opens a new session.
     fn on_click(&mut self, col: u16, row: u16) {
         if self.overlay.is_some() {
@@ -3162,6 +3222,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         strip: tabs::Strip::default(),
         sidebar: Rect::default(),
         drag: None,
+        sel: None,
+        frame: Buffer::default(),
     };
     ui.forward(0, pushes);
     let first = snap.session_id.clone();
@@ -3180,7 +3242,11 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         ui.send(p, vec![]);
     }
     loop {
-        term.draw(|f| ui.draw(f))?;
+        let done = term.draw(|f| {
+            ui.draw(f);
+            ui.sel_highlight(f.buffer_mut());
+        })?;
+        ui.frame = done.buffer.clone();
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(CEvent::Key(k))) => ui.on_key(k),
@@ -3201,8 +3267,13 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                     MouseEventKind::ScrollDown => ui.scroll(3),
                     MouseEventKind::Down(MouseButton::Left) if ui.on_divider(m.column, m.row) => ui.drag = Some(ui.sidebar.width),
                     MouseEventKind::Drag(MouseButton::Left) if ui.drag.is_some() => ui.drag = Some(m.column.saturating_sub(ui.sidebar.x) + 1),
+                    MouseEventKind::Drag(MouseButton::Left) => ui.sel_drag(m.column, m.row),
                     MouseEventKind::Up(MouseButton::Left) if ui.drag.is_some() => ui.end_drag(),
-                    MouseEventKind::Down(MouseButton::Left) => ui.on_click(m.column, m.row),
+                    MouseEventKind::Up(MouseButton::Left) => ui.sel_end(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        ui.sel_start(m.column, m.row);
+                        ui.on_click(m.column, m.row);
+                    }
                     _ => {}
                 },
                 Some(Ok(CEvent::Resize(..))) => ui.invalidate_all(),
