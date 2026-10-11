@@ -21,7 +21,7 @@ use anyhow::Result;
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -2093,7 +2093,7 @@ impl Ui {
         let width = area.width as usize;
         let (input_lines, cursor) = self.input.layout(width.saturating_sub(2));
         let chips = u16::from(!self.images.is_empty());
-        let input_h = input_lines.len().min(8) as u16 + chips;
+        let input_h = input_lines.len().min(8) as u16 + chips + 2;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, input_area, status] = Layout::vertical([
@@ -2153,7 +2153,9 @@ impl Ui {
                 }
                 let tok = self.out_tokens + self.stream_chars as u64 / 4;
                 let tok = if tok >= 1000 { format!("{:.1}k", tok as f64 / 1000.0) } else { tok.to_string() };
-                spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · esc to interrupt)  "), theme::dim()));
+                spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · "), theme::dim()));
+                spans.push(Span::styled("esc", Style::default().fg(Color::White)));
+                spans.push(Span::styled(" to interrupt)  ", theme::dim()));
                 spans.extend(self.counts.spans());
                 if !matches!(self.status.as_str(), "thinking" | "writing") && !self.status.starts_with("compacting") && !self.status.starts_with("waiting") {
                     let st: String = self.status.chars().take(width / 3).collect();
@@ -2169,7 +2171,10 @@ impl Ui {
         }
 
         // input
-        let inner = input_area;
+        // Lighter band with one blank row above and below the text.
+        let band = Style::default().bg(Color::Indexed(237));
+        f.render_widget(UiBlock::default().style(band), input_area);
+        let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
         let skip = cursor.0.saturating_sub(7);
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
@@ -2184,7 +2189,7 @@ impl Ui {
         if self.input.text.is_empty() && self.images.is_empty() {
             il = vec![Line::from(vec![Span::styled("› ", theme::accent()), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
         }
-        f.render_widget(Paragraph::new(il), inner);
+        f.render_widget(Paragraph::new(il).style(band), inner);
         if self.overlay.is_none() {
             f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + chips + (cursor.0 - skip) as u16));
         }
@@ -2262,6 +2267,7 @@ impl Ui {
         const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
         let accent = theme::accent();
+        let white = Style::default().fg(Color::White);
         let mut out: Vec<Line<'static>> = LOGO
             .iter()
             .enumerate()
@@ -2290,13 +2296,13 @@ impl Ui {
         }
         out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
         out.push(Line::from(vec![
-            Span::styled("  /help", accent),
+            Span::styled("  /help", white),
             Span::styled(" commands  ·  ", theme::dim()),
-            Span::styled("tab", accent),
+            Span::styled("tab", white),
             Span::styled(" agent  ·  ", theme::dim()),
-            Span::styled("ctrl+p", accent),
+            Span::styled("ctrl+p", white),
             Span::styled(" model  ·  ", theme::dim()),
-            Span::styled("ctrl+t", accent),
+            Span::styled("ctrl+t", white),
             Span::styled(" tree", theme::dim()),
         ]));
         let mut top = vec![Line::default(); h.saturating_sub(out.len()) / 2];
@@ -2455,12 +2461,12 @@ impl Ui {
                     ("pgup pgdn shift+↑↓ wheel", "scroll"),
                     ("ctrl+c ×2 / ctrl+d", "quit"),
                 ] {
-                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), theme::accent()), Span::raw(d)]));
+                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), Style::default().fg(Color::White)), Span::styled(d, theme::dim())]));
                 }
                 l.push(Line::default());
                 l.push(Line::from(Span::styled("Commands", theme::accent().add_modifier(Modifier::BOLD))));
                 for (c, d) in COMMANDS {
-                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), theme::accent()), Span::raw(*d)]));
+                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())]));
                 }
                 f.render_widget(Paragraph::new(l).block(block("θ help")), r);
             }
@@ -2535,9 +2541,22 @@ impl Ui {
     }
 }
 
-/// Key hint drawn as the last line of an overlay body, dimmed.
+/// Key hint drawn as the last line of an overlay body: each "key rest" segment has the key in white, the rest dimmed.
 fn hint(keys: &'static str) -> Line<'static> {
-    Line::from(Span::styled(keys, theme::dim()))
+    let mut spans = Vec::new();
+    for (i, seg) in keys.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", theme::dim()));
+        }
+        let (lead, body) = seg.split_at(seg.len() - seg.trim_start().len());
+        let (key, rest) = body.split_once(' ').map_or((body, ""), |(k, r)| (k, r));
+        spans.push(Span::raw(lead));
+        spans.push(Span::styled(key.to_string(), Style::default().fg(Color::White)));
+        if !rest.is_empty() {
+            spans.push(Span::styled(format!(" {rest}"), theme::dim()));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Rows `text` takes when wrapped at `width` (approximate: by display width, per line).
