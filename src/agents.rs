@@ -167,6 +167,13 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) ->
     if let Some(s) = read(&project.join(".theta/SOUL.md")) {
         parts.push(s);
     }
+    // Per-agent SOUL: SOUL.<Agent>.md, global then project.
+    let own = format!("SOUL.{}.md", agent.name);
+    for p in [config::home().join(&own), project.join(".theta").join(&own)] {
+        if let Some(s) = read(&p) {
+            parts.push(s);
+        }
+    }
     parts.push(agent.prompt.clone());
     if !skills.is_empty() {
         parts.push(skills.to_string());
@@ -258,7 +265,7 @@ name: Auto
 description: Autonomous orchestrator — plans with the user, then runs Build and Plan subagents end to end until the task is done and verified
 can: read and search code, search the web, ask the user, keep a todo list, delegate to Build (write) and Plan (review) subagents
 cannot: edit project files or run shell commands itself
-tools: read, grep, find, ls, todo, write_plan, web_search, web_fetch, ask, task, list_agents, job_output, job_kill
+tools: read, grep, find, ls, todo, write_plan, web_search, web_fetch, ask, task, list_agents, jobs, wait, job_output, job_kill
 delegate: all
 ---
 You are theta in auto mode. You never write code yourself: you orchestrate subagents. Only you can spawn them; they cannot spawn others.
@@ -270,13 +277,46 @@ Phase 1 — Plan with the user (the only phase where you stop for the user):
 
 Phase 2 — Execute, without stopping:
 Once validated, run the whole plan end to end. Do not stop, summarize or ask for confirmation between steps. Mark todos done as you go.
-- Build: call `task` with agent `Build` and a full, self-contained prompt (files, approach, what must not change, how to verify). Independent steps can use `background`.
+- Build: call `task` with agent `Build` and a full, self-contained prompt (files, approach, what must not change, how to verify). Independent steps use `background`, then `wait`. Follow your SOUL.Auto.md for prompts, reports and waiting.
 - Review: after each built step, call `task` with agent `Plan` to review the changes and the verification output. Ask for concrete defects only.
 - Fix: send each defect back to a `Build` subagent, then review again. Repeat until clean.
 - Check each report against the code yourself before you trust it.
 - Replan only if reality breaks the plan. Ask the user again only if blocked on a decision that is really theirs.
 
 Phase 3 — Report, only when every todo is done and verified: what changed, what was verified, what is left.
+"#;
+
+/// Shipped as ~/.theta/SOUL.Auto.md; applied to the Auto agent only.
+pub const DEFAULT_AUTO_SOUL: &str = r#"# SOUL — Auto
+You orchestrate; your context window is the scarce resource. Spend it on decisions, not on subagent chatter.
+
+## Writing a subagent prompt
+You write every subagent prompt. The subagent sees nothing else, so make it self-contained and short:
+- Goal in one sentence, then the exact files/symbols, the approach, what must not change.
+- How to verify (command to run, expected result).
+- Report format is imposed by theta (≤ ~600 chars: done, files, verification, open issues). Do not ask for more.
+- Never paste code or logs you can point to by `path:line`.
+- Pick the agent: Build writes, Plan reviews (read-only). Raise `effort` only for hard steps.
+- Subagents already run with rtk and the terse skills (caveman, ponytail). Do not repeat that in prompts.
+
+## Reading reports
+- A report is the whole truth you get by default. It ends with `[transcript: <path>]`.
+- Open the transcript only when the report is vague, contradicts the todo, claims a failure you cannot explain, or you must audit a risky change. Then `grep`/`read` a slice, never the whole file.
+- Check claims cheaply against the code (`grep`, `read` offset/limit) before marking a todo done.
+
+## Running subagents
+- Independent steps (no shared files, no ordering): start them all with `background: true`.
+- Dependent or same-file steps: run them one after the other.
+- `jobs` shows every job and its state. `wait` blocks until a job ends: `mode: any` returns at the first end, `mode: all` when none is left running.
+- Choose the wait mode by situation:
+  - `any` when each result can be reviewed or built upon alone: review the finished step while the others still run, then wait again.
+  - `all` when steps must be judged together (shared interfaces, one integration check, one final verification).
+- Never poll with `job_output` in a loop; `wait` is the only way to wait. Use `job_output` for one specific look at a running job.
+- If you end your turn with background subagents still running, theta wakes you when one ends. Prefer `wait` so you stay in control.
+
+## Your own output
+- Terse. No narration between tool calls. Update `todo` as steps complete.
+- Final report only when every todo is done and verified: what changed, how it was verified, what is left.
 "#;
 
 #[cfg(test)]

@@ -176,11 +176,19 @@ impl Default for McpServer {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillSettings {
     /// Skills injected into every system prompt (also: `auto: true` in the skill file).
     pub auto: Vec<String>,
+    /// Skills injected into every subagent's system prompt, on top of `auto` (absent skills are ignored).
+    pub subagent: Vec<String>,
+}
+
+impl Default for SkillSettings {
+    fn default() -> Self {
+        Self { auto: vec![], subagent: vec!["caveman".into(), "ponytail".into()] }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -282,6 +290,11 @@ pub fn bootstrap() -> Result<()> {
     if !soul.exists() {
         std::fs::write(&soul, crate::agents::DEFAULT_SOUL)?;
     }
+    // Per-agent SOUL: written once, never overwritten (yours to edit).
+    let auto_soul = h.join("SOUL.Auto.md");
+    if !auto_soul.exists() {
+        std::fs::write(&auto_soul, crate::agents::DEFAULT_AUTO_SOUL)?;
+    }
     sync_agents(&h.join("agents"));
     let settings = global_settings_path();
     if !settings.exists() {
@@ -375,6 +388,7 @@ disabled = []
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
 [skills]
 auto = []                # always injected, e.g. ["caveman", "ponytail"]
+subagent = ["caveman", "ponytail"]   # also injected into every subagent (token-lean reports)
 
 # MCP servers: `command` (stdio) or `url` (HTTP, `/mcp login <name>` for OAuth). Tools appear as mcp__<name>__<tool>.
 # [mcp.fs]

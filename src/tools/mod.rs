@@ -87,6 +87,10 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"id":{"type":"string"},"tail":{"type":"integer","description":"only the last N lines"}},"required":["id"]})),
         def("job_kill", "Stop a running background job by id.",
             json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
+        def("jobs", "List every background job (shell, lint, subagent) with its id, state and age.",
+            json!({"type":"object","properties":{}})),
+        def("wait", "Block until background subagents end and return their reports. `mode`: any (default) returns at the first end, all when none is left running. Use it instead of polling job_output.",
+            json!({"type":"object","properties":{"mode":{"type":"string","enum":["any","all"]},"timeout":{"type":"integer","description":"seconds, default 900"}}})),
         def("grep", "Search file contents with a regex (respects .gitignore). Results grouped by file.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern"]})),
         def("find", "Find files by glob pattern (respects .gitignore), e.g. `**/*.rs`.",
@@ -112,7 +116,7 @@ pub fn all_defs() -> Vec<ToolDef> {
 
 pub fn task_def(agents: &[String]) -> ToolDef {
     def("task", &format!("Delegate a self-contained task to a subagent with a fresh context. It returns only its final report, which keeps your context small. Use for broad searches, research, or independent work. Agents: {}.", agents.join(", ")),
-        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"],"description":"Reasoning effort for this subagent; omit to use the configured default"},"background":{"type":"boolean","description":"Return at once with a job id; the report arrives in a later message and you can keep working"}},"required":["description","prompt"]}))
+        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 word label"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"],"description":"Reasoning effort for this subagent; omit to use the configured default"},"background":{"type":"boolean","description":"Return at once with a job id; the report arrives in a later message and you can keep working"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent with its context instead of a fresh one"}},"required":["description","prompt"]}))
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -159,11 +163,18 @@ pub fn truncate_middle(text: &str, max_lines: usize) -> (String, bool) {
     (joined, true)
 }
 
+/// Subagent transcripts live on this machine: reading them must not go to the ssh host.
+fn is_transcript(name: &str, args: &Value, ctx: &ToolCtx) -> bool {
+    matches!(name, "read" | "grep")
+        && s(args, "path").is_some_and(|p| !p.contains("..") && resolve(&ctx.cwd, p).starts_with(crate::config::home().join("cache/subagents")))
+}
+
 pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
     if let Some(bad) = args.get("_invalid_json") {
         return ToolOut::err(format!("invalid JSON arguments: {bad}"));
     }
     if crate::ssh::is_remote_tool(name)
+        && !is_transcript(name, args, ctx)
         && let Some(host) = ctx.ssh.get()
     {
         return host.call(name, args).await;
@@ -179,6 +190,8 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
         "bash" => shell::bash(args, ctx).await,
         "job_output" => job_output(args, ctx),
         "job_kill" => job_kill(args, ctx),
+        "jobs" => Ok(jobs_list(ctx)),
+        "wait" => wait(args, ctx, &|| false).await,
         "todo" => todo(args, ctx),
         "web_search" => web::search(args, ctx).await,
         "web_fetch" => web::fetch(args, ctx).await,
@@ -191,13 +204,58 @@ fn job_output(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
     let id = s(args, "id").ok_or_else(|| anyhow::anyhow!("id required"))?;
     let (text, info) = ctx.jobs.output(id, n(args, "tail").map(|t| t as usize)).ok_or_else(|| anyhow::anyhow!("no job `{id}`"))?;
     let (text, _) = truncate_middle(&text, ctx.settings.tools.max_lines);
-    let state = match info.status {
+    Ok(ToolOut::ok(format!("[{}] {}\n{text}", state_of(info.status), info.label)))
+}
+
+fn state_of(s: crate::jobs::Status) -> String {
+    match s {
         crate::jobs::Status::Running => "running".to_string(),
         crate::jobs::Status::Done(c) => format!("exit {c}"),
         crate::jobs::Status::Killed => "killed".into(),
         crate::jobs::Status::Missing => "absent".into(),
-    };
-    Ok(ToolOut::ok(format!("[{state}] {}\n{text}", info.label)))
+    }
+}
+
+fn jobs_list(ctx: &ToolCtx) -> ToolOut {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let l = ctx.jobs.list();
+    if l.is_empty() {
+        return ToolOut::ok("no jobs");
+    }
+    ToolOut::ok(l.iter().map(|j| format!("{} {:?} [{}] {}s {}", j.id, j.kind, state_of(j.status), j.ended.unwrap_or(now).saturating_sub(j.started), j.label)).collect::<Vec<_>>().join("\n"))
+}
+
+/// `wait`: block on subagent jobs, then hand over the reports of the ones that ended.
+/// `interrupt` is polled while waiting (a user message is pending): the wait ends early.
+pub async fn wait(args: &Value, ctx: &ToolCtx, interrupt: &(dyn Fn() -> bool + Sync)) -> anyhow::Result<ToolOut> {
+    let all = s(args, "mode") == Some("all");
+    let secs = n(args, "timeout").unwrap_or(900).clamp(1, 3600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let start = ctx.jobs.ended_count();
+    let mut why = "";
+    loop {
+        tokio::select! {
+            _ = ctx.jobs.wait_since(all, start) => break,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        if interrupt() {
+            why = "[interrupted: the user sent a message]";
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            why = "[timeout: nothing ended]";
+            break;
+        }
+    }
+    let mut out = ctx.jobs.take_pending().join("\n\n");
+    if out.is_empty() {
+        out = if !why.is_empty() { why.into() } else { "[no report: no subagent running, or it was stopped]".into() };
+    }
+    let running = ctx.jobs.running_agents();
+    if running > 0 {
+        out.push_str(&format!("\n\n[{running} subagent(s) still running; see `jobs`]"));
+    }
+    Ok(ToolOut::ok(out))
 }
 
 fn job_kill(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
@@ -235,5 +293,24 @@ mod tests {
         assert!(out.starts_with("line0\nline1\nline2\nline3\n… [90 lines omitted]"));
         assert!(out.ends_with("line99"));
         assert_eq!(truncate_middle("a\nb", 10), ("a\nb".to_string(), false));
+    }
+
+    #[test]
+    fn transcripts_stay_local_under_ssh() {
+        let ctx = ToolCtx {
+            cwd: PathBuf::from("/proj"),
+            settings: Default::default(),
+            http: reqwest::Client::new(),
+            todos: Default::default(),
+            read_cache: Default::default(),
+            session_id: String::new(),
+            jobs: Default::default(),
+            ssh: Default::default(),
+        };
+        let t = crate::config::home().join("cache/subagents/ab.jsonl").display().to_string();
+        assert!(is_transcript("read", &json!({"path": t}), &ctx));
+        assert!(!is_transcript("write", &json!({"path": t}), &ctx));
+        assert!(!is_transcript("read", &json!({"path": "src/main.rs"}), &ctx));
+        assert!(!is_transcript("read", &json!({"path": format!("{t}/../../../x")}), &ctx));
     }
 }
