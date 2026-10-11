@@ -117,10 +117,12 @@ impl Server {
         for (cwd, mut rt) in all {
             let Ok(settings) = config::load(&rt.project) else { continue };
             rt.settings = Arc::new(settings);
+            rt.agents = Arc::new(crate::agents::discover(&rt.project));
             for live in self.lives.lock().unwrap().values() {
                 let mut st = live.st.lock().unwrap();
                 if st.rt.cwd == cwd {
                     st.rt.settings = rt.settings.clone();
+                    st.rt.agents = rt.agents.clone();
                 }
             }
             self.runtimes.lock().unwrap().insert(cwd, rt);

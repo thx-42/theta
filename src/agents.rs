@@ -102,10 +102,17 @@ pub fn discover(project: &Path) -> Vec<Agent> {
     let mut out = Vec::new();
     load_dir(&config::home().join("agents"), Scope::Global, &mut out);
     load_dir(&project.join(".theta/agents"), Scope::Local, &mut out);
-    if !out.iter().any(|a| a.name.eq_ignore_ascii_case("build")) {
-        out.insert(0, parse(DEFAULT_BUILD, "Build", Scope::Builtin));
-    }
+    ensure_builtins(&mut out);
     out
+}
+
+/// The shipped agents must always exist: re-add any missing one from the binary.
+fn ensure_builtins(out: &mut Vec<Agent>) {
+    for (src, name) in [(DEFAULT_BUILD, "Build"), (DEFAULT_PLAN, "Plan"), (DEFAULT_AUTO, "Auto")] {
+        if !out.iter().any(|a| a.name.eq_ignore_ascii_case(name)) {
+            out.insert(0, parse(src, name, Scope::Builtin));
+        }
+    }
 }
 
 /// One block per agent for the `list_agents` tool: task, can, cannot.
@@ -317,6 +324,17 @@ mod tests {
         let b = parse("plain prompt", "Plain", Scope::Global);
         assert_eq!((b.name.as_str(), b.prompt.as_str()), ("Plain", "plain prompt"));
         assert!(chrono_date().starts_with("20"));
+    }
+
+    #[test]
+    fn missing_builtins_are_restored() {
+        let mut out = vec![parse("---\nname: Plan\n---\nmine", "Plan", Scope::Local)];
+        ensure_builtins(&mut out);
+        let mut names: Vec<_> = out.iter().map(|a| a.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Auto", "Build", "Plan"]);
+        assert_eq!(find(&out, "Plan").unwrap().prompt, "mine");
+        assert_eq!(find(&out, "Auto").unwrap().scope, Scope::Builtin);
     }
 
     #[test]

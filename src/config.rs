@@ -321,8 +321,12 @@ fn sync_agents(dir: &Path) {
     for (name, new) in [("Build", crate::agents::DEFAULT_BUILD), ("Plan", crate::agents::DEFAULT_PLAN), ("Auto", crate::agents::DEFAULT_AUTO)] {
         let (path, new_hash) = (dir.join(format!("{name}.md")), sha256(new.as_bytes()));
         let Ok(cur) = std::fs::read_to_string(&path) else {
-            if std::fs::write(&path, new).is_ok() {
-                shipped.insert(name.into(), new_hash);
+            match std::fs::write(&path, new) {
+                Ok(()) => {
+                    shipped.insert(name.into(), new_hash);
+                    eprintln!("theta: agent {name} missing, restored {}", path.display());
+                }
+                Err(e) => eprintln!("theta: cannot restore agent {name} in {}: {e}", path.display()),
             }
             continue;
         };
