@@ -430,6 +430,8 @@ struct Ui {
     images: Vec<Block>,
     /// First Esc of a double press; the second one within 2s stops the agent.
     esc_at: Option<Instant>,
+    /// Ctrl+x was pressed: the next key is a leader command.
+    leader: bool,
     /// The last run was stopped by the user.
     interrupted: bool,
     /// Tabs being reopened at start; they must not take focus while this counts down.
@@ -1322,7 +1324,28 @@ impl Ui {
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.cmd_sel = 0;
         }
+        // Leader (ctrl+x) then one key: vim-like, no Option/Alt needed.
+        if std::mem::take(&mut self.leader) {
+            match k.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let n = c as usize - '1' as usize;
+                    if n < self.tabs.len() { self.switch_to(n) } else { self.notify(format!("no tab {c}")) }
+                }
+                KeyCode::Char('n') => self.new_tab(),
+                KeyCode::Char('w') => self.close_tab(),
+                KeyCode::Char('b') => self.toggle_tab_bar(),
+                KeyCode::Char('j') => self.open_jobs(),
+                KeyCode::Char('h') => self.step_tab(-1),
+                KeyCode::Char('l') => self.step_tab(1),
+                _ => self.notify("leader: unknown key"),
+            }
+            return;
+        }
         match k.code {
+            KeyCode::Char('x') if ctrl => {
+                self.leader = true;
+                self.notify("leader: n w b j h l 1-9");
+            }
             // Tab keys: alt, because ctrl+tab and ctrl+shift+t belong to terminal emulators such as Warp.
             KeyCode::Char(c @ '1'..='9') if alt => {
                 let n = c as usize - '1' as usize;
@@ -2023,10 +2046,9 @@ impl Ui {
         }
         self.strip = strip;
         let width = area.width as usize;
-        let inner_w = width.saturating_sub(2);
-        let (input_lines, cursor) = self.input.layout(inner_w.saturating_sub(2));
+        let (input_lines, cursor) = self.input.layout(width.saturating_sub(2));
         let chips = u16::from(!self.images.is_empty());
-        let input_h = (input_lines.len().min(8) + 2) as u16 + chips;
+        let input_h = input_lines.len().min(8) as u16 + chips;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, input_area, status] = Layout::vertical([
@@ -2102,10 +2124,7 @@ impl Ui {
         }
 
         // input
-        let border = if self.running { theme::dim() } else { theme::accent() };
-        let block = UiBlock::bordered().border_type(BorderType::Rounded).border_style(border);
-        let inner = block.inner(input_area);
-        f.render_widget(block, input_area);
+        let inner = input_area;
         let skip = cursor.0.saturating_sub(7);
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
@@ -2130,16 +2149,16 @@ impl Ui {
         if self.overlay.is_none() && !m.is_empty() {
             {
                 let sel = self.cmd_sel.min(m.len() - 1);
-                let max = 10.min(input_area.y.saturating_sub(2) as usize).max(1);
+                let max = 10.min(input_area.y as usize).max(1);
                 let start = sel.saturating_sub(max - 1);
-                let h = m.len().min(max) as u16 + 2;
-                let r = Rect { x: input_area.x + 1, y: input_area.y.saturating_sub(h), width: 60.min(area.width.saturating_sub(2)), height: h };
+                let h = m.len().min(max) as u16;
+                let r = Rect { x: input_area.x, y: input_area.y.saturating_sub(h), width: input_area.width, height: h };
                 f.render_widget(Clear, r);
                 let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
-                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(theme::accent())), Span::styled(format!(" {d}"), st.patch(theme::dim()))])
+                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(Style::default().fg(ratatui::style::Color::White))), Span::styled(format!(" {d}"), st.patch(theme::dim()))])
                 }).collect();
-                f.render_widget(Paragraph::new(lines).block(UiBlock::bordered().border_type(BorderType::Rounded).border_style(theme::dim())), r);
+                f.render_widget(Paragraph::new(lines), r);
             }
         }
 
@@ -3016,6 +3035,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         queued: vec![],
         images: vec![],
         esc_at: None,
+        leader: false,
         interrupted: false,
         restoring: 0,
         opening: vec![],
