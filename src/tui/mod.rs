@@ -2096,10 +2096,11 @@ impl Ui {
         let input_h = input_lines.len().min(8) as u16 + chips + 2;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
-        let [chat, todo_area, progress, input_area, status] = Layout::vertical([
+        let [chat, todo_area, progress, _gap, input_area, status] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(todo_h),
             Constraint::Length(if show_progress { 1 } else { 0 }),
+            Constraint::Length(1),
             Constraint::Length(input_h),
             Constraint::Length(1),
         ])
@@ -2202,11 +2203,13 @@ impl Ui {
                 let max = 10.min(input_area.y as usize).max(1);
                 let start = sel.saturating_sub(max - 1);
                 let h = m.len().min(max) as u16;
-                let r = Rect { x: input_area.x, y: input_area.y.saturating_sub(h), width: input_area.width, height: h };
+                let full = f.area().width;
+                let r = Rect { x: 0, y: input_area.y.saturating_sub(h), width: full, height: h };
                 f.render_widget(Clear, r);
                 let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
-                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(Style::default().fg(ratatui::style::Color::White))), Span::styled(format!(" {d}"), st.patch(theme::dim()))])
+                    let pad = " ".repeat((full as usize).saturating_sub(12 + d.width()));
+                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(Style::default().fg(ratatui::style::Color::White))), Span::styled(format!(" {d}{pad}"), st.patch(theme::dim()))])
                 }).collect();
                 f.render_widget(Paragraph::new(lines), r);
             }
