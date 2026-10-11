@@ -60,7 +60,7 @@ pub enum Req {
     Ssh(String),
     /// Change the host's working directory (`/cd`). Local clients only.
     Cd(String),
-    /// List a directory of the host (`/ls`); answered with `Push::Notice`. Local clients only.
+    /// Ask for the host's current directory (the `/cd` explorer); answered with `Push::Dir`. Local clients only.
     Ls(String),
     /// Link this daemon to theta-server so a browser can drive it (answered with `Push::Remote`). Local clients only.
     /// `cwd` is the project the browser opens first: the one the user is working in.
@@ -170,6 +170,8 @@ pub enum Push {
     JobOutput { id: String, text: String },
     /// The session's tools now run on this host (or back on this machine); its directory changed.
     Ssh(Option<SshInfo>),
+    /// Content of the host's working directory: names, directories end with `/`.
+    Dir { cwd: String, entries: Vec<String> },
     Remote { state: RemoteState, url: String },
     Overview(Box<Overview>),
     /// Tabs of `cwd` were opened or closed by another client: mirror it. Sent to every client.

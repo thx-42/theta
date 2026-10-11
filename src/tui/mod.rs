@@ -91,8 +91,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/linters", "linters per language and whether they are installed"),
     ("/remote", "control theta from a browser: (none) | stop | status"),
     ("/ssh", "run tools on a server: <ssh arguments> | off"),
-    ("/cd", "change directory on the ssh server"),
-    ("/ls", "list a directory on the ssh server"),
+    ("/cd", "browse the ssh server's folders: (none) opens the explorer | <dir>"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
@@ -300,8 +299,17 @@ struct JobsView {
     polled: Instant,
 }
 
+/// `/cd`: folders of the ssh host; enter goes in, backspace goes up.
+struct DirView {
+    cwd: String,
+    /// `..` first, then directories (ending in `/`), then files.
+    entries: Vec<String>,
+    sel: usize,
+}
+
 enum Overlay {
     Pick(Picker),
+    Dir(DirView),
     Jobs(JobsView),
     Tree(tree::TreeView),
     Settings(SettingsView),
@@ -889,8 +897,8 @@ impl Ui {
                 }
             }
             "/ssh" => self.remote.send(Req::Ssh(arg.to_string())),
+            "/cd" if arg.is_empty() => self.remote.send(Req::Ls(String::new())),
             "/cd" => self.remote.send(Req::Cd(arg.to_string())),
-            "/ls" => self.remote.send(Req::Ls(arg.to_string())),
             "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -1556,6 +1564,29 @@ impl Ui {
                     self.overlay = Some(Overlay::Report(title, lines));
                 }
             }
+            Overlay::Dir(mut v) => {
+                let last = v.entries.len().saturating_sub(1);
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Up => v.sel = v.sel.saturating_sub(1),
+                    KeyCode::Down => v.sel = (v.sel + 1).min(last),
+                    KeyCode::PageUp => v.sel = v.sel.saturating_sub(10),
+                    KeyCode::PageDown => v.sel = (v.sel + 10).min(last),
+                    KeyCode::Home => v.sel = 0,
+                    KeyCode::End => v.sel = last,
+                    KeyCode::Backspace | KeyCode::Left => self.remote.send(Req::Cd("..".into())),
+                    KeyCode::Char('~') => self.remote.send(Req::Cd("~".into())),
+                    KeyCode::Enter | KeyCode::Right => {
+                        if let Some(e) = v.entries.get(v.sel)
+                            && let Some(dir) = e.strip_suffix('/').or((e == "..").then_some(".."))
+                        {
+                            self.remote.send(Req::Cd(dir.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Dir(v));
+            }
             Overlay::Jobs(mut v) => {
                 let viewing = v.view.is_some();
                 match (viewing, k.code) {
@@ -2214,6 +2245,7 @@ impl Ui {
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 18,
+            Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
             Overlay::Pick(p) => p.rows().max(1) + 1,
@@ -2245,6 +2277,17 @@ impl Ui {
                     let col = 5 + a.input.text[..a.input.cur].width();
                     f.set_cursor_position((r.x + 1 + col as u16, r.y + 1 + row as u16));
                 }
+            }
+            Overlay::Dir(v) => {
+                let rows = h.saturating_sub(4) as usize;
+                let top = (v.sel + 1).saturating_sub(rows);
+                let l: Vec<Line> = v.entries.iter().enumerate().skip(top).take(rows).map(|(i, e)| {
+                    let dir = e.ends_with('/') || e == "..";
+                    let st = if i == v.sel { theme::sel() } else if dir { theme::accent() } else { theme::dim() };
+                    Line::from(vec![Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()), Span::styled(e.clone(), st)])
+                }).collect();
+                let name: String = v.cwd.chars().rev().take(iw.saturating_sub(10)).collect::<Vec<_>>().into_iter().rev().collect();
+                f.render_widget(Paragraph::new(l).block(block(&format!("θ {name}")).title_bottom(hint(" ↑↓ select · enter open · ⌫ up · ~ home · esc close "))), r);
             }
             Overlay::Jobs(v) => {
                 let mut l = Vec::new();
@@ -2933,6 +2976,12 @@ impl Ui {
             Push::Overview(_) | Push::Tabs { .. } => {} // web clients / handled in on_tab_push
             Push::Jobs(l) => self.jobs = l,
             Push::Ssh(i) => self.ssh = i,
+            Push::Dir { cwd, mut entries } => {
+                entries.sort_by_key(|e| (!e.ends_with('/'), e.to_lowercase()));
+                entries.insert(0, "..".into());
+                let sel = if entries.len() > 1 { 1 } else { 0 };
+                self.overlay = Some(Overlay::Dir(DirView { cwd, entries, sel }));
+            }
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay
                     && v.view.as_deref() == Some(&id)

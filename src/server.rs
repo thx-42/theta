@@ -519,6 +519,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
                 match h.cd(&path).await {
                     Ok(cwd) => {
                         let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd })));
+                        let _ = out.send(dir_push(&h).await);
                     }
                     Err(e) => {
                         let _ = out.send(Push::Err(format!("{e:#}")));
@@ -526,14 +527,13 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
                 }
             });
         }
-        Req::Ls(path) => {
-            let (live, out) = (live.clone(), out.clone());
-            tokio::spawn(async move {
-                let Some(h) = live.st.lock().unwrap().rt.ssh.get() else { return };
-                let args = if path.is_empty() { serde_json::json!({}) } else { serde_json::json!({ "path": path }) };
-                let o = h.call("ls", &args).await;
-                let _ = out.send(if o.is_error { Push::Err(o.content) } else { Push::Notice(format!("{}:\n{}", h.cwd(), o.content)) });
-            });
+        Req::Ls(_) => {
+            let (out, host) = (out.clone(), live.st.lock().unwrap().rt.ssh.get());
+            if let Some(h) = host {
+                tokio::spawn(async move {
+                    let _ = out.send(dir_push(&h).await);
+                });
+            }
         }
         Req::Answer { id, text } => {
             let mut st = live.st.lock().unwrap();
@@ -777,6 +777,17 @@ fn after_run(live: &Arc<Live>, st: &mut State) {
     }
 }
 
+/// What the `/cd` explorer shows: the host's working directory.
+async fn dir_push(h: &crate::ssh::Host) -> Push {
+    let o = h.call("ls", &serde_json::json!({})).await;
+    if o.is_error {
+        return Push::Err(o.content);
+    }
+    // `ls` prints "(empty)" and "[N more entries]" markers: not names.
+    let entries = o.content.lines().filter(|l| !l.starts_with('[') && *l != "(empty)").map(String::from).collect();
+    Push::Dir { cwd: h.cwd(), entries }
+}
+
 /// `/ssh`: connect the session's tools to a host, report the state, or go back to local.
 fn ssh_connect(live: &Arc<Live>, args: String, out: &UnboundedSender<Push>) {
     let slot = live.st.lock().unwrap().rt.ssh.clone();
@@ -784,7 +795,7 @@ fn ssh_connect(live: &Arc<Live>, args: String, out: &UnboundedSender<Push>) {
     match args.as_str() {
         "" => {
             let _ = out.send(Push::Notice(match slot.get() {
-                Some(h) => format!("ssh: {} ({}) in {}\n/cd <dir>, /ls [dir], /ssh off", h.name, h.info, h.cwd()),
+                Some(h) => format!("ssh: {} ({}) in {}\n/cd to browse, /ssh off to leave", h.name, h.info, h.cwd()),
                 None => "ssh: not connected. /ssh <ssh arguments>, e.g. /ssh user@host or /ssh my-alias".into(),
             }));
         }
@@ -809,7 +820,7 @@ fn ssh_connect(live: &Arc<Live>, args: String, out: &UnboundedSender<Push>) {
                         let h = Arc::new(h);
                         slot.set(Some(h.clone()));
                         let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd: h.cwd() })));
-                        let _ = live.bus.send(Push::Notice(format!("ssh: connected to {} ({}), in {}\nread, write, edit, ls, find, grep and bash now run there. /cd <dir> to move, /ssh off to leave.", h.name, h.info, h.cwd())));
+                        let _ = live.bus.send(Push::Notice(format!("ssh: connected to {} ({}), in {}\nread, write, edit, ls, find, grep and bash now run there. /cd to browse, /ssh off to leave.", h.name, h.info, h.cwd())));
                     }
                     Err(e) => {
                         let _ = out.send(Push::Err(format!("ssh: {e:#}")));
