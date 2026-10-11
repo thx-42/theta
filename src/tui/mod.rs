@@ -490,6 +490,8 @@ struct Ui {
     sel: Option<((u16, u16), (u16, u16))>,
     /// Last drawn frame, read to copy the selected text.
     frame: Buffer,
+    /// Area the selection is limited to: the open popup, else the main area.
+    sel_area: Rect,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -2266,9 +2268,10 @@ impl Ui {
         f.render_widget(Paragraph::new(Line::from(bar)), status);
 
         // overlays
-        if let Some(ov) = &self.overlay {
-            self.draw_overlay(f, ov, area);
-        }
+        self.sel_area = match &self.overlay {
+            Some(ov) => self.draw_overlay(f, ov, area),
+            None => area,
+        };
     }
 
     fn splash(&self, h: usize) -> Vec<Line<'static>> {
@@ -2318,7 +2321,8 @@ impl Ui {
         top
     }
 
-    fn draw_overlay(&self, f: &mut Frame, ov: &Overlay, area: Rect) {
+    /// Draws the popup and returns its rect, the only area a mouse selection may cover.
+    fn draw_overlay(&self, f: &mut Frame, ov: &Overlay, area: Rect) -> Rect {
         let w = (area.width.saturating_sub(4)).min(100);
         let iw = w.saturating_sub(4) as usize;
         let content = match ov {
@@ -2546,6 +2550,7 @@ impl Ui {
                 f.render_widget(Paragraph::new(l).block(block("Settings")), r);
             }
         }
+        r
     }
 }
 
@@ -2943,13 +2948,21 @@ impl Ui {
         }
     }
 
+    /// A press outside the selection area (e.g. outside the popup) selects nothing.
     fn sel_start(&mut self, col: u16, row: u16) {
-        self.sel = Some(((col, row), (col, row)));
+        let r = self.sel_area;
+        let inside = col >= r.x && col < r.right() && row >= r.y && row < r.bottom();
+        self.sel = inside.then_some(((col, row), (col, row)));
     }
 
+    /// Drag stays inside the selection area: past its edge the selection stops at the edge.
     fn sel_drag(&mut self, col: u16, row: u16) {
+        let r = self.sel_area;
+        if r.is_empty() {
+            return;
+        }
         if let Some((_, end)) = &mut self.sel {
-            *end = (col, row);
+            *end = (col.clamp(r.x, r.right() - 1), row.clamp(r.y, r.bottom() - 1));
         }
     }
 
@@ -2969,25 +2982,37 @@ impl Ui {
         let _ = std::io::Write::flush(&mut out);
     }
 
+    /// Per selected row: (row, first col, last col), limited to `sel_area`.
+    fn sel_rows(&self) -> Vec<(u16, u16, u16)> {
+        let Some((s, e)) = self.sel_range() else { return vec![] };
+        let r = self.sel_area;
+        (s.1..=e.1)
+            .map(|row| {
+                let x0 = if row == s.1 { s.0 } else { r.x };
+                let x1 = if row == e.1 { e.0 } else { r.right().saturating_sub(1) };
+                (row, x0, x1)
+            })
+            .collect()
+    }
+
     fn sel_text(&self) -> Option<String> {
-        let (s, e) = self.sel_range()?;
-        let width = self.frame.area.width;
-        let lines = (s.1..=e.1).map(|row| {
-            let x0 = if row == s.1 { s.0 } else { 0 };
-            let x1 = if row == e.1 { e.0 } else { width.saturating_sub(1) };
-            let line: String = (x0..=x1).map(|x| self.frame.cell((x, row)).map_or(" ", |c| c.symbol())).collect();
-            line.trim_end().to_string()
-        });
-        Some(lines.collect::<Vec<_>>().join("\n"))
+        let rows = self.sel_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|&(row, x0, x1)| {
+                let line: String = (x0..=x1).map(|x| self.frame.cell((x, row)).map_or(" ", |c| c.symbol())).collect();
+                line.trim_end().to_string()
+            })
+            .collect();
+        Some(lines.join("\n"))
     }
 
     /// Reverse the selected cells so the selection shows.
     fn sel_highlight(&self, buf: &mut Buffer) {
-        let Some((s, e)) = self.sel_range() else { return };
-        let width = buf.area.width;
-        for row in s.1..=e.1 {
-            let x0 = if row == s.1 { s.0 } else { 0 };
-            let x1 = if row == e.1 { e.0 } else { width.saturating_sub(1) };
+        for (row, x0, x1) in self.sel_rows() {
             for x in x0..=x1 {
                 if let Some(c) = buf.cell_mut((x, row)) {
                     c.set_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -3224,6 +3249,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         drag: None,
         sel: None,
         frame: Buffer::default(),
+        sel_area: Rect::default(),
     };
     ui.forward(0, pushes);
     let first = snap.session_id.clone();
