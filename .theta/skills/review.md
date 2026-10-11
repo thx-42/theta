@@ -1,8 +1,8 @@
 ---
 name: review
-description: Revue de code d'un diff, une ligne par problème
+description: Review a diff, one line per problem
 ---
-Relis le diff (`git diff`, puis les fichiers appelants si besoin). Un problème par ligne :
-`chemin:ligne: gravité: problème. correctif.`
-Cherche dans l'ordre : bugs de logique, perte de données/sécurité, cas limites (vide, unicode, I/O en erreur), `unwrap`/panics sur entrée utilisateur, code mort ou dupliqué, tests manquants.
-Ignore le style que `cargo fmt`/`clippy` règlent. Pas de compliments. Rien trouvé : dis-le en une ligne.
+Read the diff (`git diff`, then the calling files if needed). One problem per line:
+`path:line: severity: problem. fix.`
+Look in this order: logic bugs, data loss/security, edge cases (empty, unicode, I/O errors), `unwrap`/panics on user input, dead or duplicated code, missing tests.
+Ignore style that `cargo fmt`/`clippy` handle. No compliments. Nothing found: say so in one line.

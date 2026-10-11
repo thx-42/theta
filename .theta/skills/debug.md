@@ -1,10 +1,10 @@
 ---
 name: debug
-description: Diagnostiquer avant de modifier
+description: Diagnose before editing
 ---
-N'édite rien avant d'avoir une cause prouvée.
-1. Reproduis (commande exacte, sortie exacte).
-2. Liste 2-3 hypothèses classées par probabilité.
-3. Teste la plus probable avec une lecture ou un log, pas avec un correctif.
-4. Corrige à la cause, pas au symptôme. Relance la repro puis `cargo test`.
-Cause non trouvée : dis ce qui est écarté et ce qui manque.
+Do not edit anything before a cause is proven.
+1. Reproduce (exact command, exact output).
+2. List 2-3 hypotheses, ranked by probability.
+3. Test the most likely one with a read or a log, not with a fix.
+4. Fix the cause, not the symptom. Rerun the repro, then `cargo test`.
+Cause not found: say what was ruled out and what is missing.

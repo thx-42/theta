@@ -1,8 +1,8 @@
 ---
 name: commit
-description: Message de commit Conventional Commits
+description: Conventional Commits message
 ---
-Regarde `git status` et `git diff --staged` (sinon `git diff`).
-Message : `type(scope): sujet` ≤ 72 car., impératif, sans point. Types : feat, fix, docs, refactor, test, chore.
-Corps seulement si le pourquoi n'est pas évident. Un commit = une intention ; sinon propose de découper.
-Ne committe que si l'utilisateur le demande.
+Look at `git status` and `git diff --staged` (otherwise `git diff`).
+Message: `type(scope): subject` ≤ 72 chars, imperative, no period. Types: feat, fix, docs, refactor, test, chore.
+Body only if the why is not obvious. One commit = one intent; otherwise propose splitting it.
+Commit only if the user asks.

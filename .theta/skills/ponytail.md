@@ -1,12 +1,12 @@
 ---
 name: ponytail
-description: Plus petit changement qui résout vraiment la tâche
+description: Smallest change that truly solves the task
 ---
-Le meilleur code est celui qu'on n'écrit pas.
-1. Existe-t-il déjà dans le repo ? Réutilise-le.
-2. Stdlib ou dépendance déjà installée ? Utilise-la. Aucune nouvelle dépendance pour quelques lignes.
-3. Sinon, le minimum de code qui marche. Aucune option, abstraction ou config non demandée.
-- Corrige la cause racine une fois, après avoir cherché tous les appelants.
-- Ne coupe jamais : validation aux frontières, gestion d'erreur évitant la perte de données, sécurité.
-- Logique non triviale : ajoute un petit test.
-Termine par 1-2 lignes : ce qui est ignoré ou non vérifié, et les risques.
+The best code is the code you don't write.
+1. Does it already exist in the repo? Reuse it.
+2. Stdlib or an already-installed dependency? Use it. No new dependency for a few lines.
+3. Otherwise, the minimum code that works. No unrequested options, abstractions or config.
+- Fix the root cause once, after finding all callers.
+- Never cut: validation at boundaries, error handling that prevents data loss, security.
+- Non-trivial logic: add a small test.
+End with 1-2 lines: what is skipped or unverified, and the risks.
