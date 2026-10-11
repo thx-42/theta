@@ -2,9 +2,12 @@
 
 use super::theme;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Underline color of table cells: it is never drawn (no underline), and mouse selection skips cells with it.
+pub const NO_SELECT: Color = Color::Rgb(1, 2, 3);
 
 fn finish(mut spans: Vec<Span<'static>>) -> Line<'static> {
     while let Some(last) = spans.last() {
@@ -366,13 +369,13 @@ fn render_table(rows: &[Vec<String>], width: usize, out: &mut Vec<Line<'static>>
             }
             let pad = " ".repeat(w[i] - tw);
             let st = if ri == 0 { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
-            spans.push(Span::styled(format!("{text}{pad}"), st));
-            spans.push(Span::styled(if i + 1 < cols { " │ " } else { "" }, theme::dim()));
+            spans.push(Span::styled(format!("{text}{pad}"), st.underline_color(NO_SELECT)));
+            spans.push(Span::styled(if i + 1 < cols { " │ " } else { "" }, theme::dim().underline_color(NO_SELECT)));
         }
         out.push(Line::from(spans));
         if ri == 0 {
             let sep: Vec<String> = w.iter().map(|n| "─".repeat(*n)).collect();
-            out.push(Line::from(Span::styled(sep.join("─┼─"), theme::dim())));
+            out.push(Line::from(Span::styled(sep.join("─┼─"), theme::dim().underline_color(NO_SELECT))));
         }
     }
 }

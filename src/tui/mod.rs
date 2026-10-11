@@ -21,7 +21,7 @@ use anyhow::Result;
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures::StreamExt;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Paragraph, Wrap};
@@ -2269,7 +2269,7 @@ impl Ui {
 
         // overlays
         self.sel_area = match &self.overlay {
-            Some(ov) => self.draw_overlay(f, ov, area),
+            Some(ov) => self.draw_overlay(f, ov, area).inner(Margin::new(1, 1)),
             None => area,
         };
     }
@@ -3003,18 +3003,18 @@ impl Ui {
         let lines: Vec<String> = rows
             .iter()
             .map(|&(row, x0, x1)| {
-                let line: String = (x0..=x1).map(|x| self.frame.cell((x, row)).map_or(" ", |c| c.symbol())).collect();
+                let line: String = (x0..=x1).filter_map(|x| self.frame.cell((x, row))).filter(|c| c.underline_color != markdown::NO_SELECT).map(|c| c.symbol()).collect();
                 line.trim_end().to_string()
             })
             .collect();
         Some(lines.join("\n"))
     }
 
-    /// Reverse the selected cells so the selection shows.
+    /// Reverse the selected cells so the selection shows. Table cells stay unselected.
     fn sel_highlight(&self, buf: &mut Buffer) {
         for (row, x0, x1) in self.sel_rows() {
             for x in x0..=x1 {
-                if let Some(c) = buf.cell_mut((x, row)) {
+                if let Some(c) = buf.cell_mut((x, row)).filter(|c| c.underline_color != markdown::NO_SELECT) {
                     c.set_style(Style::default().add_modifier(Modifier::REVERSED));
                 }
             }
