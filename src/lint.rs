@@ -132,6 +132,7 @@ mod tests {
             read_cache: Default::default(),
             session_id: String::new(),
             jobs: Default::default(),
+            ssh: Default::default(),
         }
     }
 

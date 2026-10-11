@@ -17,6 +17,7 @@ mod proto;
 mod relay;
 mod server;
 mod session;
+mod ssh;
 mod tools;
 mod tui;
 mod types;
@@ -72,6 +73,9 @@ enum Cmd {
     Refresh,
     /// The background server (started automatically on first use). `theta daemon stop` stops it.
     Daemon { action: Option<String> },
+    /// Serve tool calls over stdin/stdout for `/ssh` (started on the server by theta itself).
+    #[command(hide = true)]
+    SshAgent,
     /// Check for a newer release and install it.
     Update {
         /// Only report whether a newer version exists.
@@ -110,6 +114,7 @@ pub async fn build_runtime(cwd: std::path::PathBuf) -> Result<agent::Runtime> {
         read_cache: Default::default(),
         asks: Default::default(),
         jobs: Default::default(),
+        ssh: Default::default(),
     })
 }
 
@@ -185,6 +190,9 @@ async fn main() -> Result<()> {
             }
             Some(a) => bail!("unknown action `{a}` (stop)"),
         };
+    }
+    if let Some(Cmd::SshAgent) = &cli.cmd {
+        return ssh::agent().await;
     }
     if let Some(Cmd::Update { check, force }) = &cli.cmd {
         return update::run(*check, *force).await;
@@ -270,7 +278,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
-        Some(Cmd::Daemon { .. } | Cmd::Update { .. }) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");

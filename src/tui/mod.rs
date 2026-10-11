@@ -90,6 +90,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tree", "browse and fork the conversation tree"),
     ("/linters", "linters per language and whether they are installed"),
     ("/remote", "control theta from a browser: (none) | stop | status"),
+    ("/ssh", "run tools on a server: <ssh arguments> | off"),
+    ("/cd", "change directory on the ssh server"),
+    ("/ls", "list a directory on the ssh server"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
     ("/model", "change model"),
@@ -435,6 +438,8 @@ struct Ui {
     /// Link to theta-server, shared by every tab; `remote_asked` = this TUI ran `/remote` and wants the code shown.
     remote_state: RemoteState,
     remote_asked: bool,
+    /// Host the tools of this session run on (`/ssh`).
+    ssh: Option<crate::proto::SshInfo>,
     cost: f64,
     ctx_tokens: u64,
     quit_armed: Option<Instant>,
@@ -883,6 +888,9 @@ impl Ui {
                     _ => self.notify("usage: /remote [stop|status]"),
                 }
             }
+            "/ssh" => self.remote.send(Req::Ssh(arg.to_string())),
+            "/cd" => self.remote.send(Req::Cd(arg.to_string())),
+            "/ls" => self.remote.send(Req::Ls(arg.to_string())),
             "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -2117,6 +2125,9 @@ impl Ui {
         if !self.verbose() {
             left.push(Span::styled(" · compact", theme::dim()));
         }
+        if let Some(s) = &self.ssh {
+            left.push(Span::styled(format!(" · ⇢ {}:{}", s.host, s.cwd), theme::accent()));
+        }
         let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
         if live > 0 {
             left.push(Span::styled(format!(" · ⚙ {live}"), theme::accent()));
@@ -2172,6 +2183,9 @@ impl Ui {
         out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));
         out.push(Line::from(vec![Span::styled("  model  ", theme::dim()), Span::raw(self.app.turn.model.clone())]));
         out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(self.app.rt.cwd.display().to_string())]));
+        if let Some(s) = &self.ssh {
+            out.push(Line::from(vec![Span::styled("  ssh    ", theme::dim()), Span::raw(format!("{}:{}", s.host, s.cwd))]));
+        }
         if let Some((p, _)) = self.app.rt.catalog.resolve(&self.app.turn.model) {
             let local = p.env.is_empty() && p.oauth.is_none();
             if !local && futures::executor::block_on(self.app.rt.auth.status(&p)).is_none() {
@@ -2834,6 +2848,7 @@ impl Ui {
         self.apply_meta(&snap.agent, snap.model, snap.effort);
         self.todos = snap.todos;
         self.jobs = snap.jobs;
+        self.ssh = snap.ssh;
         self.asks.clear();
         self.overlay = None;
         self.running = false;
@@ -2917,6 +2932,7 @@ impl Ui {
             Push::Remote { state, url } => self.on_remote(state, &url),
             Push::Overview(_) | Push::Tabs { .. } => {} // web clients / handled in on_tab_push
             Push::Jobs(l) => self.jobs = l,
+            Push::Ssh(i) => self.ssh = i,
             Push::JobOutput { id, text } => {
                 if let Some(Overlay::Jobs(v)) = &mut self.overlay
                     && v.view.as_deref() == Some(&id)
@@ -2963,6 +2979,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         jobs: snap.jobs.clone(),
         remote_state: RemoteState::Off,
         remote_asked: false,
+        ssh: None,
         cost: 0.0,
         ctx_tokens: 0,
         quit_armed: None,

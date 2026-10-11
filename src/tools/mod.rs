@@ -31,6 +31,8 @@ pub struct ToolCtx {
     /// Session the tools run for; `write_plan` names its file after it.
     pub session_id: String,
     pub jobs: crate::jobs::Jobs,
+    /// Host the file and shell tools run on, when the session works over ssh.
+    pub ssh: crate::ssh::Slot,
 }
 
 pub struct ToolOut {
@@ -160,6 +162,11 @@ pub fn truncate_middle(text: &str, max_lines: usize) -> (String, bool) {
 pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
     if let Some(bad) = args.get("_invalid_json") {
         return ToolOut::err(format!("invalid JSON arguments: {bad}"));
+    }
+    if crate::ssh::is_remote_tool(name)
+        && let Some(host) = ctx.ssh.get()
+    {
+        return host.call(name, args).await;
     }
     let res = match name {
         "read" => fs::read(args, ctx),

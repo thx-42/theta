@@ -1,7 +1,7 @@
 //! Background daemon: owns sessions, agent runs and MCP connections; any number of TUI clients attach over a unix socket.
 
 use crate::agent::{self, Event, Runtime, Steer, Turn};
-use crate::proto::{AgentBrief, ModelBrief, Overview, Push, RemoteState, Req, SessionBrief, Snapshot, Target, socket_path};
+use crate::proto::{AgentBrief, ModelBrief, Overview, Push, RemoteState, Req, SessionBrief, Snapshot, SshInfo, Target, socket_path};
 use crate::session::{self, Session};
 use crate::types::{Block, Msg, Role};
 use crate::{agents, config};
@@ -161,6 +161,7 @@ impl Server {
         rt.read_cache = Default::default();
         rt.asks = Default::default();
         rt.jobs = Default::default();
+        rt.ssh = Default::default();
         let jobs_sink = bus.clone();
         rt.jobs.on_change(move |l| {
             let _ = jobs_sink.send(Push::Jobs(l));
@@ -304,6 +305,9 @@ impl Server {
                         });
                     });
                 }
+                Req::Ssh(_) | Req::Cd(_) | Req::Ls(_) if !local => {
+                    let _ = out.send(Push::Err("not allowed remotely".into()));
+                }
                 Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus if !local => {
                     let _ = out.send(Push::Err("not allowed remotely".into()));
                 }
@@ -435,6 +439,7 @@ fn subscribe(live: &Arc<Live>, out: &UnboundedSender<Push>) -> tokio::task::Join
         replay: st.replay.clone(),
         todos: st.rt.todos.lock().unwrap().clone(),
         jobs: st.rt.jobs.list(),
+        ssh: st.rt.ssh.get().map(|h| SshInfo { host: h.name.clone(), cwd: h.cwd() }),
     };
     drop(s);
     let _ = out.send(Push::Snapshot(Box::new(snap)));
@@ -502,6 +507,34 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
         }
         Req::Interrupt => interrupt(live),
+        Req::Ssh(args) => ssh_connect(live, args, out),
+        Req::Cd(path) | Req::Ls(path) if live.st.lock().unwrap().rt.ssh.get().is_none() => {
+            let _ = path;
+            err("not connected over ssh; use /ssh <host> first");
+        }
+        Req::Cd(path) => {
+            let (live, out) = (live.clone(), out.clone());
+            tokio::spawn(async move {
+                let Some(h) = live.st.lock().unwrap().rt.ssh.get() else { return };
+                match h.cd(&path).await {
+                    Ok(cwd) => {
+                        let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd })));
+                    }
+                    Err(e) => {
+                        let _ = out.send(Push::Err(format!("{e:#}")));
+                    }
+                }
+            });
+        }
+        Req::Ls(path) => {
+            let (live, out) = (live.clone(), out.clone());
+            tokio::spawn(async move {
+                let Some(h) = live.st.lock().unwrap().rt.ssh.get() else { return };
+                let args = if path.is_empty() { serde_json::json!({}) } else { serde_json::json!({ "path": path }) };
+                let o = h.call("ls", &args).await;
+                let _ = out.send(if o.is_error { Push::Err(o.content) } else { Push::Notice(format!("{}:\n{}", h.cwd(), o.content)) });
+            });
+        }
         Req::Answer { id, text } => {
             let mut st = live.st.lock().unwrap();
             let sender = st.rt.asks.lock().unwrap().remove(&id);
@@ -740,6 +773,49 @@ fn after_run(live: &Arc<Live>, st: &mut State) {
         if live.session.lock().unwrap().add_msg(Msg::user(text), None).is_ok() {
             let _ = live.bus.send(Push::Event(Event::User(text.into())));
             launch_turn(live, st);
+        }
+    }
+}
+
+/// `/ssh`: connect the session's tools to a host, report the state, or go back to local.
+fn ssh_connect(live: &Arc<Live>, args: String, out: &UnboundedSender<Push>) {
+    let slot = live.st.lock().unwrap().rt.ssh.clone();
+    let args = args.trim().to_string();
+    match args.as_str() {
+        "" => {
+            let _ = out.send(Push::Notice(match slot.get() {
+                Some(h) => format!("ssh: {} ({}) in {}\n/cd <dir>, /ls [dir], /ssh off", h.name, h.info, h.cwd()),
+                None => "ssh: not connected. /ssh <ssh arguments>, e.g. /ssh user@host or /ssh my-alias".into(),
+            }));
+        }
+        "off" | "stop" => {
+            slot.set(None);
+            let _ = live.bus.send(Push::Ssh(None));
+            let _ = live.bus.send(Push::Notice("ssh: tools run on this machine again".into()));
+        }
+        _ => {
+            let (live, out) = (live.clone(), out.clone());
+            tokio::spawn(async move {
+                let _ = live.bus.send(Push::Notice(format!("ssh: connecting to {args}…")));
+                let (s, bus) = (slot.clone(), live.bus.clone());
+                let on_close = move || {
+                    if crate::ssh::closed(&s) {
+                        let _ = bus.send(Push::Ssh(None));
+                        let _ = bus.send(Push::Err("ssh connection lost; tools run on this machine again. Reconnect with /ssh".into()));
+                    }
+                };
+                match crate::ssh::connect(&crate::ssh::split(&args), on_close).await {
+                    Ok(h) => {
+                        let h = Arc::new(h);
+                        slot.set(Some(h.clone()));
+                        let _ = live.bus.send(Push::Ssh(Some(SshInfo { host: h.name.clone(), cwd: h.cwd() })));
+                        let _ = live.bus.send(Push::Notice(format!("ssh: connected to {} ({}), in {}\nread, write, edit, ls, find, grep and bash now run there. /cd <dir> to move, /ssh off to leave.", h.name, h.info, h.cwd())));
+                    }
+                    Err(e) => {
+                        let _ = out.send(Push::Err(format!("ssh: {e:#}")));
+                    }
+                }
+            });
         }
     }
 }

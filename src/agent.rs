@@ -71,6 +71,7 @@ pub struct Runtime {
     pub read_cache: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     pub asks: Asks,
     pub jobs: crate::jobs::Jobs,
+    pub ssh: crate::ssh::Slot,
 }
 
 /// What one run needs: who answers, with which model, and which tools.
@@ -110,6 +111,7 @@ impl Runtime {
             read_cache: self.read_cache.clone(),
             session_id: session_id.to_string(),
             jobs: self.jobs.clone(),
+            ssh: self.ssh.clone(),
         }
     }
 
@@ -200,7 +202,11 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
 /// Run until the model answers without tool calls. Appends everything to `session`.
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
-    let system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills));
+    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills));
+    if let Some(h) = rt.ssh.get() {
+        system.push_str("\n\n");
+        system.push_str(&crate::ssh::prompt_note(&h));
+    }
     let tools = rt.tools_for(&turn.agent, turn.depth);
     let session_id = session.lock().unwrap().id.clone();
     let ctx = rt.tool_ctx(&session_id);
@@ -453,6 +459,7 @@ mod tests {
             read_cache: Default::default(),
             asks: Default::default(),
             jobs: Default::default(),
+            ssh: Default::default(),
         }
     }
 

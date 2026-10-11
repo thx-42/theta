@@ -55,6 +55,13 @@ pub enum Req {
     /// Ask for a job's output; answered with `Push::JobOutput`.
     JobOutput(String),
     Shutdown,
+    /// `/ssh <ssh arguments>`: run the file and shell tools of this session on that host. Empty: report the state;
+    /// `off`: back to this machine. Local clients only.
+    Ssh(String),
+    /// Change the host's working directory (`/cd`). Local clients only.
+    Cd(String),
+    /// List a directory of the host (`/ls`); answered with `Push::Notice`. Local clients only.
+    Ls(String),
     /// Link this daemon to theta-server so a browser can drive it (answered with `Push::Remote`). Local clients only.
     /// `cwd` is the project the browser opens first: the one the user is working in.
     RemoteStart { cwd: PathBuf },
@@ -65,6 +72,13 @@ pub enum Req {
     /// What a client needs to start: projects, the sessions of `cwd` (default: the daemon's), agents, models.
     /// Answered with `Push::Overview`.
     Overview { cwd: Option<PathBuf> },
+}
+
+/// The host a session's tools run on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SshInfo {
+    pub host: String,
+    pub cwd: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,6 +150,8 @@ pub struct Snapshot {
     pub todos: Vec<Todo>,
     #[serde(default)]
     pub jobs: Vec<JobInfo>,
+    #[serde(default)]
+    pub ssh: Option<SshInfo>,
 }
 
 /// Daemon → client.
@@ -152,6 +168,8 @@ pub enum Push {
     /// Background jobs of the session changed (started, ended or killed).
     Jobs(Vec<JobInfo>),
     JobOutput { id: String, text: String },
+    /// The session's tools now run on this host (or back on this machine); its directory changed.
+    Ssh(Option<SshInfo>),
     Remote { state: RemoteState, url: String },
     Overview(Box<Overview>),
     /// Tabs of `cwd` were opened or closed by another client: mirror it. Sent to every client.
