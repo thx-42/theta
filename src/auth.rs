@@ -164,6 +164,8 @@ const ANTHROPIC_AUTHORIZE: &str = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const ANTHROPIC_PORT: u16 = 53692;
+/// Redirect for logins over SSH: Anthropic shows the code on this page, to paste into theta.
+const ANTHROPIC_MANUAL_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
 
 const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE: &str = "https://auth.openai.com/oauth/authorize";
@@ -445,7 +447,9 @@ fn read_line(msg: &str) -> String {
 
 async fn login_anthropic(io: &mut Io) -> Result<Cred> {
     let (verifier, challenge) = pkce();
-    let redirect = format!("http://localhost:{ANTHROPIC_PORT}/callback");
+    // over SSH the browser cannot reach localhost on this machine: use the manual code page instead
+    let remote = std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    let redirect = if remote { ANTHROPIC_MANUAL_REDIRECT.to_string() } else { format!("http://localhost:{ANTHROPIC_PORT}/callback") };
     let cid = anthropic_client_id();
     let url = format!(
         "{ANTHROPIC_AUTHORIZE}?{}",
