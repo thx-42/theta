@@ -24,7 +24,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -2269,7 +2269,7 @@ impl Ui {
 
         // overlays
         self.sel_area = match &self.overlay {
-            Some(ov) => self.draw_overlay(f, ov, area).inner(Margin::new(1, 1)),
+            Some(ov) => self.draw_overlay(f, ov, area).inner(Margin::new(2, 2)),
             None => area,
         };
     }
@@ -2324,7 +2324,7 @@ impl Ui {
     /// Draws the popup and returns its rect, the only area a mouse selection may cover.
     fn draw_overlay(&self, f: &mut Frame, ov: &Overlay, area: Rect) -> Rect {
         let w = (area.width.saturating_sub(4)).min(100);
-        let iw = w.saturating_sub(4) as usize;
+        let iw = w.saturating_sub(6) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 18,
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
@@ -2338,10 +2338,10 @@ impl Ui {
             Overlay::Login(v) => v.lines.iter().map(|l| wrapped_rows(l, iw) + 1).sum::<usize>() + 4,
         } as u16;
         let min_h = if matches!(ov, Overlay::Pick(_)) { 12 } else { 5 };
-        let h = area.height.saturating_sub(4).min(content.max(min_h) + 2);
+        let h = area.height.saturating_sub(4).min(content.max(min_h) + 4);
         let r = Rect { x: (area.width - w) / 2, y: (area.height.saturating_sub(h)) / 3, width: w, height: h };
         f.render_widget(Clear, r);
-        let block = |t: &str| UiBlock::bordered().border_type(BorderType::Rounded).border_style(theme::accent()).title(Span::styled(format!(" {t} "), Style::default().add_modifier(Modifier::BOLD)));
+        let block = |t: &str| UiBlock::bordered().padding(Padding::uniform(1)).border_type(BorderType::Rounded).border_style(theme::accent()).title(Span::styled(format!(" {t} "), Style::default().add_modifier(Modifier::BOLD)));
         match ov {
             Overlay::Ask(a) => {
                 let mut l = vec![Line::from(Span::styled(a.question.clone(), Style::default().add_modifier(Modifier::BOLD))), Line::default()];
