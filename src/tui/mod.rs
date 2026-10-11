@@ -299,6 +299,11 @@ struct JobsView {
     polled: Instant,
 }
 
+/// Left arrow on an empty prompt: subagents and shell commands of this session, newest first.
+struct ActivityView {
+    sel: usize,
+}
+
 /// `/cd`: folders of the ssh host; enter goes in, backspace goes up.
 struct DirView {
     cwd: String,
@@ -311,6 +316,7 @@ enum Overlay {
     Pick(Picker),
     Dir(DirView),
     Jobs(JobsView),
+    Activity(ActivityView),
     Tree(tree::TreeView),
     Settings(SettingsView),
     Help,
@@ -912,6 +918,25 @@ impl Ui {
         self.overlay = Some(Overlay::Jobs(JobsView { sel: 0, view: None, text: String::new(), polled: Instant::now() }));
     }
 
+    /// Subagent and shell tool calls, newest first: (kind, state (None = running, Some(ok)), label, output).
+    fn activity(&self) -> Vec<(&'static str, Option<bool>, String, String)> {
+        self.items
+            .iter()
+            .rev()
+            .filter_map(|it| match it {
+                Item::Tool { name, summary, state, out, .. } if name == "task" || name == "bash" => {
+                    let kind = if name == "task" { "agent" } else { "shell" };
+                    let done = match state {
+                        ToolState::Running => None,
+                        ToolState::Done { ok } => Some(*ok),
+                    };
+                    Some((kind, done, summary.clone(), out.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Refresh the output shown in `/jobs` about once a second.
     fn poll_job(&mut self) {
         if let Some(Overlay::Jobs(v)) = &mut self.overlay
@@ -1388,6 +1413,9 @@ impl Ui {
                     self.scroll_top = None;
                 }
             }
+            KeyCode::Left if self.input.text.is_empty() && self.images.is_empty() => {
+                self.overlay = Some(Overlay::Activity(ActivityView { sel: 0 }));
+            }
             KeyCode::Char('o') if ctrl => self.toggle_verbose(),
             KeyCode::Char('t') if ctrl => self.open_tree(),
             KeyCode::Char('p') if ctrl => self.open_actions(),
@@ -1633,6 +1661,23 @@ impl Ui {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::Jobs(v));
+            }
+            Overlay::Activity(mut v) => {
+                let rows = self.activity();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Up => v.sel = v.sel.saturating_sub(1),
+                    KeyCode::Down => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
+                    KeyCode::Enter => {
+                        if let Some((kind, _, label, out)) = rows.into_iter().nth(v.sel) {
+                            let lines = if out.is_empty() { vec!["(no output yet)".to_string()] } else { out.lines().map(String::from).collect() };
+                            self.overlay = Some(Overlay::Report(format!("θ {kind} · {label}"), lines));
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Activity(v));
             }
             Overlay::Ask(mut a) => {
                 let free = a.options.len();
@@ -2267,6 +2312,7 @@ impl Ui {
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
+            Overlay::Activity(_) => self.activity().len().max(1) + 3,
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len() + 2,
             Overlay::Settings(v) => self.settings_rows(v.tab).len() + 6,
@@ -2307,6 +2353,29 @@ impl Ui {
                 }).collect();
                 let name: String = v.cwd.chars().rev().take(iw.saturating_sub(10)).collect::<Vec<_>>().into_iter().rev().collect();
                 f.render_widget(Paragraph::new(l).block(block(&format!("θ {name}")).title_bottom(hint(" ↑↓ select · enter open · ⌫ up · ~ home · esc close "))), r);
+            }
+            Overlay::Activity(v) => {
+                let rows = self.activity();
+                let vis = h.saturating_sub(3) as usize;
+                let top = (v.sel + 1).saturating_sub(vis);
+                let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _))| {
+                    let (mark, st) = match state {
+                        None => ("●", theme::accent()),
+                        Some(true) => ("✓", theme::dim()),
+                        Some(false) => ("✗", theme::err()),
+                    };
+                    let sel = if i == v.sel { theme::sel() } else { Style::default() };
+                    let label: String = label.chars().take(iw.saturating_sub(14)).collect();
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()),
+                        Span::styled(format!("{mark} "), st),
+                        Span::styled(format!("{kind:<6} {label}"), sel),
+                    ])
+                }).collect();
+                if l.is_empty() {
+                    l.push(Line::from(Span::styled(" nothing yet", theme::dim())));
+                }
+                f.render_widget(Paragraph::new(l).block(block("θ activity").title_bottom(hint(" ↑↓ select · enter output · esc close "))), r);
             }
             Overlay::Jobs(v) => {
                 let mut l = Vec::new();
