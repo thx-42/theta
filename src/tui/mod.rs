@@ -2268,10 +2268,15 @@ impl Ui {
         f.render_widget(Paragraph::new(Line::from(bar)), status);
 
         // overlays
+        let prev = self.sel_area;
         self.sel_area = match &self.overlay {
             Some(ov) => self.draw_overlay(f, ov, area).inner(Margin::new(2, 2)),
             None => area,
         };
+        // popup opened or closed: the old selection no longer lives in this area
+        if prev != self.sel_area {
+            self.sel = None;
+        }
     }
 
     fn splash(&self, h: usize) -> Vec<Line<'static>> {
@@ -3275,7 +3280,10 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         ui.frame = done.buffer.clone();
         tokio::select! {
             ev = events.next() => match ev {
-                Some(Ok(CEvent::Key(k))) => ui.on_key(k),
+                Some(Ok(CEvent::Key(k))) => {
+                    ui.sel = None;
+                    ui.on_key(k);
+                }
                 Some(Ok(CEvent::Paste(s))) => {
                     let s = normalize_paste(&s);
                     match &mut ui.overlay {
