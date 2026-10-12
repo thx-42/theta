@@ -65,7 +65,8 @@ pub mod theme {
     pub fn ok() -> Style { Style::default().fg(Color::Green) }
     pub fn err() -> Style { Style::default().fg(Color::Red) }
     pub fn user() -> Style { Style::default().add_modifier(Modifier::BOLD) }
-    pub fn logo() -> Style { Style::default().fg(Color::Black).bg(accent_color()).add_modifier(Modifier::BOLD) }
+    /// The θ badge of the status bar, in the color of the active agent.
+    pub fn logo(name: &str) -> Style { Style::default().fg(Color::Black).bg(Color::Indexed(color_for(name))).add_modifier(Modifier::BOLD) }
     pub fn sel() -> Style { Style::default().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD) }
 }
 
@@ -509,6 +510,8 @@ struct Ui {
     asks: VecDeque<AskView>,
     login_tx: UnboundedSender<LoginMsg>,
     cmd_sel: usize,
+    /// `@path` suggestions for the word being typed: (query, when listed, entries).
+    mentions: std::cell::RefCell<(String, Instant, Vec<(String, String)>)>,
     /// Settings view to return to after a model picker opened from it.
     settings_back: Option<SettingsView>,
     quit: bool,
@@ -541,6 +544,74 @@ type Opened = Result<(Remote, UnboundedReceiver<Push>, Snapshot), String>;
 
 fn agent_label(a: &Agent) -> String {
     format!("{} ({})", a.name, a.scope.label())
+}
+
+/// `s` cut to `w` columns, with `…` when it does not fit.
+fn fit(s: &str, w: usize) -> String {
+    if s.width() <= w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > w {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Suggestions for `@query`: the folder named by `query` up to its last `/`, narrowed by what follows (folders first, ending in `/`),
+/// then deeper files and folders whose name contains it. Honors .gitignore; dot files only when asked for.
+fn mention_entries(cwd: &std::path::Path, query: &str) -> Vec<(String, String)> {
+    const MAX: usize = 40;
+    let (dir, prefix) = match query.rsplit_once('/') {
+        Some((d, p)) => (format!("{d}/"), p),
+        None => (String::new(), query),
+    };
+    let base = if dir.starts_with('/') { std::path::PathBuf::from(&dir) } else { cwd.join(&dir) };
+    let lower = prefix.to_lowercase();
+    let walk = |depth: usize| {
+        ignore::WalkBuilder::new(&base).max_depth(Some(depth)).hidden(!prefix.starts_with('.')).require_git(false).build().flatten().skip(1)
+    };
+    let size = |e: &ignore::DirEntry| match e.metadata() {
+        Ok(m) if m.is_dir() => "folder".to_string(),
+        Ok(m) if m.len() >= 1 << 20 => format!("{:.1} MB", m.len() as f64 / (1 << 20) as f64),
+        Ok(m) if m.len() >= 1 << 10 => format!("{} KB", m.len() >> 10),
+        Ok(m) => format!("{} B", m.len()),
+        Err(_) => String::new(),
+    };
+    let entry = |e: &ignore::DirEntry| {
+        let rel = match e.path().strip_prefix(cwd) {
+            Ok(r) => r.display().to_string(),
+            Err(_) => format!("{dir}{}", e.path().strip_prefix(&base).unwrap_or(e.path()).display()),
+        };
+        let slash = if e.file_type().is_some_and(|t| t.is_dir()) { "/" } else { "" };
+        (format!("@{rel}{slash}"), size(e), slash.is_empty())
+    };
+    let name_of = |e: &ignore::DirEntry| e.file_name().to_string_lossy().to_string();
+    let mut direct: Vec<_> = walk(1)
+        .filter(|e| name_of(e).to_lowercase().starts_with(&lower) && !name_of(e).contains(char::is_whitespace))
+        .map(|e| entry(&e))
+        .collect();
+    direct.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    let mut out: Vec<(String, String)> = direct.into_iter().take(MAX).map(|(p, d, _)| (p, d)).collect();
+    // No folder typed yet: also find it deeper (`@mod` → src/tui/mod.rs); depth 1 is already listed above.
+    if !lower.is_empty() && !query.contains('/') && out.len() < MAX {
+        for e in walk(6).take(20_000) {
+            let n = name_of(&e).to_lowercase();
+            if e.depth() == 1 || !n.contains(&lower) || n.contains(char::is_whitespace) {
+                continue;
+            }
+            let (p, d, _) = entry(&e);
+            out.push((p, d));
+            if out.len() >= MAX {
+                break;
+            }
+        }
+    }
+    out
 }
 
 impl Ui {
@@ -1651,19 +1722,36 @@ impl Ui {
         }
     }
 
-    /// The `$prefix` being typed at the end of the input, if any.
-    fn skill_token(&self) -> Option<&str> {
-        let tok = self.input.text.rsplit(' ').next()?;
-        tok.starts_with('$').then_some(tok)
+    /// The word the cursor is in (up to the cursor), with its byte offset.
+    fn token(&self) -> (usize, &str) {
+        let before = &self.input.text[..self.input.cur];
+        let start = before.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+        (start, &before[start..])
     }
 
-    /// Suggestions under the input: slash commands, else skills matching a `$prefix`.
+    /// The `$skill` or `@path` being typed at the cursor, if any.
+    fn skill_token(&self) -> Option<&str> {
+        Some(self.token().1).filter(|t| t.starts_with(['$', '@']))
+    }
+
+    /// Suggestions under the input: slash commands, `$prefix` skills, `@path` files and folders.
     fn hints(&self) -> Vec<(String, String)> {
         let slash = self.cmd_matches();
         if !slash.is_empty() {
             return slash.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
         }
         let Some(tok) = self.skill_token() else { return vec![] };
+        if let Some(query) = tok.strip_prefix('@') {
+            // Tools run on the ssh host: its files are not on this disk.
+            if self.ssh.is_some() {
+                return vec![];
+            }
+            let mut cache = self.mentions.borrow_mut();
+            if cache.0 != query || cache.1.elapsed() > Duration::from_secs(2) {
+                *cache = (query.to_string(), Instant::now(), mention_entries(&self.app.rt.cwd, query));
+            }
+            return cache.2.clone();
+        }
         let prefix = tok[1..].to_lowercase();
         self.app
             .rt
@@ -1677,13 +1765,13 @@ impl Ui {
             .collect()
     }
 
-    /// Put a picked hint into the input: `$skill` replaces the token being typed, `/cmd` replaces the line.
+    /// Put a picked hint into the input: `$skill` and `@path` replace the word at the cursor (a folder keeps the cursor inside it, to go deeper), `/cmd` replaces the line.
     fn complete(&mut self, hint: &str) {
-        let base = match self.skill_token() {
-            Some(tok) => self.input.text[..self.input.text.len() - tok.len()].to_string(),
-            None => String::new(),
-        };
-        self.input.set(format!("{base}{hint} "));
+        let (start, word) = self.token();
+        let (start, end) = if word.starts_with(['$', '@']) { (start, self.input.cur) } else { (0, self.input.text.len()) };
+        let tail = if hint.ends_with('/') { "" } else { " " };
+        self.input.text.replace_range(start..end, &format!("{hint}{tail}"));
+        self.input.cur = start + hint.len() + tail.len();
     }
 
     /// Commands matching a `/partial` input (empty when not typing a command).
@@ -2367,6 +2455,7 @@ impl Ui {
         f.render_widget(UiBlock::default().style(band), input_area);
         let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
         let skip = cursor.0.saturating_sub(7);
+        let prompt = theme::agent(&self.app.turn.agent.name);
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
             let mut spans = vec![Span::raw("  ")];
@@ -2374,11 +2463,11 @@ impl Ui {
             il.push(Line::from(spans));
         }
         for (n, l) in input_lines.iter().enumerate().skip(skip).take(8) {
-            let prefix = if n == 0 { Span::styled("› ", theme::accent()) } else { Span::raw("  ") };
+            let prefix = if n == 0 { Span::styled("› ", prompt) } else { Span::raw("  ") };
             il.push(Line::from(vec![prefix, Span::raw(l.clone())]));
         }
         if self.input.text.is_empty() && self.images.is_empty() {
-            il = vec![Line::from(vec![Span::styled("› ", theme::accent()), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
+            il = vec![Line::from(vec![Span::styled("› ", prompt), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
         }
         f.render_widget(Paragraph::new(il).style(band), inner);
         let text_area = Rect { x: inner.x + 2, y: inner.y + chips, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(chips) };
@@ -2395,13 +2484,20 @@ impl Ui {
                 let max = 10.min(input_area.y as usize).max(1);
                 let start = sel.saturating_sub(max - 1);
                 let h = m.len().min(max) as u16;
-                let full = f.area().width;
-                let r = Rect { x: 0, y: input_area.y.saturating_sub(h), width: full, height: h };
+                // As wide as the input, not the terminal (the tab sidebar is not covered).
+                let w = input_area.width as usize;
+                let r = Rect { x: input_area.x, y: input_area.y.saturating_sub(h), width: input_area.width, height: h };
                 f.render_widget(Clear, r);
+                let name_w = m.iter().map(|(c, _)| c.width()).max().unwrap_or(0).max(10).min(w / 2);
                 let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
-                    let pad = " ".repeat((full as usize).saturating_sub(12 + d.width()));
-                    Line::from(vec![Span::styled(format!(" {c:<10}"), st.patch(Style::default().fg(ratatui::style::Color::White))), Span::styled(format!(" {d}{pad}"), st.patch(theme::dim()))])
+                    let name = fit(c, name_w);
+                    let desc = fit(d, w.saturating_sub(name_w + 2));
+                    let pad = " ".repeat(w.saturating_sub(name_w + 2 + desc.width()));
+                    Line::from(vec![
+                        Span::styled(format!(" {name:<name_w$}"), st.patch(Style::default().fg(Color::White))),
+                        Span::styled(format!(" {desc}{pad}"), st.patch(theme::dim())),
+                    ])
                 }).collect();
                 f.render_widget(Paragraph::new(lines), r);
             }
@@ -2409,26 +2505,27 @@ impl Ui {
 
         // status bar
         let a = &self.app.turn.agent;
+        let ag = theme::agent(&a.name);
         let mut left = vec![
-            Span::styled(" θ ", theme::logo()),
+            Span::styled(" θ ", theme::logo(&a.name)),
             Span::styled(format!(" {} ", a.name), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(format!("({})", a.scope.label()), theme::dim()),
             Span::styled("  ", theme::dim()),
-            Span::styled(self.app.turn.model.clone(), theme::accent()),
+            Span::styled(self.app.turn.model.clone(), ag),
             Span::styled(format!(" · {}", self.app.turn.effort), theme::dim()),
         ];
         if !self.verbose() {
             left.push(Span::styled(" · compact", theme::dim()));
         }
         if let Some(s) = &self.ssh {
-            left.push(Span::styled(format!(" · ⇢ {}:{}", s.host, s.cwd), theme::accent()));
+            left.push(Span::styled(format!(" · ⇢ {}:{}", s.host, s.cwd), ag));
         }
         let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
         if live > 0 {
-            left.push(Span::styled(format!(" · ⚙ {live}"), theme::accent()));
+            left.push(Span::styled(format!(" · ⚙ {live}"), ag));
         }
         match &self.remote_state {
-            RemoteState::Linked => left.push(Span::styled(" · ⇄ remote", theme::accent())),
+            RemoteState::Linked => left.push(Span::styled(" · ⇄ remote", ag)),
             RemoteState::Code { .. } => left.push(Span::styled(" · ⇄ waiting for browser", theme::dim())),
             _ => {}
         }
@@ -2436,7 +2533,7 @@ impl Ui {
         let pct = if ctx_max > 0 { self.ctx_tokens * 100 / ctx_max } else { 0 };
         let title = self.app.session.lock().unwrap().title.clone().unwrap_or_default();
         let right = match &self.notice {
-            Some((n, t)) if t.elapsed() < Duration::from_secs(4) => vec![Span::styled(format!("{n} "), theme::accent())],
+            Some((n, t)) if t.elapsed() < Duration::from_secs(4) => vec![Span::styled(format!("{n} "), ag)],
             _ => vec![
                 Span::styled(format!("{} ", title.chars().take(30).collect::<String>()), theme::dim()),
                 Span::styled(format!("{}k/{}k {}% ", self.ctx_tokens / 1000, ctx_max / 1000, pct), if pct >= 80 { theme::err() } else { theme::dim() }),
@@ -2467,7 +2564,7 @@ impl Ui {
     fn splash(&self, h: usize) -> Vec<Line<'static>> {
         const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
-        let accent = theme::accent();
+        let accent = theme::agent(&a.name);
         let white = Style::default().fg(Color::White);
         let mut out: Vec<Line<'static>> = LOGO
             .iter()
@@ -3463,6 +3560,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         asks: VecDeque::new(),
         login_tx,
         cmd_sel: 0,
+        mentions: std::cell::RefCell::new((String::new(), Instant::now(), Vec::new())),
         settings_back: None,
         quit: false,
         tabs: vec![Tab::new(0)],
@@ -3574,6 +3672,35 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mentions_navigate_to_a_file() {
+        let root = std::env::temp_dir().join(format!("theta-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/tui")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("src/tui/mod.rs"), "x").unwrap();
+        std::fs::write(root.join("src/main.rs"), "x").unwrap();
+        std::fs::write(root.join("README.md"), "x").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("target/junk.rs"), "x").unwrap();
+        let names = |q: &str| super::mention_entries(&root, q).into_iter().map(|(p, _)| p).collect::<Vec<_>>();
+        // folders first, ignored and hidden entries left out
+        assert_eq!(names(""), ["@src/", "@README.md"]);
+        assert_eq!(names("sr"), ["@src/"]);
+        assert_eq!(names("src/"), ["@src/tui/", "@src/main.rs"]);
+        assert_eq!(names("src/t"), ["@src/tui/"]);
+        // no folder typed: also found deeper
+        assert_eq!(names("mod"), ["@src/tui/mod.rs"]);
+        assert!(names("junk").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fit_cuts_by_width() {
+        assert_eq!(super::fit("abcdef", 6), "abcdef");
+        assert_eq!(super::fit("abcdef", 4), "abc…");
+    }
+
     #[test]
     fn editor_word_moves_and_click() {
         let mut e = super::Editor { text: "ab cd  ef".into(), cur: 0 };

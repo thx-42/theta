@@ -25,3 +25,5 @@
 - `/reload`: re-read settings, agents, skills, MCP config and these guides.
 - `/help`: keys and commands.
 - `/quit`: exit.
+
+In the input, besides `/`: `$name` suggests skills, `@path` suggests files and folders (tab goes into a folder, `.gitignore` is honored, `@mod` also finds `src/tui/mod.rs`). The list is as wide as the input.
