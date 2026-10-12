@@ -185,6 +185,9 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) ->
     if !skills.is_empty() {
         parts.push(skills.to_string());
     }
+    if let Some(guides) = guides() {
+        parts.push(guides);
+    }
     let date = chrono_date();
     parts.push(format!(
         "# Environment\n- cwd: {}\n- project root: {}\n- platform: {} {}\n- date: {date}",
@@ -200,6 +203,14 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) ->
         }
     }
     parts.join("\n\n")
+}
+
+/// Every guide in ~/.theta/docs, in name order: lets theta explain and configure itself.
+fn guides() -> Option<String> {
+    let mut files: Vec<_> = std::fs::read_dir(config::home().join("docs")).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+    files.sort();
+    let texts: Vec<String> = files.iter().filter_map(|p| read(p)).collect();
+    (!texts.is_empty()).then(|| format!("# theta guides (~/.theta/docs)\n\n{}", texts.join("\n\n")))
 }
 
 fn chrono_date() -> String {

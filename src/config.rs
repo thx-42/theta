@@ -161,7 +161,7 @@ impl Default for ToolSettings {
 }
 
 /// One MCP server: `command` (stdio) or `url` (streamable HTTP). `${VAR}` in values is expanded.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServer {
     pub command: String,
@@ -298,11 +298,44 @@ pub fn bootstrap() -> Result<()> {
         std::fs::write(&auto_soul, crate::agents::DEFAULT_AUTO_SOUL)?;
     }
     sync_agents(&h.join("agents"));
+    let changed = write_docs()?;
+    if !changed.is_empty() {
+        eprintln!("theta: guides updated in {}: {}", h.join("docs").display(), changed.join(", "));
+    }
     let settings = global_settings_path();
     if !settings.exists() {
         std::fs::write(&settings, DEFAULT_SETTINGS)?;
     }
     Ok(())
+}
+
+/// Guides shipped in the binary; they describe theta to the agent, so they are always replaced.
+pub const DOCS: &[(&str, &str)] = &[
+    ("README.md", include_str!("../docs/README.md")),
+    ("config.md", include_str!("../docs/config.md")),
+    ("mcp.md", include_str!("../docs/mcp.md")),
+    ("tools.md", include_str!("../docs/tools.md")),
+    ("agents.md", include_str!("../docs/agents.md")),
+    ("create-agents.md", include_str!("../docs/create-agents.md")),
+    ("skills.md", include_str!("../docs/skills.md")),
+    ("remote.md", include_str!("../docs/remote.md")),
+    ("commands.md", include_str!("../docs/commands.md")),
+];
+
+/// Write the shipped guides to ~/.theta/docs (other files there are left alone).
+/// Returns the names of the guides that were missing or different, so the caller can say so.
+pub fn write_docs() -> Result<Vec<&'static str>> {
+    let dir = home().join("docs");
+    std::fs::create_dir_all(&dir)?;
+    let mut changed = Vec::new();
+    for (name, text) in DOCS {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(*text) {
+            std::fs::write(&path, text)?;
+            changed.push(*name);
+        }
+    }
+    Ok(changed)
 }
 
 /// Install the shipped agents. `.shipped` records the hash of the version last written (or offered):

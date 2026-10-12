@@ -110,6 +110,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "subscription limits and resets (Claude, Codex)"),
     ("/stats", "token statistics across all sessions"),
     ("/copy", "copy the last answer"),
+    ("/reload", "re-read settings, agents, skills, MCP config and the guides"),
     ("/help", "keys and commands"),
     ("/quit", "exit"),
 ];
@@ -362,6 +363,41 @@ impl Editor {
             self.cur = start;
         }
     }
+    /// Byte index of the char under visual (row, col) for `width`, same wrap as `layout`.
+    fn at(&self, width: usize, row: usize, col: usize) -> usize {
+        let width = width.max(4);
+        let (mut line, mut w) = (0, 0);
+        for (i, c) in self.text.char_indices() {
+            if c == '\n' {
+                if line == row {
+                    return i;
+                }
+                line += 1;
+                w = 0;
+                continue;
+            }
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > width {
+                line += 1;
+                w = 0;
+            }
+            if line > row || (line == row && w + cw > col) {
+                return i;
+            }
+            w += cw;
+        }
+        self.text.len()
+    }
+    fn word_left(&mut self) {
+        let t = self.text[..self.cur].trim_end();
+        self.cur = t.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+    }
+    fn word_right(&mut self) {
+        let rest = &self.text[self.cur..];
+        let t = rest.trim_start();
+        let lead = rest.len() - t.len();
+        self.cur += lead + t.find(char::is_whitespace).unwrap_or(t.len());
+    }
     fn delete_word(&mut self) {
         let before = &self.text[..self.cur];
         let trimmed = before.trim_end();
@@ -482,6 +518,8 @@ struct Ui {
     shell_tx: UnboundedSender<String>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
+    /// Input text area as drawn last frame: (rect, first visible visual row, wrap width).
+    input_hit: (Rect, usize, usize),
     /// Sidebar rect as drawn last frame (vertical only; empty otherwise).
     sidebar: Rect,
     /// Live sidebar width while dragging its divider; saved on release.
@@ -915,6 +953,7 @@ impl Ui {
             "/cd" if arg.is_empty() => self.remote.send(Req::Ls(String::new())),
             "/cd" => self.remote.send(Req::Cd(arg.to_string())),
             "/linters" => self.overlay = Some(Overlay::Report("θ linters".into(), crate::lint::report(&self.app.rt.settings))),
+            "/reload" => self.reload(),
             "/help" => self.overlay = Some(Overlay::Help),
             "/quit" | "/exit" => self.quit = true,
             _ => self.notify(format!("unknown command {cmd}")),
@@ -1002,6 +1041,21 @@ impl Ui {
     /// Join (or create) a session in the daemon; the snapshot that comes back resets the view.
     fn attach(&mut self, target: Where) {
         self.remote.send(Req::Attach { target, cwd: self.app.rt.cwd.clone(), agent: None, model: None });
+    }
+
+    /// Re-read everything from disk here and in the daemon, which also reconnects changed MCP servers.
+    fn reload(&mut self) {
+        let project = self.app.rt.project.clone();
+        let settings = match config::load(&project) {
+            Ok(s) => s,
+            Err(e) => return self.notify(format!("reload failed: {e:#}")),
+        };
+        self.app.rt.skills = Arc::new(crate::skills::discover(&project, &settings.skills.auto));
+        self.app.rt.agents = Arc::new(agents::discover(&project));
+        self.app.rt.settings = Arc::new(settings);
+        self.remote.send(Req::Reload);
+        self.invalidate_all();
+        self.notify("reloaded settings, agents, skills, MCP config and guides");
     }
 
     fn update_settings(&mut self, key: &str, value: toml::Value, apply: impl FnOnce(&mut config::Settings)) {
@@ -1198,7 +1252,7 @@ impl Ui {
             self.remote.send(Req::McpStatus);
             return;
         }
-        let Some(cfg) = mcp.config(name).cloned() else { return self.notify(format!("usage: /mcp {action} <server> (see /mcp)")) };
+        let Some(cfg) = mcp.config(name) else { return self.notify(format!("usage: /mcp {action} <server> (see /mcp)")) };
         let n = name.to_string();
         match action {
             "login" => {
@@ -1385,7 +1439,12 @@ impl Ui {
             }
             KeyCode::Char('n') if alt => self.new_tab(),
             KeyCode::Char('w') if alt => self.close_tab(),
-            KeyCode::Char('b') if alt => self.toggle_tab_bar(),
+            // Word moves: Option+Left/Right send ESC b / ESC f on macOS terminals, so alt+b/f must be word moves.
+            KeyCode::Backspace if alt => self.input.delete_word(),
+            KeyCode::Left if alt => self.input.word_left(),
+            KeyCode::Right if alt => self.input.word_right(),
+            KeyCode::Char('b') if alt => self.input.word_left(),
+            KeyCode::Char('f') if alt => self.input.word_right(),
             KeyCode::Char('j') if alt => self.open_jobs(),
             KeyCode::PageDown if alt => self.step_tab(1),
             KeyCode::PageUp if alt => self.step_tab(-1),
@@ -2198,6 +2257,8 @@ impl Ui {
             il = vec![Line::from(vec![Span::styled("› ", theme::accent()), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
         }
         f.render_widget(Paragraph::new(il).style(band), inner);
+        let text_area = Rect { x: inner.x + 2, y: inner.y + chips, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(chips) };
+        self.input_hit = (text_area, skip, width.saturating_sub(2));
         if self.overlay.is_none() {
             f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + chips + (cursor.0 - skip) as u16));
         }
@@ -3031,6 +3092,11 @@ impl Ui {
         if self.overlay.is_some() {
             return;
         }
+        let (r, skip, w) = self.input_hit;
+        if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height && !self.input.text.is_empty() {
+            self.input.cur = self.input.at(w, skip + (row - r.y) as usize, (col - r.x) as usize);
+            return;
+        }
         let mut hit = None;
         for (i, (tab, close)) in self.strip.tabs.iter().enumerate() {
             if tabs::hit(*close, col, row) {
@@ -3250,6 +3316,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         opened_tx,
         shell_tx,
         strip: tabs::Strip::default(),
+        input_hit: (Rect::default(), 0, 0),
         sidebar: Rect::default(),
         drag: None,
         sel: None,
@@ -3351,6 +3418,27 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_word_moves_and_click() {
+        let mut e = super::Editor { text: "ab cd  ef".into(), cur: 0 };
+        e.word_right();
+        assert_eq!(e.cur, 2);
+        e.word_right();
+        assert_eq!(e.cur, 5);
+        e.word_right();
+        assert_eq!(e.cur, 9);
+        e.word_left();
+        assert_eq!(e.cur, 7);
+        e.word_left();
+        assert_eq!(e.cur, 3);
+        e.word_left();
+        assert_eq!(e.cur, 0);
+        // click on col 4 of a 3-wide-wrapped line lands in the second visual row
+        let e = super::Editor { text: "abcdefgh".into(), cur: 0 };
+        assert_eq!(e.at(4, 0, 2), 2);
+        assert_eq!(e.at(4, 1, 1), 5);
+    }
+
     #[test]
     fn agent_colors_are_stable_and_distinct() {
         use super::theme::color_for;

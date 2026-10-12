@@ -113,9 +113,14 @@ impl Server {
 
     async fn reload(&self) {
         self.base.auth.reload().await;
+        let _ = config::write_docs();
+        if let Ok(settings) = config::load(&self.base.project) {
+            self.base.mcp.reload(&settings.mcp).await;
+        }
         let all: Vec<(PathBuf, Runtime)> = self.runtimes.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         for (cwd, mut rt) in all {
             let Ok(settings) = config::load(&rt.project) else { continue };
+            rt.skills = Arc::new(crate::skills::discover(&rt.project, &settings.skills.auto));
             rt.settings = Arc::new(settings);
             rt.agents = Arc::new(crate::agents::discover(&rt.project));
             for live in self.lives.lock().unwrap().values() {
@@ -123,6 +128,7 @@ impl Server {
                 if st.rt.cwd == cwd {
                     st.rt.settings = rt.settings.clone();
                     st.rt.agents = rt.agents.clone();
+                    st.rt.skills = rt.skills.clone();
                 }
             }
             self.runtimes.lock().unwrap().insert(cwd, rt);

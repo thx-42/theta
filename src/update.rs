@@ -241,6 +241,8 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     if state.exists() {
         let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
     }
+    // This process still holds the old guides: the new binary writes its own.
+    let _ = std::process::Command::new(&exe).arg("docs").status();
     ink.cat("^o^", &format!("updated to {}", ink.paint("1", &latest)));
     restart_daemon(&ink).await;
     Ok(())

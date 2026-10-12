@@ -75,6 +75,8 @@ enum Cmd {
     },
     /// Refresh the model catalog from models.dev.
     Refresh,
+    /// Write the shipped guides to ~/.theta/docs and say which changed (the installer runs this).
+    Docs,
     /// Nightly only: dump a whole session (messages, tool calls, nested subagent transcripts) as Markdown.
     #[command(hide = !update::is_dev())]
     Dump {
@@ -294,6 +296,16 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
+        Some(Cmd::Docs) => {
+            let changed = config::write_docs()?;
+            let dir = config::home().join("docs");
+            if changed.is_empty() {
+                println!("guides already up to date in {}", dir.display());
+            } else {
+                println!("guides updated in {}: {}", dir.display(), changed.join(", "));
+            }
+            return Ok(());
+        }
         Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
         None => {}
     }

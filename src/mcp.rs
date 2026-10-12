@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -368,7 +368,7 @@ struct Slot {
 }
 
 pub struct Registry {
-    cfg: BTreeMap<String, McpServer>,
+    cfg: RwLock<BTreeMap<String, McpServer>>,
     slots: Mutex<BTreeMap<String, Slot>>,
 }
 
@@ -376,28 +376,41 @@ impl Registry {
     /// Nothing is started until `connect_all`.
     pub fn new(cfg: &BTreeMap<String, McpServer>) -> Registry {
         let slots = cfg.keys().map(|k| (k.clone(), Slot { client: None, error: Some("not connected".into()) })).collect();
-        Registry { cfg: cfg.clone(), slots: Mutex::new(slots) }
+        Registry { cfg: RwLock::new(cfg.clone()), slots: Mutex::new(slots) }
     }
 
     pub fn has(&self, name: &str) -> bool {
-        self.cfg.contains_key(name)
+        self.cfg.read().unwrap().contains_key(name)
     }
 
-    pub fn config(&self, name: &str) -> Option<&McpServer> {
-        self.cfg.get(name)
+    pub fn config(&self, name: &str) -> Option<McpServer> {
+        self.cfg.read().unwrap().get(name).cloned()
     }
 
     pub async fn connect_all(&self) {
-        futures::future::join_all(self.cfg.keys().map(|n| self.connect(n))).await;
+        let names: Vec<String> = self.cfg.read().unwrap().keys().cloned().collect();
+        futures::future::join_all(names.iter().map(|n| self.connect(n))).await;
+    }
+
+    /// Apply a new `[mcp]` table: drop removed servers, (re)connect added or changed ones, keep the rest.
+    pub async fn reload(&self, cfg: &BTreeMap<String, McpServer>) {
+        let changed: Vec<String> = {
+            let mut cur = self.cfg.write().unwrap();
+            let changed = cfg.iter().filter(|(k, v)| cur.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+            *cur = cfg.clone();
+            changed
+        };
+        self.slots.lock().unwrap().retain(|k, _| cfg.contains_key(k));
+        futures::future::join_all(changed.iter().map(|n| self.connect(n))).await;
     }
 
     /// (Re)connect one server; failure is kept as its status.
     pub async fn connect(&self, name: &str) {
-        let Some(cfg) = self.cfg.get(name) else { return };
+        let Some(cfg) = self.config(name) else { return };
         let slot = if !cfg.enabled {
             Slot { client: None, error: Some("disabled".into()) }
         } else {
-            match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(name, cfg)).await {
+            match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(name, &cfg)).await {
                 Ok(Ok(c)) => Slot { client: Some(Arc::new(c)), error: None },
                 Ok(Err(e)) => Slot { client: None, error: Some(format!("{e:#}")) },
                 Err(_) => Slot { client: None, error: Some("connect timeout".into()) },
@@ -429,8 +442,8 @@ impl Registry {
     /// One line per server for `/mcp`.
     pub fn status(&self) -> Vec<String> {
         let slots = self.slots.lock().unwrap();
-        self.cfg
-            .iter()
+        let cfg = self.cfg.read().unwrap();
+        cfg.iter()
             .map(|(n, cfg)| {
                 let kind = if cfg.url.is_empty() { "stdio" } else { "http" };
                 match slots.get(n) {

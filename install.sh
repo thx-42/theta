@@ -164,6 +164,12 @@ path_hint() {
   esac
 }
 
+# documentation de theta (~/.theta/docs) : écrite à chaque installation, dit ce qui a changé
+refresh_docs() {
+  step "documentation de theta"
+  "$BIN_DIR/$BIN_NAME" docs || warn "documentation non mise à jour"
+}
+
 cmd_install() {
   banner
   local method="${1:-}"
@@ -175,6 +181,7 @@ cmd_install() {
     *) die "méthode inconnue : $method" ;;
   esac
   ok "θ installé ($method, $CHANNEL) → $BIN_DIR/$BIN_NAME"
+  refresh_docs
   path_hint
   printf '\n  %sessaie :%s theta --help\n' "$C_DIM" "$C_RESET"
 }
@@ -199,11 +206,13 @@ cmd_update() {
   [[ -n "$new" ]] || die "impossible de déterminer la dernière version"
   if [[ "$cur" == "$new" ]]; then
     ok "θ déjà à jour ($method, ${cur:0:12})"
+    refresh_docs
     return
   fi
   step "mise à jour ($method, $CHANNEL) : ${cur:0:12} → ${new:0:12}"
   if [[ "$method" == release ]]; then install_release; else install_source; fi
   ok "θ mis à jour"
+  refresh_docs
 }
 
 cmd_uninstall() {
