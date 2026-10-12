@@ -325,7 +325,7 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 | `alt+pgdn` / `alt+pgup` | onglet suivant / précédent |
 | clic sur un onglet · sur `×` · sur `+` | aller à / fermer / ouvrir un onglet |
 
-`/` affiche les commandes, `$` les skills et `@` les fichiers : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` ou `@fichier` incomplet, `enter` complète d'abord). `@src/` descend dans le dossier, `@mod` retrouve aussi `src/tui/mod.rs` plus profond ; `.gitignore` est respecté. La liste a la largeur de l'input. Rien n'a de couleur propre : l'interface (barre du bas, logo, `›`, listes, spinner, titres) prend la couleur de l'agent actif, et chaque message ou outil garde celle de l'agent qui l'a écrit. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
+`/` affiche les commandes, `$` les skills et `@` les fichiers : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` ou `@fichier` incomplet, `enter` complète d'abord). `@src/` descend dans le dossier, `@mod` retrouve aussi `src/tui/mod.rs` plus profond ; `.gitignore` est respecté. La liste a la largeur de l'input. Rien n'a de couleur propre : l'interface (barre du bas, logo, listes, spinner, titres) prend la couleur de l'agent actif (le prompt utilisateur et son `›` restent blancs), et chaque message ou outil garde celle de l'agent qui l'a écrit. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
 Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
 

@@ -2193,8 +2193,8 @@ impl Ui {
     // ---------- drawing ----------
 
     /// Assistant and tool parts get a gutter bar in the color of the agent that wrote them.
-    /// Everything accented inside an item (bullets, headings, spinner, `›`) takes the color of its agent;
-    /// a prompt takes the color of the first agent that answered it.
+    /// Everything accented inside an item (bullets, headings, spinner) takes the color of its agent;
+    /// a prompt keeps its white `›`, its agent label names who answered.
     fn item_lines(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
         match &self.items[i] {
             Item::Assistant { agent, .. } | Item::Tool { agent, .. } => theme::as_agent(agent, || {
@@ -2237,7 +2237,7 @@ impl Ui {
         let mut top = vec![left, Span::raw(" ".repeat(width.saturating_sub(used)))];
         top.extend(label);
         let mut out = vec![Line::from(top).style(band)];
-        for l in markdown::wrap(spans, width, vec![Span::styled("› ", theme::accent().add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
+        for l in markdown::wrap(spans, width, vec![Span::styled("› ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
             let fill = width.saturating_sub(l.width());
             let mut s = l.spans;
             s.push(Span::raw(" ".repeat(fill)));
@@ -2472,7 +2472,7 @@ impl Ui {
         f.render_widget(UiBlock::default().style(band), input_area);
         let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
         let skip = cursor.0.saturating_sub(7);
-        let prompt = theme::agent(&self.app.turn.agent.name);
+        let prompt = Style::default().fg(Color::White);
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
             let mut spans = vec![Span::raw("  ")];
