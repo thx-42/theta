@@ -175,9 +175,16 @@ fn short_model(m: &str) -> &str {
     m.rsplit('/').next().unwrap_or(m)
 }
 
+/// `max` columns of `s` looping like an LED sign, shifted by `offset` characters.
+fn marquee(s: &str, max: usize, offset: usize) -> String {
+    let chars: Vec<char> = format!("{s}   ").chars().collect();
+    (0..max).map(|i| chars[(offset + i) % chars.len()]).collect()
+}
+
 /// Render the tab strip into `area` and return its clickable parts.
 /// Horizontal: one row. Vertical: a card of `CARD` rows per tab, then a + row, then the divider.
-pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<Line<'static>>, Strip) {
+/// `hover` is the hovered tab and the marquee offset: its title scrolls when it does not fit.
+pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, hover: Option<(usize, usize)>) -> (Vec<Line<'static>>, Strip) {
     let mut out = Strip::default();
     // A tab at work shows in the color of its own agent.
     let glyph = |status: TabStatus, agent: &str| match status {
@@ -188,6 +195,10 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
     };
     let name = |t: &str| if t.trim().is_empty() { "new session".to_string() } else { t.trim().to_string() };
     let style = |active: bool| if active { theme::sel() } else { theme::dim() };
+    let fit = |i: usize, t: &str, max: usize| match hover {
+        Some((h, off)) if h == i && t.chars().count() > max => marquee(t, max, off),
+        _ => clip(t, max),
+    };
 
     if vertical {
         // One blank column on each side of the cards, then the divider on the last column.
@@ -208,7 +219,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
             let idx = format!(" {} ", i + 1);
             // Row 1: glyph, number, title, then " ×" at the right edge.
             let room = w.saturating_sub(1 + 1 + idx.len() + 2);
-            let title = clip(&name(&t.title), room);
+            let title = fit(i, &name(&t.title), room);
             lines.push(row(vec![
                 Span::styled(" ", st),
                 Span::styled(g, st.patch(c)),
@@ -255,7 +266,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
         let w = (5 + format!("{}", i + 1).len() + max.min(name(&t.title).chars().count())) as u16;
         spans.push(Span::styled(" ", st));
         spans.push(Span::styled(g, st.patch(c)));
-        spans.push(Span::styled(format!(" {} {} ", i + 1, clip(&name(&t.title), max)), st));
+        spans.push(Span::styled(format!(" {} {} ", i + 1, fit(i, &name(&t.title), max)), st));
         let tab = Rect { x, y: area.y, width: w, height: 1 };
         x += w;
         spans.push(Span::styled("×", st.patch(theme::dim())));
@@ -291,6 +302,16 @@ mod tests {
         t.watch(&ev(Event::Interrupted));
         t.watch(&ev(Event::Done));
         assert_eq!(t.status, TabStatus::Idle);
+    }
+
+    #[test]
+    fn marquee_loops_the_title_across_the_width() {
+        assert_eq!(marquee("abcdef", 4, 0), "abcd");
+        assert_eq!(marquee("abcdef", 4, 2), "cdef");
+        // Wraps through the gap after the title, then back to the start.
+        assert_eq!(marquee("abcdef", 4, 5), "f   ");
+        assert_eq!(marquee("abcdef", 4, 6), "   a");
+        assert_eq!(marquee("abcdef", 4, 9), "abcd");
     }
 
     #[test]

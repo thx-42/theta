@@ -545,6 +545,9 @@ struct Ui {
     shell_tx: UnboundedSender<String>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
+    /// Tab under the mouse, and the marquee offset of its title.
+    hover: Option<usize>,
+    marquee: usize,
     /// Input text area as drawn last frame: (rect, first visible visual row, wrap width).
     input_hit: (Rect, usize, usize),
     /// Sidebar rect as drawn last frame (vertical only; empty otherwise).
@@ -2389,7 +2392,8 @@ impl Ui {
             (a, b)
         };
         self.sidebar = if vertical { strip_area } else { Rect::default() };
-        let (lines, strip) = if hidden { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical) };
+        let hover = self.hover.map(|i| (i, self.marquee));
+        let (lines, strip) = if hidden { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical, hover) };
         if !hidden {
             f.render_widget(Paragraph::new(lines), strip_area);
         }
@@ -3383,6 +3387,15 @@ impl Ui {
         }
     }
 
+    /// Mouse moved: the tab under it scrolls its title from the start.
+    fn on_hover(&mut self, col: u16, row: u16) {
+        let hover = self.strip.tabs.iter().position(|(tab, _)| tabs::hit(*tab, col, row));
+        if hover != self.hover {
+            self.hover = hover;
+            self.marquee = 0;
+        }
+    }
+
     /// Mouse on the tab strip: × closes, the title switches, + opens a new session.
     fn on_click(&mut self, col: u16, row: u16) {
         if self.overlay.is_some() {
@@ -3612,6 +3625,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         opened_tx,
         shell_tx,
         strip: tabs::Strip::default(),
+        hover: None,
+        marquee: 0,
         input_hit: (Rect::default(), 0, 0),
         sidebar: Rect::default(),
         drag: None,
@@ -3662,6 +3677,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 Some(Ok(CEvent::Mouse(m))) => match m.kind {
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),
+                    MouseEventKind::Moved => ui.on_hover(m.column, m.row),
                     MouseEventKind::Down(MouseButton::Left) if ui.on_divider(m.column, m.row) => ui.drag = Some(ui.sidebar.width),
                     MouseEventKind::Drag(MouseButton::Left) if ui.drag.is_some() => ui.drag = Some(m.column.saturating_sub(ui.sidebar.x) + 1),
                     MouseEventKind::Drag(MouseButton::Left) => ui.sel_drag(m.column, m.row),
@@ -3691,6 +3707,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {
                     ui.spin += 1;
                 }
+                ui.marquee += 1;
                 ui.poll_job();
             }
         }
