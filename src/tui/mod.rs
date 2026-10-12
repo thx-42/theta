@@ -2555,11 +2555,9 @@ impl Ui {
         }
         let ctx_max = self.model_ctx();
         let pct = if ctx_max > 0 { self.ctx_tokens * 100 / ctx_max } else { 0 };
-        let title = self.app.session.lock().unwrap().title.clone().unwrap_or_default();
         let right = match &self.notice {
             Some((n, t)) if t.elapsed() < Duration::from_secs(4) => vec![Span::styled(format!("{n} "), ag)],
             _ => vec![
-                Span::styled(format!("{} ", title.chars().take(30).collect::<String>()), theme::dim()),
                 Span::styled(format!("{}k/{}k {}% ", self.ctx_tokens / 1000, ctx_max / 1000, pct), if pct >= 80 { theme::err() } else { theme::dim() }),
                 Span::styled(format!("${:.3} ", self.cost), theme::dim()),
             ],
