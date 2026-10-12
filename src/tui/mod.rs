@@ -322,14 +322,10 @@ struct DirView {
     sel: usize,
 }
 
-/// Ctrl+x leader keys, shown while the leader is armed.
-const LEADER: &[(&str, &str)] = &[
-    ("1 … 9", "go to tab"),
-    ("n", "new session tab"),
-    ("w", "close session tab"),
-    ("b", "hide / show tab bar"),
-    ("j", "background jobs"),
-    ("h / l", "previous / next tab"),
+/// Ctrl+x leader keys, grouped; shown while the leader is armed.
+const LEADER: &[(&str, &[(&str, &str)])] = &[
+    ("tabs", &[("1 … 9", "go to tab"), ("h  l", "previous / next tab"), ("n", "new session tab"), ("w", "close session tab"), ("b", "hide / show tab bar")]),
+    ("agent", &[("m", "model of this conversation"), ("j", "running agents & jobs")]),
 ];
 
 enum Overlay {
@@ -1238,11 +1234,10 @@ impl Ui {
             let e = s.agents.entry(k).or_default();
             if f == "model" { e.model = v } else { e.effort = v }
         });
+        // The model is re-resolved by the daemon on reload, so a model picked in this conversation still wins.
         if self.app.turn.agent.name.eq_ignore_ascii_case(&name) {
             let s = &self.app.rt.settings;
-            self.app.turn.model = agents::model_of(&agent, s).unwrap_or_else(|| s.model.clone());
             self.app.turn.effort = agents::effort_of(&agent, s).unwrap_or_else(|| s.effort.clone());
-            self.remote.send(Req::SetModel(self.app.turn.model.clone()));
             self.remote.send(Req::SetEffort(self.app.turn.effort.clone()));
         }
     }
@@ -1264,7 +1259,7 @@ impl Ui {
         };
         let mut items = Vec::new();
         match target {
-            Target::Main => {}
+            Target::Main => items.push(item("(default)", "from agent setting or main model", "")),
             Target::Agent(_) => items.push(item("(default)", "from agent file or main model", "")),
             _ => items.push(item("(same as main model)", "", "")),
         }
@@ -1489,9 +1484,8 @@ impl Ui {
                 let v = value.clone();
                 match t {
                     Target::Main => {
-                        self.app.turn.model = value.clone();
-                        self.remote.send(Req::SetModel(value.clone()));
-                        self.update_settings("model", value.clone().into(), |s| s.model = v);
+                        // Kept in this conversation only: the daemon stores it in the session and answers with Push::Meta.
+                        self.remote.send(Req::PickModel(v));
                         self.ctx_tokens = crate::compact::current_tokens(&self.app.session.lock().unwrap());
                     }
                     Target::Compaction => self.update_settings("models.compaction", value.clone().into(), |s| s.models.compaction = v),
@@ -1499,7 +1493,7 @@ impl Ui {
                     Target::Subagent => self.update_settings("models.subagent", value.clone().into(), |s| s.models.subagent = v),
                     Target::Agent(i) => self.set_agent_setting(i, "model", value.clone()),
                 }
-                self.notify(format!("model: {}", if value.is_empty() { "main model" } else { &value }));
+                self.notify(format!("model: {}", if value.is_empty() { "default" } else { &value }));
                 self.back_to_settings();
             }
             Purpose::Agent => {
@@ -1565,6 +1559,7 @@ impl Ui {
                 KeyCode::Char('w') => self.close_tab(),
                 KeyCode::Char('b') => self.toggle_tab_bar(),
                 KeyCode::Char('j') => self.open_jobs(),
+                KeyCode::Char('m') => self.open_models(Target::Main),
                 KeyCode::Char('h') => self.step_tab(-1),
                 KeyCode::Char('l') => self.step_tab(1),
                 KeyCode::Esc => {}
@@ -2653,7 +2648,7 @@ impl Ui {
         let iw = w.saturating_sub(6) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 18,
-            Overlay::Leader => LEADER.len() + 2,
+            Overlay::Leader => LEADER.iter().map(|(_, keys)| keys.len() + 2).sum::<usize>() + 2,
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
@@ -2727,11 +2722,13 @@ impl Ui {
                 let mut l = Vec::new();
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 if let Some(id) = &v.view {
-                    let rows = h.saturating_sub(4) as usize;
+                    let rows = h.saturating_sub(6) as usize;
                     let lines: Vec<&str> = v.text.lines().collect();
                     l.extend(lines[lines.len().saturating_sub(rows)..].iter().map(|x| Line::from(x.to_string())));
+                    l.push(Line::default());
+                    l.push(hint("k stop · esc back"));
                     let label = self.jobs.iter().find(|j| &j.id == id).map(|j| j.label.chars().take(60).collect::<String>()).unwrap_or_default();
-                    f.render_widget(Paragraph::new(l).block(block(&format!("θ job {id} · {label}")).title_bottom(hint(" k stop · esc back "))), r);
+                    f.render_widget(Paragraph::new(l).block(block(&format!("θ job {id} · {label}"))), r);
                 } else {
                     for (i, j) in self.jobs.iter().enumerate() {
                         let (mark, st) = match j.status {
@@ -2758,7 +2755,9 @@ impl Ui {
                     if l.is_empty() {
                         l.push(Line::from(Span::styled(" no background jobs", theme::dim())));
                     }
-                    f.render_widget(Paragraph::new(l).block(block("θ jobs").title_bottom(hint(" ↑↓ select · enter output · k stop · esc close "))), r);
+                    l.push(Line::default());
+                    l.push(hint("↑↓ select · enter output · k stop · esc close"));
+                    f.render_widget(Paragraph::new(l).block(block("θ jobs")), r);
                 }
             }
             Overlay::Mcp(v) => {
@@ -2845,9 +2844,16 @@ impl Ui {
                 f.render_widget(Paragraph::new(l).block(block("θ help")), r);
             }
             Overlay::Leader => {
-                let mut l: Vec<Line> = LEADER.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("  {k:<12}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())])).collect();
-                l.push(Line::default());
-                l.push(hint(" a key to run · esc cancel "));
+                let mut l = Vec::new();
+                for (group, keys) in LEADER {
+                    l.push(Line::from(Span::styled(*group, theme::dim())));
+                    for (k, d) in keys.iter() {
+                        l.push(Line::from(vec![Span::styled(format!(" {k:^9} "), theme::accent().add_modifier(Modifier::BOLD)), Span::raw(" "), Span::raw(*d)]));
+                    }
+                    l.push(Line::default());
+                }
+                l.pop();
+                l.push(hint("a key to run · esc cancel"));
                 f.render_widget(Paragraph::new(l).block(block("θ ctrl+x")), r);
             }
             Overlay::Pick(p) => {

@@ -129,6 +129,8 @@ impl Server {
                     st.rt.settings = rt.settings.clone();
                     st.rt.agents = rt.agents.clone();
                     st.rt.skills = rt.skills.clone();
+                    st.turn.model = model_for_turn(&st.turn.agent, &rt.settings, pick_of(live, &st.turn.agent.name));
+                    let _ = live.bus.send(meta(&st));
                 }
             }
             self.runtimes.lock().unwrap().insert(cwd, rt);
@@ -174,7 +176,12 @@ impl Server {
         rt.jobs.on_change(move |l| {
             let _ = jobs_sink.send(Push::Jobs(l));
         });
-        let turn = crate::make_turn(&rt, agent, model)?;
+        let mut turn = crate::make_turn(&rt, agent, model)?;
+        if model.is_none()
+            && let Some(m) = session.model_for(&turn.agent.name)
+        {
+            turn.model = m.to_string();
+        }
         let live = Arc::new(Live {
             session: Arc::new(Mutex::new(session)),
             bus,
@@ -191,7 +198,8 @@ impl Server {
         }
         let mut st = live.st.lock().unwrap();
         if let Some(a) = agent.and_then(|n| agents::find(&st.rt.agents, n).cloned()) {
-            switch_agent(&mut st, a);
+            let pick = pick_of(live, &a.name);
+            switch_agent(&mut st, a, pick);
         }
         if let Some(m) = model {
             st.turn.model = m.to_string();
@@ -557,6 +565,15 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             st.turn.model = m;
             let _ = live.bus.send(meta(&st));
         }
+        Req::PickModel(m) => {
+            let mut st = live.st.lock().unwrap();
+            let name = st.turn.agent.name.clone();
+            if let Err(e) = live.session.lock().unwrap().set_model(&name, m.clone()) {
+                err(&format!("could not save model: {e}"));
+            }
+            st.turn.model = model_for_turn(&st.turn.agent, &st.rt.settings, pick_of(live, &name));
+            let _ = live.bus.send(meta(&st));
+        }
         Req::SetEffort(e) => {
             let mut st = live.st.lock().unwrap();
             st.turn.effort = e;
@@ -565,7 +582,8 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
         Req::SetAgent(name) => {
             let mut st = live.st.lock().unwrap();
             if let Some(a) = agents::find(&st.rt.agents, &name).cloned() {
-                switch_agent(&mut st, a);
+                let pick = pick_of(live, &a.name);
+                switch_agent(&mut st, a, pick);
                 let _ = live.bus.send(meta(&st));
             } else {
                 err(&format!("unknown agent `{name}`"));
@@ -642,14 +660,20 @@ fn send(live: &Arc<Live>, text: String, extra: String, images: Vec<Block>, out: 
     launch_turn(live, &mut st);
 }
 
+/// Model with pick (chosen by hand in this conversation) > agent setting > main model.
+fn model_for_turn(agent: &agents::Agent, settings: &config::Settings, pick: Option<String>) -> String {
+    pick.or_else(|| agents::model_of(agent, settings)).unwrap_or_else(|| settings.model.clone())
+}
+
+/// The model the user picked by hand for `agent` in this conversation, if any.
+fn pick_of(live: &Live, agent: &str) -> Option<String> {
+    live.session.lock().unwrap().model_for(agent).map(String::from)
+}
+
 /// Agent, plus the model and effort that agent implies (same rules the TUI used before the split).
-fn switch_agent(st: &mut State, a: agents::Agent) {
+fn switch_agent(st: &mut State, a: agents::Agent, pick: Option<String>) {
     let s = st.rt.settings.clone();
-    if let Some(m) = agents::model_of(&a, &s) {
-        st.turn.model = m;
-    } else if agents::model_of(&st.turn.agent, &s).is_some() {
-        st.turn.model = s.model.clone();
-    }
+    st.turn.model = model_for_turn(&a, &s, pick);
     if let Some(e) = agents::effort_of(&a, &s) {
         st.turn.effort = e;
     } else if agents::effort_of(&st.turn.agent, &s).is_some() {
@@ -775,7 +799,8 @@ fn after_run(live: &Arc<Live>, st: &mut State) {
     if let Some(name) = st.handoff.take()
         && let Some(a) = agents::find(&st.rt.agents, &name).cloned()
     {
-        switch_agent(st, a);
+        let pick = pick_of(live, &a.name);
+        switch_agent(st, a, pick);
         let _ = live.bus.send(meta(st));
         let text = "Plan approved. Implement it now, following the todo list.";
         if live.session.lock().unwrap().add_msg(Msg::user(text), None).is_ok() {

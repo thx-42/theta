@@ -37,6 +37,8 @@ pub enum Req {
     Interrupt,
     Answer { id: String, text: String },
     SetModel(String),
+    /// Model picked by hand for the current agent in this conversation (empty = back to the agent's setting).
+    PickModel(String),
     SetEffort(String),
     SetAgent(String),
     Compact,

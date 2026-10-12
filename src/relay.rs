@@ -34,6 +34,7 @@ pub fn allowed(req: &Req) -> bool {
             | Req::Interrupt
             | Req::Answer { .. }
             | Req::SetModel(_)
+            | Req::PickModel(_)
             | Req::SetEffort(_)
             | Req::SetAgent(_)
             | Req::Compact

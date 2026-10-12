@@ -52,6 +52,9 @@ fn render(path: &std::path::Path, depth: usize, seen: &mut HashSet<PathBuf>, out
             Kind::Leaf { target } => {
                 let _ = writeln!(buf, "_branch switched to `{target}`_\n");
             }
+            Kind::Model { agent, model } => {
+                let _ = writeln!(buf, "_model for {agent}: {}_\n", if model.is_empty() { "default" } else { model });
+            }
             Kind::Compaction { summary, tokens_before, .. } => {
                 let _ = writeln!(buf, "## compaction ({tokens_before} tokens before)\n{}\n", fence(summary));
             }

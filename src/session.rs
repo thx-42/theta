@@ -19,6 +19,8 @@ pub enum Kind {
     Title { title: String },
     /// Active branch switched to `target` (empty = root).
     Leaf { target: String },
+    /// Model picked by hand for `agent` in this conversation (empty = back to the agent's own setting).
+    Model { agent: String, model: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +41,8 @@ pub struct Session {
     pub entries: Vec<Entry>,
     index: HashMap<String, usize>,
     pub leaf: Option<String>,
+    /// Model picked by hand per agent (lowercase agent name), replayed from `Kind::Model`.
+    models: BTreeMap<String, String>,
     written: bool,
     /// Called with every entry appended after construction (the daemon broadcasts them to attached clients).
     sink: Option<Box<dyn Fn(&Entry) + Send>>,
@@ -161,7 +165,7 @@ impl Session {
     pub fn new(cwd: &Path) -> Session {
         let id = new_id();
         let path = dir_for(cwd).join(format!("{id}.jsonl"));
-        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, written: false, sink: None };
+        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), written: false, sink: None };
         s.push_entry(Entry { id, parent: None, ts: now(), kind: Kind::Session { cwd: cwd.display().to_string() } });
         s.leaf = None;
         s
@@ -185,7 +189,7 @@ impl Session {
     }
 
     fn blank(path: &Path) -> Session {
-        Session { id: String::new(), path: path.to_path_buf(), cwd: PathBuf::new(), title: None, entries: vec![], index: HashMap::new(), leaf: None, written: true, sink: None }
+        Session { id: String::new(), path: path.to_path_buf(), cwd: PathBuf::new(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), written: true, sink: None }
     }
 
     /// Replay one stored entry into the in-memory state. Idempotent per entry id.
@@ -200,6 +204,7 @@ impl Session {
             }
             Kind::Title { title } => self.title = Some(title.clone()),
             Kind::Leaf { target } => self.leaf = (!target.is_empty()).then(|| target.clone()),
+            Kind::Model { agent, model } => self.remember_model(agent, model),
             _ => self.leaf = Some(e.id.clone()),
         }
         self.push_entry(e);
@@ -259,6 +264,29 @@ impl Session {
             self.append(Kind::Title { title }, false)?;
             self.leaf = leaf;
         }
+        Ok(())
+    }
+
+    fn remember_model(&mut self, agent: &str, model: &str) {
+        let key = agent.to_lowercase();
+        if model.is_empty() {
+            self.models.remove(&key);
+        } else {
+            self.models.insert(key, model.to_string());
+        }
+    }
+
+    /// Model picked by hand for `agent` in this conversation; it beats the agent's own settings.
+    pub fn model_for(&self, agent: &str) -> Option<&str> {
+        self.models.get(&agent.to_lowercase()).map(String::as_str)
+    }
+
+    /// Pick a model for `agent` in this conversation only. Empty = back to the agent's own setting.
+    pub fn set_model(&mut self, agent: &str, model: String) -> Result<()> {
+        self.remember_model(agent, &model);
+        let leaf = self.leaf.clone();
+        self.append(Kind::Model { agent: agent.to_string(), model }, false)?;
+        self.leaf = leaf;
         Ok(())
     }
 
@@ -376,6 +404,18 @@ mod tests {
         assert!(c[0].text().contains("sum"));
         assert_eq!(c[1].text(), "alt");
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn model_pick_is_per_agent_and_replays_without_moving_leaf() {
+        let mut s = Session::blank(Path::new(""));
+        let pick = |id: &str, agent: &str, model: &str| Entry { id: id.into(), parent: None, ts: 0, kind: Kind::Model { agent: agent.into(), model: model.into() } };
+        s.apply(pick("a", "Build", "x/y"));
+        assert_eq!(s.model_for("build"), Some("x/y"));
+        assert_eq!(s.model_for("Plan"), None);
+        assert!(s.leaf.is_none());
+        s.apply(pick("b", "build", ""));
+        assert_eq!(s.model_for("Build"), None);
     }
 
     #[test]
