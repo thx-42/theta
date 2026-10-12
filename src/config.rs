@@ -434,7 +434,7 @@ disabled = []
 auto = []                # always injected, e.g. ["caveman", "ponytail"]
 subagent = ["caveman", "ponytail"]   # also injected into every subagent (token-lean reports)
 
-# MCP servers: `command` (stdio) or `url` (HTTP, `/mcp login <name>` for OAuth). Tools appear as mcp__<name>__<tool>.
+# MCP servers: `command` (stdio) or `url` (HTTP, `theta mcp login <name>` for OAuth). Tools appear as mcp__<name>__<tool>.
 # [mcp.fs]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "."]

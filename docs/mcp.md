@@ -78,17 +78,24 @@ Applies to all agents and all projects, MCP and built-in names alike. Use it to 
 For an HTTP server that asks for OAuth (no static `Authorization` header needed):
 
 1. Add `[mcp.<name>]` with `url`, then `/reload`.
-2. `/mcp login <name>`: browser opens the provider's login page. theta listens on local port 53693 for the callback.
+2. `theta mcp login <name>` (or `l` in `/mcp`): browser opens the provider's login page. theta listens on local port 53693 for the callback.
 3. Tokens: `~/.theta/mcp-auth.json`.
-4. `/mcp logout <name>`: deletes stored tokens for that server.
+4. `o` in `/mcp` (or `theta mcp logout <name>`): deletes stored tokens for that server.
 
-Status `needs login: /mcp login <name>` means the server rejected the token.
+Status `needs login` means the server rejected the token.
 
 ## Commands
 
-- `/mcp`: one line per server: `● name (kind) · N tools · ~T tokens/request` when connected, `○ … needs login` when OAuth is missing, `✗ … <error>` on failure, `✗ … · disabled` when `enabled = false`.
-- `/mcp login <name>`, `/mcp logout <name>`.
-- `/mcp reconnect <name>`: restart one server now.
+`/mcp` opens a pop-up listing every server. Up/down selects one; the keys act on it:
+
+- `enter` or `r`: reconnect the server now.
+- `l`: log in (OAuth). `o`: log out.
+- `d`: write a diagnosis prompt into the input bar (error, transport, env var names, what to check). Send it and theta looks into the config and fixes it.
+- `esc`: close.
+
+Each row shows `● name (kind) · N tools` when connected, `○ … needs login` when OAuth is missing, `✗ … <error>` on failure, `○ … disabled` when `enabled = false`.
+
+The CLI keeps `theta mcp list | login | logout <name>`.
 
 `~T tokens/request` is the cost of sending that server's tool definitions on every request. Use it to decide whether a server is worth its cost on a subagent.
 
@@ -105,6 +112,6 @@ MCP servers belong to the theta daemon. Config is read from the daemon's first p
 
 - `cannot start <command>`: binary not in PATH of the daemon. Use an absolute path, or check the env set in `env`.
 - `connect timeout`: server does not complete the handshake in 20 s. Run the command by hand to see what it prints.
-- `unauthorized`: run `/mcp login <name>`.
+- `unauthorized`: run `theta mcp login <name>`.
 - Tool missing from the model: check it is connected (`/mcp`), that the agent's `tools:` matches, and that it is not in `[tools] disabled`.
 - Tool name too long: names are cut at 64 characters; a long server name shortens the tool part.

@@ -295,7 +295,7 @@ impl Client {
         }
         let status = r.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("unauthorized: run `/mcp login {server}`");
+            bail!("unauthorized: run `theta mcp login {server}`");
         }
         let sse = r.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("text/event-stream"));
         let text = r.text().await?;
@@ -365,6 +365,15 @@ impl Client {
 struct Slot {
     client: Option<Arc<Client>>,
     error: Option<String>,
+}
+
+/// One server's state, as shown in the `/mcp` pop-up.
+pub struct Row {
+    pub name: String,
+    pub http: bool,
+    pub enabled: bool,
+    pub tools: Option<usize>,
+    pub error: Option<String>,
 }
 
 pub struct Registry {
@@ -439,7 +448,25 @@ impl Registry {
         client.call(&tool, args).await.unwrap_or_else(|e| ToolOut::err(format!("{e:#}")))
     }
 
-    /// One line per server for `/mcp`.
+    /// Structured state of every server, for the `/mcp` pop-up.
+    pub fn rows(&self) -> Vec<Row> {
+        let slots = self.slots.lock().unwrap();
+        let cfg = self.cfg.read().unwrap();
+        cfg.iter()
+            .map(|(n, cfg)| {
+                let slot = slots.get(n);
+                Row {
+                    name: n.clone(),
+                    http: !cfg.url.is_empty(),
+                    enabled: cfg.enabled,
+                    tools: slot.and_then(|s| s.client.as_ref()).map(|c| c.tools.len()),
+                    error: slot.and_then(|s| s.error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// One line per server for the CLI `theta mcp list`.
     pub fn status(&self) -> Vec<String> {
         let slots = self.slots.lock().unwrap();
         let cfg = self.cfg.read().unwrap();
@@ -452,7 +479,7 @@ impl Registry {
                         let bytes: usize = c.tools.iter().map(|t| t.name.len() + t.description.len() + t.schema.to_string().len()).sum();
                         format!("● {n} ({kind}) · {} tools · ~{} tokens/request", c.tools.len(), bytes / 4)
                     }
-                    Some(Slot { error: Some(e), .. }) if e.starts_with("unauthorized") => format!("○ {n} ({kind}) · needs login: /mcp login {n}"),
+                    Some(Slot { error: Some(e), .. }) if e.starts_with("unauthorized") => format!("○ {n} ({kind}) · needs login: theta mcp login {n}"),
                     Some(Slot { error: Some(e), .. }) => format!("✗ {n} ({kind}) · {e}"),
                     _ => format!("✗ {n} ({kind})"),
                 }

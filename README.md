@@ -262,7 +262,7 @@ headers = { Authorization = "Bearer ${NOTION_TOKEN}" }   # optionnel ; `${VAR}` 
 ```
 
 - Les tools s'appellent `mcp__<serveur>__<tool>`. Un agent sans `tools:` les reçoit tous ; sinon listez `mcp__*` ou `mcp__<serveur>` dans `tools`.
-- `/mcp` liste les serveurs (● connecté, ○ login requis, ✗ erreur) ; `/mcp login|logout|reconnect <serveur>` (aussi `theta mcp list|login|logout`). Le login est OAuth 2.1 (PKCE, enregistrement dynamique) ; tokens dans `~/.theta/mcp-auth.json` (0600), rafraîchis automatiquement.
+- `/mcp` ouvre un pop-up des serveurs (● connecté, ○ login requis, ✗ erreur) : `entrée`/`r` reconnecter, `l` login, `o` logout, `d` demander un diagnostic (CLI : `theta mcp list|login|logout`). Le login est OAuth 2.1 (PKCE, enregistrement dynamique) ; tokens dans `~/.theta/mcp-auth.json` (0600), rafraîchis automatiquement.
 
 ### Skills
 

@@ -98,7 +98,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/model", "change model"),
     ("/agent", "change agent"),
     ("/skills", "list skills (use $name in a message)"),
-    ("/mcp", "MCP servers: list | login | logout | reconnect <name>"),
+    ("/mcp", "MCP servers: view, login, reconnect, diagnose"),
     ("/effort", "reasoning effort"),
     ("/settings", "settings (verbosity, task models, compaction, web)"),
     ("/verbose", "toggle full / compact output"),
@@ -325,6 +325,12 @@ enum Overlay {
     Report(String, Vec<String>),
     Ask(AskView),
     Login(LoginView),
+    Mcp(McpView),
+}
+
+/// `/mcp`: MCP servers; the state is read live from the registry, `sel` is the hovered server.
+struct McpView {
+    sel: usize,
 }
 
 #[derive(Default)]
@@ -895,7 +901,7 @@ impl Ui {
             "/undo" => self.undo_turn(),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
-            "/mcp" => self.mcp_command(arg),
+            "/mcp" => self.mcp_command(),
             "/skills" => {
                 let l: Vec<_> = self.app.rt.skills.iter().map(|s| format!("${}{} ({})", s.name, if s.auto { "*" } else { "" }, s.scope.label())).collect();
                 self.notify(if l.is_empty() { "no skills in ~/.theta/skills".into() } else { format!("{} — * = auto", l.join("  ")) });
@@ -1243,53 +1249,51 @@ impl Ui {
         self.overlay = Some(Overlay::Login(v));
     }
 
-    /// `/mcp [login|logout|reconnect <server>]`
-    fn mcp_command(&mut self, arg: &str) {
-        let mut it = arg.split_whitespace();
-        let (action, name) = (it.next().unwrap_or("list"), it.next().unwrap_or(""));
-        let mcp = self.app.rt.mcp.clone();
-        if action == "list" {
-            self.remote.send(Req::McpStatus);
-            return;
-        }
-        let Some(cfg) = mcp.config(name) else { return self.notify(format!("usage: /mcp {action} <server> (see /mcp)")) };
-        let n = name.to_string();
-        match action {
-            "login" => {
-                let (say, mut said) = unbounded_channel();
-                let (paste_tx, paste) = unbounded_channel();
-                let tx = self.login_tx.clone();
-                let remote = self.remote.clone();
-                let mut v = LoginView { title: format!("MCP · {n}"), provider: String::new(), key: false, lines: vec!["starting…".into()], input: Editor::default(), paste: Some(paste_tx), task: None };
-                v.task = Some(tokio::spawn(async move {
-                    let fwd_tx = tx.clone();
-                    let fwd = tokio::spawn(async move {
-                        while let Some(m) = said.recv().await {
-                            let _ = fwd_tx.send(LoginMsg::Say(m));
-                        }
-                    });
-                    let r = crate::mcp::login(&n, &cfg, &mut auth::Io { say, paste }).await;
-                    if r.is_ok() {
-                        remote.send(Req::McpConnect(n.clone()));
-                    }
-                    let _ = fwd.await;
-                    let _ = tx.send(LoginMsg::Done(r.map_err(|e| format!("{e:#}"))));
-                }));
-                self.overlay = Some(Overlay::Login(v));
-            }
-            "logout" => match crate::mcp::logout(name) {
-                Ok(()) => {
-                    self.notify(format!("logged out of {name}"));
-                    self.remote.send(Req::McpConnect(n));
+    /// `/mcp`: pop-up listing the MCP servers; keys act on the selected one.
+    fn mcp_command(&mut self) {
+        self.overlay = Some(Overlay::Mcp(McpView { sel: 0 }));
+    }
+
+    fn mcp_login(&mut self, n: String) {
+        let Some(cfg) = self.app.rt.mcp.config(&n) else { return };
+        let (say, mut said) = unbounded_channel();
+        let (paste_tx, paste) = unbounded_channel();
+        let tx = self.login_tx.clone();
+        let remote = self.remote.clone();
+        let mut v = LoginView { title: format!("MCP · {n}"), provider: String::new(), key: false, lines: vec!["starting…".into()], input: Editor::default(), paste: Some(paste_tx), task: None };
+        v.task = Some(tokio::spawn(async move {
+            let fwd_tx = tx.clone();
+            let fwd = tokio::spawn(async move {
+                while let Some(m) = said.recv().await {
+                    let _ = fwd_tx.send(LoginMsg::Say(m));
                 }
-                Err(e) => self.push(Item::Error(format!("{e:#}"))),
-            },
-            "reconnect" => {
-                self.notify(format!("reconnecting {name}…"));
-                self.remote.send(Req::McpConnect(n));
+            });
+            let r = crate::mcp::login(&n, &cfg, &mut auth::Io { say, paste }).await;
+            if r.is_ok() {
+                remote.send(Req::McpConnect(n.clone()));
             }
-            _ => self.notify("usage: /mcp [list | login <server> | logout <server> | reconnect <server>]"),
-        }
+            let _ = fwd.await;
+            let _ = tx.send(LoginMsg::Done(r.map_err(|e| format!("{e:#}"))));
+        }));
+        self.overlay = Some(Overlay::Login(v));
+    }
+
+    /// Prompt that asks theta to diagnose one MCP server. Goes in the input bar; the user sends it.
+    fn mcp_diagnose_prompt(&self, name: &str) -> String {
+        let mcp = &self.app.rt.mcp;
+        let state = match mcp.rows().into_iter().find(|r| r.name == name).and_then(|r| r.error) {
+            Some(e) => format!("Error: {e}"),
+            None => "Error: none (no connection error reported)".into(),
+        };
+        let cfg = mcp.config(name).unwrap_or_default();
+        let target = if cfg.url.is_empty() { format!("stdio command `{} {}`", cfg.command, cfg.args.join(" ")) } else { format!("HTTP url `{}`", cfg.url) };
+        let env = if cfg.env.is_empty() { "none".to_string() } else { cfg.env.keys().cloned().collect::<Vec<_>>().join(", ") };
+        format!(
+            "The MCP server `{name}` in theta is not working.\n{state}\nTransport: {target}. Env vars (values hidden): {env}.\n\
+             Diagnose the cause and fix the config so it connects. Check that the command exists and starts, its args, the url, \
+             auth (`theta mcp login {name}` for OAuth) and the `[mcp.{name}]` table in ~/.theta/settings.toml. \
+             Then tell me what you changed so I can reconnect it from /mcp."
+        )
     }
 
     fn on_login(&mut self, m: LoginMsg) {
@@ -1671,6 +1675,34 @@ impl Ui {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
             Overlay::Help => {}
+            Overlay::Mcp(mut v) => {
+                let rows = self.app.rt.mcp.rows();
+                let name = rows.get(v.sel).map(|r| r.name.clone());
+                match (k.code, name) {
+                    (KeyCode::Esc | KeyCode::Char('q'), _) => return,
+                    (KeyCode::Up, _) => v.sel = v.sel.saturating_sub(1),
+                    (KeyCode::Down, _) => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
+                    (KeyCode::Enter | KeyCode::Char('r'), Some(n)) => {
+                        self.notify(format!("reconnecting {n}…"));
+                        self.remote.send(Req::McpConnect(n));
+                        return;
+                    }
+                    (KeyCode::Char('l'), Some(n)) => return self.mcp_login(n),
+                    (KeyCode::Char('o'), Some(n)) => match crate::mcp::logout(&n) {
+                        Ok(()) => {
+                            self.notify(format!("logged out of {n}"));
+                            self.remote.send(Req::McpConnect(n));
+                        }
+                        Err(e) => self.push(Item::Error(format!("{e:#}"))),
+                    },
+                    (KeyCode::Char('d'), Some(n)) => {
+                        self.input.set(self.mcp_diagnose_prompt(&n));
+                        return;
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Mcp(v));
+            }
             Overlay::Report(title, lines) => {
                 // The link code is typed on another device: `c` puts it on the clipboard and keeps the overlay.
                 if title == "θ remote" && matches!(k.code, KeyCode::Char('c')) {
@@ -2396,6 +2428,7 @@ impl Ui {
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
+            Overlay::Mcp(_) => self.app.rt.mcp.rows().len().max(1) + 6,
             Overlay::Activity(_) => self.activity().len().max(1) + 3,
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len() + 2,
@@ -2498,6 +2531,40 @@ impl Ui {
                     }
                     f.render_widget(Paragraph::new(l).block(block("θ jobs").title_bottom(hint(" ↑↓ select · enter output · k stop · esc close "))), r);
                 }
+            }
+            Overlay::Mcp(v) => {
+                let rows = self.app.rt.mcp.rows();
+                let mut l = Vec::new();
+                if rows.is_empty() {
+                    l.push(Line::from(Span::styled(" no MCP servers — add [mcp.<name>] to settings.toml", theme::dim())));
+                }
+                for (i, r) in rows.iter().enumerate() {
+                    let (mark, st, state) = if !r.enabled {
+                        ("○", theme::dim(), "disabled".to_string())
+                    } else if let Some(t) = r.tools {
+                        ("●", theme::accent(), format!("{t} tools"))
+                    } else if r.error.as_deref().is_some_and(|e| e.starts_with("unauthorized")) {
+                        ("○", theme::accent(), "needs login".to_string())
+                    } else if let Some(e) = &r.error {
+                        ("✗", theme::err(), e.clone())
+                    } else {
+                        ("…", theme::dim(), "connecting".to_string())
+                    };
+                    let kind = if r.http { "http" } else { "stdio" };
+                    let text: String = format!(" {mark} {}  {kind} · {state}", r.name).chars().take(iw + 1).collect();
+                    let sel = if i == v.sel { theme::sel() } else { st };
+                    l.push(Line::from(vec![Span::styled(if i == v.sel { " › " } else { "   " }, theme::accent()), Span::styled(text, sel)]));
+                }
+                if let Some(r) = rows.get(v.sel) {
+                    let c = self.app.rt.mcp.config(&r.name).unwrap_or_default();
+                    let target = if c.url.is_empty() { format!("{} {}", c.command, c.args.join(" ")) } else { c.url.clone() };
+                    l.push(Line::default());
+                    l.push(Line::from(Span::styled(format!(" {target}"), theme::dim())));
+                    if let Some(e) = &r.error {
+                        l.push(Line::from(Span::styled(format!(" {e}"), theme::err())));
+                    }
+                }
+                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(block("θ mcp").title_bottom(hint(" ↑↓ select · enter reconnect · l login · o logout · d diagnose · esc close "))), r);
             }
             Overlay::Report(title, lines) => {
                 let mut l = lines.iter().map(|x| Line::from(Span::styled(x.clone(), if x.starts_with(' ') || x.starts_with("loading") { Style::default() } else { theme::accent().add_modifier(Modifier::BOLD) }))).collect::<Vec<_>>();

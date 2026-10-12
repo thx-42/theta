@@ -8,7 +8,7 @@
 - `/model`: pick model. `/effort [low|medium|high|xhigh|max]`: reasoning effort.
 - `/agent`: pick agent. See `agents.md`.
 - `/skills`: list skills. See `skills.md`.
-- `/mcp [list | login | logout | reconnect <name>]`: see `mcp.md`.
+- `/mcp`: pop-up of MCP servers (reconnect, login, logout, diagnose). See `mcp.md`.
 - `/settings`: verbosity, task models, compaction, web.
 - `/verbose`: toggle full and compact output.
 - `/compact`: compact context now.
