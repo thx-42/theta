@@ -351,7 +351,7 @@ fn sync_agents(dir: &Path) {
         .filter_map(|l| l.split_once(' ').map(|(n, h)| (n.to_string(), h.to_string())))
         .collect();
     let before = shipped.clone();
-    for (name, new) in [("Build", crate::agents::DEFAULT_BUILD), ("Plan", crate::agents::DEFAULT_PLAN), ("Auto", crate::agents::DEFAULT_AUTO)] {
+    for (name, new) in [("Build", crate::agents::DEFAULT_BUILD), ("Plan", crate::agents::DEFAULT_PLAN), ("Auto", crate::agents::DEFAULT_AUTO), ("Explore", crate::agents::DEFAULT_EXPLORE)] {
         let (path, new_hash) = (dir.join(format!("{name}.md")), sha256(new.as_bytes()));
         let Ok(cur) = std::fs::read_to_string(&path) else {
             match std::fs::write(&path, new) {

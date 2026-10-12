@@ -1386,7 +1386,7 @@ impl Ui {
     }
 
     fn cycle_agent(&mut self) {
-        let agents = self.app.rt.agents.clone();
+        let agents: Vec<_> = self.app.rt.agents.iter().filter(|a| !a.hidden).cloned().collect();
         if agents.len() < 2 {
             return;
         }

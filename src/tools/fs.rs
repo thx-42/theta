@@ -34,7 +34,8 @@ pub fn read(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let max = ctx.settings.tools.max_lines.max(50) * 3 / 2;
     let limit = n(args, "limit").map(|l| l as usize).unwrap_or(max).min(max);
     let ranged = args.get("offset").is_some() || args.get("limit").is_some();
-    let key = format!("{}:{offset}:{limit}", path.display());
+    // Per session: a subagent never read what its parent read, so it must get the content, not the "unchanged" stub.
+    let key = format!("{}:{offset}:{limit}:{}", path.display(), ctx.session_id);
     let h = hash(&text);
     {
         let mut cache = ctx.read_cache.lock().unwrap();
@@ -320,6 +321,29 @@ mod tests {
         let (s, e) = fuzzy_find(hay, "fn a() {\n    x();").unwrap();
         assert_eq!(&hay[s..e], "fn a() {  \n    x();");
         assert!(fuzzy_find("a\nb\na\nb\n", "a\nb").is_none());
+    }
+
+    #[test]
+    fn read_stub_is_per_session() {
+        let f = std::env::temp_dir().join(format!("theta-read-test-{}", std::process::id()));
+        std::fs::write(&f, "hello\n").unwrap();
+        let args = serde_json::json!({"path": f.display().to_string()});
+        let parent = crate::tools::ToolCtx {
+            cwd: std::env::temp_dir(),
+            settings: Default::default(),
+            http: reqwest::Client::new(),
+            todos: Default::default(),
+            read_cache: Default::default(),
+            session_id: "parent".into(),
+            jobs: Default::default(),
+            ssh: Default::default(),
+        };
+        let mut sub = parent.clone();
+        sub.session_id = "sub".into();
+        assert!(read(&args, &parent).unwrap().content.contains("hello"));
+        assert!(read(&args, &parent).unwrap().content.contains("unchanged"));
+        assert!(read(&args, &sub).unwrap().content.contains("hello"));
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

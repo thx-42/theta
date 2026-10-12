@@ -40,6 +40,8 @@ pub struct Agent {
     pub tools: Option<Vec<String>>,
     /// May spawn any agent as a subagent (`delegate: all`); otherwise only read-only ones, unless it has every tool.
     pub delegate_all: bool,
+    /// Subagent-only helper: not offered to the user (tab cycle, remote list) nor as a handoff target; `task` still spawns it.
+    pub hidden: bool,
     pub prompt: String,
 }
 
@@ -56,6 +58,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
         subagent_effort: None,
         tools: None,
         delegate_all: false,
+        hidden: false,
         prompt: text.trim().to_string(),
     };
     let Some(rest) = text.strip_prefix("---") else { return a };
@@ -77,6 +80,7 @@ fn parse(text: &str, fallback_name: &str, scope: Scope) -> Agent {
             "subagent_model" => a.subagent_model = Some(v),
             "subagent_effort" => a.subagent_effort = Some(v),
             "delegate" => a.delegate_all = v.eq_ignore_ascii_case("all"),
+            "hidden" => a.hidden = v.eq_ignore_ascii_case("true"),
             "tools" => a.tools = Some(v.trim_matches(['[', ']']).split(',').map(|t| t.trim().trim_matches('"').to_string()).filter(|t| !t.is_empty()).collect()),
             _ => {}
         }
@@ -108,7 +112,7 @@ pub fn discover(project: &Path) -> Vec<Agent> {
 
 /// The shipped agents must always exist: re-add any missing one from the binary.
 fn ensure_builtins(out: &mut Vec<Agent>) {
-    for (src, name) in [(DEFAULT_BUILD, "Build"), (DEFAULT_PLAN, "Plan"), (DEFAULT_AUTO, "Auto")] {
+    for (src, name) in [(DEFAULT_BUILD, "Build"), (DEFAULT_PLAN, "Plan"), (DEFAULT_AUTO, "Auto"), (DEFAULT_EXPLORE, "Explore")] {
         if !out.iter().any(|a| a.name.eq_ignore_ascii_case(name)) {
             out.insert(0, parse(src, name, Scope::Builtin));
         }
@@ -119,6 +123,7 @@ fn ensure_builtins(out: &mut Vec<Agent>) {
 pub fn catalog(agents: &[Agent]) -> String {
     agents
         .iter()
+        .filter(|a| !a.hidden)
         .map(|a| {
             let mut s = format!("- {}: {}", a.name, a.description);
             if !a.can.is_empty() {
@@ -277,44 +282,59 @@ You are theta in planning mode. You do not edit files or run commands. Turn the 
 Stay brief. Never ask what you can find out yourself. Do not start coding.
 "#;
 
+pub const DEFAULT_EXPLORE: &str = r#"---
+name: Explore
+description: Read-only investigator — reads one slice of the codebase and reports exactly the facts it was asked for
+can: read and search code, search the web
+cannot: edit files, run shell commands, plan, ask the user
+tools: read, grep, find, ls, web_search, web_fetch
+hidden: true
+---
+You are a read-only investigator. The prompt names a slice of the codebase and the questions to answer. Read what you need (targeted reads, grep first), answer every question with `path:line` evidence, and stop. Do not plan, redesign or propose changes unless asked; flag only what the questions ask about. If a question cannot be answered from the code, say so.
+"#;
+
 pub const DEFAULT_AUTO: &str = r#"---
 name: Auto
-description: Autonomous orchestrator — plans with the user, then runs Build and Plan subagents end to end until the task is done and verified
-can: read and search code, search the web, ask the user, keep a todo list, delegate to Build (write) and Plan (review) subagents
+description: Autonomous orchestrator — fans out read-only investigators, writes the plan, then drives Build subagents with tailored prompts until the task is done and verified
+can: read and search code, search the web, ask the user, keep the todo list, delegate to Explore (read), Build (write) and Plan subagents
 cannot: edit project files or run shell commands itself
 tools: read, grep, find, ls, todo, write_plan, web_search, web_fetch, ask, task, list_agents, job
 delegate: all
 ---
-You are theta in auto mode. You never write code: you orchestrate subagents (only you can spawn them).
+You are theta in auto mode. You never write code and you read little: you orchestrate subagents (only you can spawn them). You alone own the todo list and the plan; subagents never see either. Each one gets a prompt you wrote for it.
 
-Phase 1 — Plan with the user (the only phase where you stop for the user):
-1. Read the relevant code; settle what you can yourself.
-2. `ask` (one question per call, concrete options) only for decisions that are the user's.
-3. Write the plan as a `todo` list of small verifiable steps, save it with `write_plan`, summarize it and `ask` (yes_no) for validation. Revise until validated.
+Phase 1 — Investigate, then plan with the user (the only phase where you stop for the user):
+1. Orient: just enough reading to cut the work into axes (a resource, a module, a layer, a question).
+2. Fan out: one `Explore` subagent per axis, all in the same turn with `background: true`, then `job` wait `all`. Each prompt names the slice (paths), the exact questions you need answered, and the report size and shape you want (e.g. "≤ 1500 chars: per file, role and public symbols; list every place that touches X as path:line"). Large scopes (a whole codebase, every resource of a server) get several Explore agents per axis. You work from their reports, not from the code they covered; fill a gap with a narrower Explore or `resume`.
+3. `ask` (one question per call, concrete options) only for decisions that are the user's.
+4. Write the plan: a `todo` list of small verifiable steps, and a plan file via `write_plan` (files, exact symbols, edits, constraints, verification per step). Summarize it and `ask` (yes_no). Revise until validated.
 
-Phase 2 — Execute without stopping or asking confirmation between steps; mark todos done as you go.
-- Build: `task` with agent `Build` and a self-contained prompt. Independent steps run with `background`, then `job` wait.
-- Review: `task` with agent `Plan` on each built step; ask for concrete defects only.
-- Fix: send defects back to `Build`, review again until clean.
-- Check each report against the code before you trust it. Replan only if reality breaks the plan.
+Phase 2 — Execute without stopping or asking confirmation between steps.
+- Write each subagent prompt yourself from the plan and the reports, complete enough that the agent needs no other context: goal, files and symbols, the exact edit (signatures, branches, values), what must not change, how to verify, what to report. Never write "do step 3" or "see the plan". Tell Build to edit, not to re-explore or redesign, and to report back instead of improvising if the code contradicts the prompt.
+- Steps with no shared files run in parallel (`background: true`, `job` wait). Dependent steps run one after the other.
+- Review each built step with an `Explore` subagent (read-only): the files and the intent, ask for concrete defects as `path:line problem`. Send defects to `Build`, review again until clean.
+- Check each report against the code before you trust it. You update the todo (done/in progress) as work lands. Replan only if reality breaks the plan.
 
 Phase 3 — Final report, only when every todo is done and verified: what changed, what was verified, what is left.
 "#;
 
 /// Shipped as ~/.theta/SOUL.Auto.md; applied to the Auto agent only.
 pub const DEFAULT_AUTO_SOUL: &str = r#"# SOUL — Auto
-Your context is the scarce resource: spend it on decisions, not on subagent chatter.
+Your context is the scarce resource: spend it on decisions, not on subagent chatter or file contents.
 
 ## Subagent prompts
-- Self-contained and short: goal in one sentence, exact files/symbols, approach, what must not change, how to verify.
-- Point to `path:line` instead of pasting code or logs. Raise `effort` only via the agent settings.
-- Build writes, Plan reviews (read-only). Subagents already run with the terse skills; do not repeat that.
-- Their report is ≤ ~600 chars and ends with `[transcript: <path>]`. Open the transcript (a `grep`/`read` slice) only when the report is vague, contradicts the todo or claims a failure you cannot explain.
+- Subagents read nothing but your prompt: no todo, no plan file, no history. Put in it the goal in one sentence, exact files/symbols, approach, constraints (what must not change), how to verify and what to report. Full is better than short; paste a short snippet only when `path:line` is not enough.
+- Explore reads and reports (questions in, facts with `path:line` out); Build applies and verifies; Plan only when you want a second design opinion. Raise `effort` only via the agent settings. Subagents already run with the terse skills; do not repeat that.
+- Reports are ≤ 600 chars unless your prompt asks for more (hard cap 6000): ask for the size you need. They end with `[transcript: <path>]`. Open the transcript (a `grep`/`read` slice) only when a report is vague, contradicts the todo or claims a failure you cannot explain.
+- Give each agent a distinct slice. Two agents never edit the same file at once.
 
 ## Waiting
-- Independent steps (no shared files, no ordering): `background: true`. Dependent steps: one after the other.
-- `job` wait: `mode: any` when each result can be reviewed alone, `all` when steps must be judged together. Never poll `job` output in a loop.
+- Independent work: `background: true`, all launched in one turn. `job` wait `all` for investigations you merge, `any` when each result can be handled alone. Never poll `job` output in a loop.
 - If you end your turn with subagents running, theta wakes you when one ends.
+
+## Finishing
+- Mark each todo `done` right after its step is reviewed. Update the list before writing the final report, never after: an unfinished list sends you back to work and costs a second report.
+- A subagent that stops after announcing its plan did nothing: resend a shorter prompt that says to act, not to announce. Check the files before trusting its report.
 
 Terse output, no narration between tool calls.
 "#;
@@ -332,6 +352,8 @@ mod tests {
         assert_eq!(a.prompt, "Be strict.");
         let c = parse("---\nname: R\ndescription: reviews\ncan: read\ncannot: edit\n---\nx", "x", Scope::Local);
         assert_eq!(catalog(&[c]), "- R: reviews\n  can: read\n  cannot: edit");
+        let h = parse("---\nname: H\nhidden: true\n---\nx", "x", Scope::Local);
+        assert!(h.hidden && catalog(&[h]).is_empty());
         let b = parse("plain prompt", "Plain", Scope::Global);
         assert_eq!((b.name.as_str(), b.prompt.as_str()), ("Plain", "plain prompt"));
         assert!(chrono_date().starts_with("20"));
@@ -343,7 +365,7 @@ mod tests {
         ensure_builtins(&mut out);
         let mut names: Vec<_> = out.iter().map(|a| a.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["Auto", "Build", "Plan"]);
+        assert_eq!(names, ["Auto", "Build", "Explore", "Plan"]);
         assert_eq!(find(&out, "Plan").unwrap().prompt, "mine");
         assert_eq!(find(&out, "Auto").unwrap().scope, Scope::Builtin);
     }

@@ -357,7 +357,7 @@ impl Server {
                 SessionBrief { running: running.contains(&id), id, title: i.title, updated: i.updated, messages: i.messages }
             })
             .collect();
-        let agents = rt.agents.iter().map(|a| AgentBrief { name: a.name.clone(), description: a.description.clone(), scope: a.scope.label().into() }).collect();
+        let agents = rt.agents.iter().filter(|a| !a.hidden).map(|a| AgentBrief { name: a.name.clone(), description: a.description.clone(), scope: a.scope.label().into() }).collect();
         let mut models = Vec::new();
         for p in rt.catalog.providers.iter() {
             let local = p.env.is_empty() && p.oauth.is_none();

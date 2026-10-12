@@ -206,9 +206,9 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
 
 /// Appended to every subagent's system prompt: the orchestrator reads nothing but the last message.
 /// Hard cap (chars) on a subagent report; reviewers get room for a defect list.
-const REPORT_CAP: usize = 2000;
+const REPORT_CAP: usize = 6000;
 
-const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters, terse: what you did, files touched (path:line), verification (command and result), open issues. Never paste code or logs. A reviewer lists each defect on one line as `path:line problem`.";
+const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size, terse: what you did, files touched (path:line), verification (command and result), open issues. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.";
 
 /// Run until the model answers without tool calls. Appends everything to `session`.
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
@@ -267,7 +267,8 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             Err(e) => return Err(e),
         };
         let calls = resp.msg.tool_calls();
-        let empty = resp.msg.content.iter().all(|b| matches!(b, Block::Thinking { .. }));
+        // Nothing said, or a turn that ends on "...:" (an announced action never taken).
+        let empty = resp.msg.content.iter().all(|b| matches!(b, Block::Thinking { .. })) || (calls.is_empty() && resp.msg.text().trim_end().ends_with(':'));
         if !resp.msg.content.is_empty() {
             session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
         }
@@ -505,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn default_tool_set_is_lean() {
         let rt = test_rt().await;
-        let build = agents::discover(std::path::Path::new("/nonexistent")).remove(0);
+        let build = agents::find(&agents::discover(std::path::Path::new("/nonexistent")), "Build").unwrap().clone();
         let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
         assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
         assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
