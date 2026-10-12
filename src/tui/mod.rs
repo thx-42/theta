@@ -35,10 +35,6 @@ use unicode_width::UnicodeWidthStr;
 
 pub mod theme {
     use ratatui::style::{Color, Modifier, Style};
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    /// Current agent's color, as a 256-color palette index (works without truecolor).
-    static ACCENT: AtomicU8 = AtomicU8::new(51);
 
     /// Stable color from an agent name: FNV-1a hash → hue, fixed saturation/lightness → 6×6×6 color cube.
     pub fn color_for(name: &str) -> u8 {
@@ -59,12 +55,10 @@ pub mod theme {
         16 + 36 * q(r) + 6 * q(g) + q(b)
     }
 
-    pub fn set_accent(name: &str) {
-        ACCENT.store(color_for(name), Ordering::Relaxed);
-    }
-
-    fn accent_color() -> Color { Color::Indexed(ACCENT.load(Ordering::Relaxed)) }
+    /// Fixed UI accent; agent colors are only used on the parts an agent produced (see `agent`).
+    fn accent_color() -> Color { Color::Indexed(51) }
     pub fn accent() -> Style { Style::default().fg(accent_color()) }
+    pub fn agent(name: &str) -> Style { Style::default().fg(Color::Indexed(color_for(name))) }
     pub fn dim() -> Style { Style::default().fg(Color::DarkGray) }
     pub fn code() -> Style { Style::default().fg(Color::Yellow) }
     pub fn link() -> Style { Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED) }
@@ -179,8 +173,12 @@ enum ToolState {
 
 enum Item {
     User(String),
-    Assistant { text: String, thinking: String, done: bool },
-    Tool { id: String, name: String, summary: String, state: ToolState, out: String, display: Option<String>, sub: Counts },
+    /// Steered message, shown when typed. `delivered`: the agent has taken it into the session.
+    Steer { text: String, delivered: bool },
+    /// `agent`: the agent that wrote this part (drives its gutter color).
+    Assistant { text: String, thinking: String, done: bool, agent: String },
+    /// `who`: for `task` calls, the subagent type that runs (empty otherwise).
+    Tool { id: String, name: String, summary: String, state: ToolState, out: String, display: Option<String>, sub: Counts, agent: String, who: String },
     Info(String),
     Error(String),
 }
@@ -560,6 +558,19 @@ impl Ui {
         self.dirty.push(true);
     }
 
+    /// Mark the oldest pending steer with this text as taken; a steer this client did not send is added.
+    fn steer_taken(&mut self, t: String) {
+        match self.items.iter().position(|it| matches!(it, Item::Steer { text, delivered: false } if *text == t)) {
+            Some(i) => {
+                if let Item::Steer { delivered, .. } = &mut self.items[i] {
+                    *delivered = true;
+                }
+                self.touch(i);
+            }
+            None => self.push(Item::Steer { text: t, delivered: true }),
+        }
+    }
+
     fn touch(&mut self, i: usize) {
         if let Some(d) = self.dirty.get_mut(i) {
             *d = true;
@@ -620,11 +631,11 @@ impl Ui {
                 let thinking: String = msg.content.iter().filter_map(|b| if let Block::Thinking { text, .. } = b { Some(text.as_str()) } else { None }).collect();
                 let text = msg.text();
                 if !text.is_empty() || !thinking.is_empty() {
-                    self.push(Item::Assistant { text, thinking, done: true });
+                    self.push(Item::Assistant { text, thinking, done: true, agent: self.app.turn.agent.name.clone() });
                 }
                 for (id, name, args) in msg.tool_calls() {
-                    let summary = tool_summary(&name, &args);
-                    self.push(Item::Tool { id, name, summary, state: ToolState::Running, out: String::new(), display: None, sub: Counts::default() });
+                    let it = self.tool_item(id, name, &args);
+                    self.push(it);
                 }
             }
         }
@@ -699,6 +710,7 @@ impl Ui {
         self.input.take();
         self.history.push(text.clone());
         self.hist = None;
+        self.push(Item::Steer { text: text.clone(), delivered: false });
         self.remote.send(Req::Steer(text));
     }
 
@@ -753,8 +765,39 @@ impl Ui {
         if let Some(Item::Assistant { done: false, .. }) = self.items.last() {
             return self.items.len() - 1;
         }
-        self.push(Item::Assistant { text: String::new(), thinking: String::new(), done: false });
+        self.push(Item::Assistant { text: String::new(), thinking: String::new(), done: false, agent: self.app.turn.agent.name.clone() });
         self.items.len() - 1
+    }
+
+    /// New running tool row, made by the current agent.
+    fn tool_item(&self, id: String, name: String, args: &Value) -> Item {
+        let summary = tool_summary(&name, args);
+        let who = if name == "task" {
+            match args.get("agent").and_then(|v| v.as_str()) {
+                Some(n) => agents::find(&self.app.rt.agents, n).map(|a| a.name.clone()).unwrap_or_else(|| n.to_string()),
+                None => self.app.turn.agent.name.clone(),
+            }
+        } else {
+            String::new()
+        };
+        Item::Tool { id, name, summary, state: ToolState::Running, out: String::new(), display: None, sub: Counts::default(), agent: self.app.turn.agent.name.clone(), who }
+    }
+
+    /// Agents that wrote the parts of the turn started by user item `i`, first-seen order.
+    fn turn_agents(&self, i: usize) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for it in &self.items[i + 1..] {
+            match it {
+                Item::User(_) => break,
+                Item::Assistant { agent, .. } | Item::Tool { agent, .. } => {
+                    if !names.contains(&agent.as_str()) {
+                        names.push(agent);
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
     }
 
     fn on_event(&mut self, ev: Event) {
@@ -782,11 +825,11 @@ impl Ui {
                 self.close_streaming();
                 self.counts.add(&name);
                 self.status = format!("{name} {}", tool_summary(&name, &args));
-                let summary = tool_summary(&name, &args);
                 if let Some(i) = self.items.iter().rposition(|it| matches!(it, Item::Tool { id: tid, .. } if *tid == id)) {
                     self.touch(i);
                 } else {
-                    self.push(Item::Tool { id, name, summary, state: ToolState::Running, out: String::new(), display: None, sub: Counts::default() });
+                    let it = self.tool_item(id, name, &args);
+                    self.push(it);
                 }
             }
             Event::ToolEnd { id, content, is_error, display, .. } => {
@@ -822,6 +865,8 @@ impl Ui {
             }
             Event::Started => self.begin_run(),
             Event::User(t) => self.push(Item::User(t)),
+            // The steer was shown when typed; this marks it as taken by the agent (or shows one from another client).
+            Event::Steer(t) => self.steer_taken(t),
             Event::Interrupted => self.on_interrupted(),
             Event::Todos(t) => self.todos = t,
             Event::Compacting => {
@@ -834,7 +879,7 @@ impl Ui {
             }
             Event::Side { question, answer } => {
                 self.push(Item::Info(format!("btw: {question}")));
-                self.push(Item::Assistant { text: answer, thinking: String::new(), done: true });
+                self.push(Item::Assistant { text: answer, thinking: String::new(), done: true, agent: self.app.turn.agent.name.clone() });
             }
             Event::Title(t) => self.notify(format!("session: {t}")),
             Event::Sub { id, event } => {
@@ -2050,17 +2095,61 @@ impl Ui {
 
     // ---------- drawing ----------
 
+    /// Assistant and tool parts get a gutter bar in the color of the agent that wrote them.
     fn item_lines(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
+        let agent = match &self.items[i] {
+            Item::Assistant { agent, .. } | Item::Tool { agent, .. } => agent.clone(),
+            _ => return self.item_body(i, width, full),
+        };
+        let bar = Span::styled("▎ ", theme::agent(&agent));
+        self.item_body(i, width.saturating_sub(2), full)
+            .into_iter()
+            .map(|l| {
+                let mut spans = vec![bar.clone()];
+                spans.extend(l.spans);
+                Line::from(spans).style(l.style)
+            })
+            .collect()
+    }
+
+    /// User prompts and steers share one band, one blank row above and below, full width.
+    /// The top row names the agents that answered, right-aligned; a steer also labels itself on the left (`steer`: delivered?).
+    fn user_lines(&self, i: usize, t: &str, width: usize, steer: Option<bool>) -> Vec<Line<'static>> {
+        let band = Style::default().bg(Color::Indexed(237));
+        let spans = vec![Span::styled(t.to_string(), theme::user())];
+        let mut label: Vec<Span> = Vec::new();
+        for (k, name) in self.turn_agents(i).into_iter().enumerate() {
+            if k > 0 {
+                label.push(Span::styled(" → ", theme::dim()));
+            }
+            label.push(Span::styled(name.to_string(), theme::agent(name).add_modifier(Modifier::BOLD)));
+        }
+        let left = match steer {
+            Some(true) => Span::styled("Steering", theme::accent().add_modifier(Modifier::BOLD)),
+            Some(false) => Span::styled("Steering", theme::dim()),
+            None => Span::raw(""),
+        };
+        let used: usize = left.width() + label.iter().map(|s| s.width()).sum::<usize>();
+        let mut top = vec![left, Span::raw(" ".repeat(width.saturating_sub(used)))];
+        top.extend(label);
+        let mut out = vec![Line::from(top).style(band)];
+        for l in markdown::wrap(spans, width, vec![Span::styled("› ", theme::accent().add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
+            let fill = width.saturating_sub(l.width());
+            let mut s = l.spans;
+            s.push(Span::raw(" ".repeat(fill)));
+            out.push(Line::from(s).style(band));
+        }
+        out.push(Line::from(" ".repeat(width)).style(band));
+        out
+    }
+
+    fn item_body(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
         let it = &self.items[i];
         let running_turn = self.running && !self.items[i + 1..].iter().any(|x| matches!(x, Item::User(_)));
         match it {
-            Item::User(t) => {
-                let mut out = vec![Line::default()];
-                let spans = vec![Span::styled(t.clone(), theme::user())];
-                out.extend(markdown::wrap(spans, width, vec![Span::styled("› ", theme::accent().add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]));
-                out
-            }
-            Item::Assistant { text, thinking, done } => {
+            Item::User(t) => self.user_lines(i, t, width, None),
+            Item::Steer { text, delivered } => self.user_lines(i, text, width, Some(*delivered)),
+            Item::Assistant { text, thinking, done, .. } => {
                 // Compact mode: only the final answer of a finished turn.
                 let is_final = !self.items[i + 1..].iter().take_while(|x| !matches!(x, Item::User(_))).any(|x| matches!(x, Item::Assistant { .. } | Item::Tool { .. }));
                 if !full && (!is_final || running_turn) {
@@ -2088,7 +2177,7 @@ impl Ui {
                 }
                 if out.len() == 1 { vec![] } else { out }
             }
-            Item::Tool { name, summary, state, out, display, sub, .. } => {
+            Item::Tool { name, summary, state, out, display, sub, who, .. } => {
                 if !full {
                     return vec![];
                 }
@@ -2098,6 +2187,9 @@ impl Ui {
                     ToolState::Done { ok: false } => ("✗", theme::err()),
                 };
                 let mut head = vec![Span::styled(format!("  {icon} "), st), Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)), Span::raw(" ")];
+                if !who.is_empty() {
+                    head.push(Span::styled(format!("({who}) "), theme::agent(who).add_modifier(Modifier::BOLD)));
+                }
                 let mut lines = markdown::wrap(vec![Span::styled(summary.clone(), theme::dim())], width, std::mem::take(&mut head), vec![Span::raw("      ")]);
                 if lines.len() > 2 {
                     lines.truncate(2);
@@ -2846,7 +2938,6 @@ impl Ui {
         for p in std::mem::take(&mut t.backlog) {
             self.on_push(p);
         }
-        theme::set_accent(&self.app.turn.agent.name);
         self.mark_seen();
         self.invalidate_all();
     }
@@ -3241,7 +3332,6 @@ impl Ui {
             if a.name != self.app.turn.agent.name {
                 self.notify(format!("agent: {}", agent_label(&a)));
             }
-            theme::set_accent(&a.name);
             self.app.turn.agent = a;
         }
         self.app.turn.model = model;
@@ -3455,7 +3545,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 }
             },
             Some(o) = opened_rx.recv() => ui.tab_opened(o),
-            Some(text) = shell_rx.recv() => ui.push(Item::Assistant { text, thinking: String::new(), done: true }),
+            Some(text) = shell_rx.recv() => ui.push(Item::Assistant { text, thinking: String::new(), done: true, agent: ui.app.turn.agent.name.clone() }),
             Some(m) = login_rx.recv() => ui.on_login(m),
             _ = tick.tick() => {
                 if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {

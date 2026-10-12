@@ -210,7 +210,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
             ]));
             // Row 2: agent · model. Row 3: what it is doing. Row 4: spacer.
             let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, short_model(&t.model)) };
-            lines.push(Line::from(vec![Span::styled(pad(&clip(&who, w), w), theme::dim()), divider()]));
+            lines.push(Line::from(vec![Span::styled(pad(&clip(&who, w), w), theme::agent(&t.agent)), divider()]));
             let detail_style = match t.status {
                 TabStatus::Working => theme::accent(),
                 TabStatus::Done => theme::ok(),

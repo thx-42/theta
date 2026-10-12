@@ -46,6 +46,8 @@ pub enum Event {
     Started,
     /// A user message was accepted; shown by every attached client.
     User(String),
+    /// A steered message reached the agent (it was appended to the session at its next step).
+    Steer(String),
     /// The run was aborted on request.
     Interrupted,
     Done,
@@ -190,18 +192,20 @@ fn is_overflow(e: &anyhow::Error) -> bool {
 /// Messages the user sent while a run was active; the run moves them into the session at its next safe point.
 pub type Steer = Arc<Mutex<VecDeque<String>>>;
 
-/// Append steered messages, and the results of background jobs that ended, as user turns. Returns true when there were any.
+/// Append steered messages and the results of background jobs that ended, as user turns. Steers are announced as `Event::Steer`, job results as `Event::User`. Returns true when there were any.
 /// Jobs belong to the main agent: subagents leave their messages alone.
 fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runtime, depth: u8) -> bool {
-    let mut texts: Vec<String> = steer.lock().unwrap().drain(..).collect();
-    if depth == 0 {
-        texts.extend(rt.jobs.take_pending());
+    let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
+    let jobs: Vec<String> = if depth == 0 { rt.jobs.take_pending() } else { Vec::new() };
+    for t in &steered {
+        let _ = session.lock().unwrap().add_msg(Msg::user(crate::skills::expand(&rt.skills, t)), None);
+        let _ = tx.send(Event::Steer(t.clone()));
     }
-    for t in &texts {
+    for t in &jobs {
         let _ = session.lock().unwrap().add_msg(Msg::user(crate::skills::expand(&rt.skills, t)), None);
         let _ = tx.send(Event::User(t.clone()));
     }
-    !texts.is_empty()
+    !(steered.is_empty() && jobs.is_empty())
 }
 
 /// Appended to every subagent's system prompt: the orchestrator reads nothing but the last message.
