@@ -61,6 +61,25 @@ fn convert(system: &str, messages: &[Msg], echo_reasoning: bool) -> Vec<Value> {
     out
 }
 
+/// OpenRouter passes Anthropic models explicit breakpoints: on the system prompt and the last user text turn.
+fn mark_cache(messages: &mut Value) {
+    let Some(arr) = messages.as_array_mut() else { return };
+    let last_user = arr.iter().rposition(|m| m["role"] == "user");
+    for i in [Some(0), last_user].into_iter().flatten() {
+        let content = arr[i]["content"].take();
+        arr[i]["content"] = match content {
+            Value::String(t) => json!([{"type":"text","text":t,"cache_control":{"type":"ephemeral"}}]),
+            Value::Array(mut parts) => {
+                if let Some(last) = parts.last_mut() {
+                    last["cache_control"] = json!({"type":"ephemeral"});
+                }
+                Value::Array(parts)
+            }
+            other => other,
+        };
+    }
+}
+
 pub async fn stream(
     client: &reqwest::Client,
     p: &Provider,
@@ -82,6 +101,12 @@ pub async fn stream(
             .iter()
             .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.schema}}))
             .collect();
+    }
+    if p.id == "openrouter" {
+        body["prompt_cache_key"] = json!(req.session_id);
+        if req.model.id.starts_with("anthropic/") {
+            mark_cache(&mut body["messages"]);
+        }
     }
     if req.model.reasoning && p.id == "openrouter" {
         let effort = match req.effort { "xhigh" | "max" => "high", e => e };

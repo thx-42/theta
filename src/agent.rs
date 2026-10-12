@@ -218,7 +218,7 @@ const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is yo
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
     let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
-    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra));
+    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra), turn.depth == 0);
     if turn.depth > 0 {
         system.push_str("\n\n");
         system.push_str(REPORT_RULE);
@@ -320,11 +320,28 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
             break;
         }
-        let futs = calls.into_iter().map(|(id, name, args)| {
+        // Parallel subagents of one agent share a prompt prefix: let the first one write the cache, the others then read it.
+        let mut seen_tasks: Vec<String> = Vec::new();
+        let staggered: Vec<bool> = calls
+            .iter()
+            .map(|(_, name, args)| {
+                if name != "task" {
+                    return false;
+                }
+                let who = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let again = seen_tasks.contains(&who);
+                seen_tasks.push(who);
+                again
+            })
+            .collect();
+        let futs = calls.into_iter().zip(staggered).map(|((id, name, args), stagger)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
+                if stagger {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                }
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
+                let mut out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -342,6 +359,14 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else {
                     tools::run(&name, &args, &ctx).await
                 };
+                // The orchestrator's context is the expensive one: its own reads stay small, big ones go to a subagent.
+                let cap = rt.settings.tools.auto_max_lines;
+                if cap > 0 && turn.depth == 0 && turn.agent.delegate_all && matches!(name.as_str(), "read" | "grep" | "find" | "ls" | "bash") {
+                    let (t, cut) = tools::truncate_middle(&out.content, cap);
+                    if cut {
+                        out.content = format!("{t}\n[cut to {cap} lines: you are the orchestrator — have a subagent read or run larger things and report conclusions]");
+                    }
+                }
                 if name == "todo" {
                     let _ = tx.send(Event::Todos(ctx.todos.lock().unwrap().clone()));
                 }
@@ -413,6 +438,40 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
     tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use `job` (output, kill) to look at it or stop it."))
 }
 
+/// stdout of `git <args>` in `cwd`; None outside a repository or on failure.
+async fn git(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let o = tokio::process::Command::new("git").args(args).current_dir(cwd).output().await.ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Fingerprint of the working tree (git status + diff size).
+async fn tree_state(cwd: &std::path::Path) -> Option<String> {
+    Some(git(cwd, &["status", "--porcelain"]).await? + &git(cwd, &["diff", "HEAD", "--shortstat"]).await.unwrap_or_default())
+}
+
+/// The check the harness runs itself after a subagent changed files: setting, else detected from the project.
+fn verify_command(settings: &crate::config::Settings, cwd: &std::path::Path) -> Option<String> {
+    match settings.tools.verify.trim() {
+        "off" => None,
+        "" if cwd.join("Cargo.toml").exists() => Some("cargo test --quiet".into()),
+        "" if cwd.join("go.mod").exists() => Some("go test ./...".into()),
+        "" => None,
+        c => Some(c.into()),
+    }
+}
+
+/// Run `cmd` and summarize: "ok", or the failure with the tail of its output. The agent's own word is not proof.
+async fn verify(cwd: &std::path::Path, cmd: &str, timeout: u64) -> String {
+    let out = crate::jobs::Out::default();
+    let code = tools::shell::run_into(cmd, cwd, &out, Some(std::time::Duration::from_secs(timeout))).await;
+    if code == 0 {
+        return format!("[verify `{cmd}`: ok]");
+    }
+    let text = out.text();
+    let tail: Vec<&str> = text.lines().rev().take(30).collect();
+    format!("[verify `{cmd}`: FAILED (exit {code})]\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+}
+
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
 /// `log` (background jobs) receives one line per tool call the subagent makes.
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
@@ -427,13 +486,18 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         }
         None => parent.agent.clone(),
     };
-    let model = agents::model_of(&agent, &rt.settings)
-        .filter(|_| named)
-        .or_else(|| parent.agent.subagent_model.clone())
-        .unwrap_or(rt.task_model("subagent", &parent.model).await);
-    // named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
-    let effort = agents::effort_of(&agent, &rt.settings)
-        .filter(|_| named)
+    // `model: "main"` escalates to the orchestrator's own model; an unknown name falls back to the defaults.
+    let asked = args.get("model").and_then(|v| v.as_str()).and_then(|m| if m == "main" { Some(parent.model.clone()) } else { rt.resolve(m).ok().map(|_| m.to_string()) });
+    let model = match asked {
+        Some(m) => m,
+        None => agents::model_of(&agent, &rt.settings)
+            .filter(|_| named)
+            .or_else(|| parent.agent.subagent_model.clone())
+            .unwrap_or(rt.task_model("subagent", &parent.model).await),
+    };
+    // `effort` argument > named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
+    let effort = args.get("effort").and_then(|v| v.as_str()).filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max")).map(String::from)
+        .or_else(|| agents::effort_of(&agent, &rt.settings).filter(|_| named))
         .or_else(|| parent.agent.subagent_effort.clone())
         .or_else(|| Some(rt.settings.models.subagent_effort.clone()).filter(|e| !e.is_empty()))
         .unwrap_or_else(|| parent.effort.clone());
@@ -469,6 +533,9 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
     });
+    // A subagent that can write is checked by the harness, not by its own report.
+    let writes = !agents::is_readonly(&turn.agent);
+    let before = if writes { tree_state(&rt.cwd).await } else { None };
     let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
     let _ = forward.await;
     res?;
@@ -479,7 +546,17 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         Some((i, _)) => format!("{}… [report cut, see transcript]", &answer[..i]),
         None => answer,
     };
-    Ok(tools::ToolOut::ok(format!("{answer}\n[transcript: {transcript}]")))
+    let mut checks = String::new();
+    if let Some(before) = before
+        && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
+            if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
+                checks = format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await);
+            }
+            if let Some(stat) = git(&rt.cwd, &["diff", "HEAD", "--shortstat"]).await.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+                checks.push_str(&format!("\n[changed since HEAD: {stat}]"));
+            }
+        }
+    Ok(tools::ToolOut::ok(format!("{answer}{checks}\n[transcript: {transcript}]")))
 }
 
 /// Name the session from its first exchange using the title model.
@@ -514,6 +591,20 @@ mod tests {
         let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
         assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
         assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
+    }
+
+    #[tokio::test]
+    async fn verify_reports_ok_and_failure_tail() {
+        let dir = std::env::temp_dir();
+        assert_eq!(verify(&dir, "true", 10).await, "[verify `true`: ok]");
+        let bad = verify(&dir, "echo boom; exit 3", 10).await;
+        assert!(bad.contains("FAILED (exit 3)") && bad.contains("boom"), "{bad}");
+        let mut st = crate::config::Settings::default();
+        assert_eq!(verify_command(&st, &dir), None);
+        st.tools.verify = "make check".into();
+        assert_eq!(verify_command(&st, &dir).as_deref(), Some("make check"));
+        st.tools.verify = "off".into();
+        assert_eq!(verify_command(&st, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))), None);
     }
 
     #[test]
