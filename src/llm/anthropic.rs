@@ -98,7 +98,9 @@ pub async fn stream(
     if oauth {
         system.push(json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}));
     }
-    system.push(json!({"type":"text","text":req.system,"cache_control":{"type":"ephemeral"}}));
+    // Tools and system rarely change: keep them 1h on Anthropic itself (the message breakpoints stay on the 5m default, as the API requires longer TTLs first).
+    let stable = if p.id == "anthropic" { json!({"type":"ephemeral","ttl":"1h"}) } else { json!({"type":"ephemeral"}) };
+    system.push(json!({"type":"text","text":req.system,"cache_control":stable}));
 
     let mut tools: Vec<Value> = req
         .tools
@@ -109,7 +111,7 @@ pub async fn stream(
         })
         .collect();
     if let Some(last) = tools.last_mut() {
-        last["cache_control"] = json!({"type":"ephemeral"});
+        last["cache_control"] = stable;
     }
 
     let max_tokens = req.model.max_output.clamp(4096, 64_000);
