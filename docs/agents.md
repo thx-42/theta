@@ -6,7 +6,7 @@ An agent is a system prompt plus a tool set and model defaults. Each session run
 
 - `Build`: default. Reads, edits, writes, runs shell commands, builds and tests. Delegates to subagents with `task`.
 - `Plan`: read-only planning. Clarifies the task, asks questions, writes a plan with `write_plan`, then hands off to another agent with `handoff`. Cannot edit files or run commands.
-- `Auto`: orchestrator. Plans with the user, then runs Build and Plan subagents until the task is verified. Never writes code itself.
+- `Auto`: autonomous agent. Owns the goal until its success condition is observed: it looks things up instead of asking, tries at least three different approaches before reporting a block, and keeps its own (expensive) context small by sending searches, commands, builds and fix loops to cheaper Explore, Build and Plan subagents. A Build report that changed files carries a `[verify ...]` line the harness added by running the project's check (`[tools] verify`). Its own `read`, `grep`, `find`, `ls` and `bash` output is capped (`[tools] auto_max_lines`). A step that failed twice can be retried on Auto's own model with `task` `model: "main"`.
 
 Built-in agents are shipped in the binary. If a file is missing from `~/.theta/agents/`, theta restores it on start. An edited file is kept; the new version is written next to it as `<name>.md.new`.
 

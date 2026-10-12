@@ -125,7 +125,7 @@ context = 128000
 |---|---|
 | **Build** | Agent par défaut : lit, édite, lance et vérifie le code. |
 | **Plan** | Clarifie, trouve les angles morts, planifie. Lecture seule : ne code pas, passe la main (`handoff`). |
-| **Auto** | Orchestrateur autonome. Planifie avec toi et fait valider le plan, puis exécute de bout en bout : des sous-agents `Build` écrivent, des sous-agents `Plan` relisent, il corrige jusqu'à ce que ce soit propre. N'écrit pas de code lui-même. |
+| **Auto** | Agent autonome : il vise un résultat observé, cherche au lieu de demander et essaie au moins trois approches avant de déclarer un blocage. Il garde son contexte (le plus cher) petit : recherches, commandes, builds et boucles de correction partent chez des sous-agents `Explore`/`Build` moins chers. Le harness lance lui-même la vérification du projet après un `Build` qui a modifié des fichiers (`[tools] verify`). |
 
 ```
         validation du plan

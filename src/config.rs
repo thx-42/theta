@@ -431,6 +431,8 @@ max_tokens = 150000      # compact at the lower of threshold x window and this; 
 rtk = "auto"             # route shell commands through rtk when installed
 bash_timeout = 120
 max_lines = 300
+# verify = ""            # run after a subagent changed files; "" = detect (Cargo.toml, go.mod), "off" = never
+# auto_max_lines = 80    # lines of read/grep/bash output the Auto agent itself receives; 0 = no cap
 disabled = []
 
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.

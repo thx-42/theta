@@ -16,7 +16,7 @@ Tools are what the agent can call. Each agent sees a subset. Names below are the
 - `ask`: ask the user a question with options (`choice` or `yes_no`). Main agent only. Opt-in.
 - `handoff`: pass the session to another agent with a one-line summary. Main agent only. Opt-in.
 - `list_agents`: list agents with their description, can and cannot. Opt-in.
-- `task`: start a subagent with a fresh context; only its final report comes back. Main agent only; lists the agents it may spawn (see `agents.md`). `background: true` runs it without waiting.
+- `task`: start a subagent with a fresh context; only its final report comes back. Main agent only; lists the agents it may spawn (see `agents.md`). `background: true` runs it without waiting. `model` (`main` = the caller's own model, or `provider/model`) and `effort` override the subagent's defaults for that call.
 - `job`: wait for or read background jobs (subagents, shells, linters). Old names `wait`, `jobs`, `job_output`, `job_kill` map to `job`.
 - `web_search`, `web_fetch`: web search (backend in `[web]`) and page fetch.
 
