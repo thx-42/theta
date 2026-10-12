@@ -9,6 +9,7 @@ mod catalog;
 mod client;
 mod compact;
 mod config;
+mod dump;
 mod hooks;
 mod jobs;
 mod lint;
@@ -49,6 +50,9 @@ struct Cli {
     /// Agent name.
     #[arg(short, long)]
     agent: Option<String>,
+    /// Start in auto mode (shorthand for `--agent Auto`).
+    #[arg(long, conflicts_with = "agent")]
+    auto: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -71,6 +75,12 @@ enum Cmd {
     },
     /// Refresh the model catalog from models.dev.
     Refresh,
+    /// Nightly only: dump a whole session (messages, tool calls, nested subagent transcripts) as Markdown.
+    #[command(hide = !update::is_dev())]
+    Dump {
+        /// Session file or id; default: the latest session of this directory.
+        session: Option<String>,
+    },
     /// The background server (started automatically on first use). `theta daemon stop` stops it.
     Daemon { action: Option<String> },
     /// Serve tool calls over stdin/stdout for `/ssh` (started on the server by theta itself).
@@ -176,7 +186,10 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.auto {
+        cli.agent = Some("Auto".into());
+    }
     if let Some(Cmd::Daemon { action }) = &cli.cmd {
         return match action.as_deref() {
             None => server::serve().await,
@@ -196,6 +209,9 @@ async fn main() -> Result<()> {
     }
     if let Some(Cmd::Update { check, force }) = &cli.cmd {
         return update::run(*check, *force).await;
+    }
+    if let Some(Cmd::Dump { session }) = &cli.cmd {
+        return dump::run(session.as_deref());
     }
     let cwd = std::env::current_dir()?;
     let rt = build_runtime(cwd.clone()).await?;
@@ -278,7 +294,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
-        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");

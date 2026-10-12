@@ -97,6 +97,7 @@ pub async fn stream(
     let mut calls: Vec<Block> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = "stop".to_string();
+    let mut last_phase = String::new();
     while let Some(ev) = sse.next().await {
         let (_, data) = ev?;
         let v: Value = match serde_json::from_str(&data) {
@@ -120,6 +121,9 @@ pub async fn stream(
             }
             "response.output_item.added" if v["item"]["type"] == "function_call" => {
                 on(Delta::ToolStart { name: v["item"]["name"].as_str().unwrap_or("").into() });
+            }
+            "response.output_item.done" if v["item"]["type"] == "message" => {
+                last_phase = v["item"]["phase"].as_str().unwrap_or("").into();
             }
             "response.output_item.done" if v["item"]["type"] == "function_call" => {
                 let it = &v["item"];
@@ -154,6 +158,9 @@ pub async fn stream(
     }
     if !calls.is_empty() {
         stop = "tool_use".into();
+    } else if last_phase == "commentary" {
+        // Muse ends a turn on a "commentary" message (an announced plan) without the call that should follow.
+        stop = "commentary".into();
     }
     content.extend(calls);
     Ok(Response { msg: Msg { role: Role::Assistant, content, model: None }, usage, stop })

@@ -228,6 +228,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let ctx = rt.tool_ctx(&session_id);
     let mut overflow_retry = false;
     let mut nudges = 0u8;
+    let mut stalls = 0u8;
     let mut compact_failed = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
@@ -266,7 +267,10 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             Err(e) => return Err(e),
         };
         let calls = resp.msg.tool_calls();
-        session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
+        let empty = resp.msg.content.iter().all(|b| matches!(b, Block::Thinking { .. }));
+        if !resp.msg.content.is_empty() {
+            session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
+        }
         let _ = tx.send(Event::Step { usage: resp.usage.clone(), model: model.key() });
         if calls.is_empty() {
             if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
@@ -290,6 +294,12 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 if woke {
                     continue;
                 }
+            }
+            // A turn that only announced its plan (or said nothing) is not an answer: push the model to act.
+            if (resp.stop == "commentary" || empty) && stalls < 3 {
+                stalls += 1;
+                session.lock().unwrap().add_msg(Msg::user("You stopped without calling a tool or giving a final answer. Continue the task now: call the tools you need, then give your final report."), None)?;
+                continue;
             }
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
             if turn.depth == 0 && turn.agent.delegate_all && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
