@@ -171,7 +171,8 @@ fn read(p: &Path) -> Option<String> {
 }
 
 /// SOUL (global, then project) + agent prompt + auto skills + environment + project context file.
-pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) -> String {
+/// `with_guides`: the theta guides are for the main agent; subagents skip them (smaller cold prefix).
+pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, with_guides: bool) -> String {
     let mut parts = Vec::new();
     if let Some(s) = read(&config::home().join("SOUL.md")) {
         parts.push(s);
@@ -190,7 +191,7 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str) ->
     if !skills.is_empty() {
         parts.push(skills.to_string());
     }
-    if let Some(guides) = guides() {
+    if let Some(guides) = with_guides.then(guides).flatten() {
         parts.push(guides);
     }
     let date = chrono_date();

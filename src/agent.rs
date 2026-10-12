@@ -214,7 +214,7 @@ const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is yo
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
     let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
-    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra));
+    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra), turn.depth == 0);
     if turn.depth > 0 {
         system.push_str("\n\n");
         system.push_str(REPORT_RULE);
