@@ -35,6 +35,7 @@ use unicode_width::UnicodeWidthStr;
 
 pub mod theme {
     use ratatui::style::{Color, Modifier, Style};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Stable color from an agent name: FNV-1a hash → hue, fixed saturation/lightness → 6×6×6 color cube.
     pub fn color_for(name: &str) -> u8 {
@@ -55,9 +56,17 @@ pub mod theme {
         16 + 36 * q(r) + 6 * q(g) + q(b)
     }
 
-    /// Fixed UI accent; agent colors are only used on the parts an agent produced (see `agent`).
-    fn accent_color() -> Color { Color::Indexed(51) }
-    pub fn accent() -> Style { Style::default().fg(accent_color()) }
+    /// Color index of the agent the UI is being drawn for: nothing in the interface has a color of its own.
+    static ACCENT: AtomicU8 = AtomicU8::new(255);
+    pub fn accent() -> Style { Style::default().fg(Color::Indexed(ACCENT.load(Ordering::Relaxed))) }
+    /// Run `f` with `accent()` set to this agent's color, then put the previous one back.
+    pub fn as_agent<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let prev = ACCENT.swap(color_for(name), Ordering::Relaxed);
+        let out = f();
+        ACCENT.store(prev, Ordering::Relaxed);
+        out
+    }
+    pub fn set_agent(name: &str) { ACCENT.store(color_for(name), Ordering::Relaxed) }
     pub fn agent(name: &str) -> Style { Style::default().fg(Color::Indexed(color_for(name))) }
     pub fn dim() -> Style { Style::default().fg(Color::DarkGray) }
     pub fn code() -> Style { Style::default().fg(Color::Yellow) }
@@ -2184,20 +2193,27 @@ impl Ui {
     // ---------- drawing ----------
 
     /// Assistant and tool parts get a gutter bar in the color of the agent that wrote them.
+    /// Everything accented inside an item (bullets, headings, spinner, `›`) takes the color of its agent;
+    /// a prompt takes the color of the first agent that answered it.
     fn item_lines(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
-        let agent = match &self.items[i] {
-            Item::Assistant { agent, .. } | Item::Tool { agent, .. } => agent.clone(),
-            _ => return self.item_body(i, width, full),
-        };
-        let bar = Span::styled("▎ ", theme::agent(&agent));
-        self.item_body(i, width.saturating_sub(2), full)
-            .into_iter()
-            .map(|l| {
-                let mut spans = vec![bar.clone()];
-                spans.extend(l.spans);
-                Line::from(spans).style(l.style)
-            })
-            .collect()
+        match &self.items[i] {
+            Item::Assistant { agent, .. } | Item::Tool { agent, .. } => theme::as_agent(agent, || {
+                let bar = Span::styled("▎ ", theme::accent());
+                self.item_body(i, width.saturating_sub(2), full)
+                    .into_iter()
+                    .map(|l| {
+                        let mut spans = vec![bar.clone()];
+                        spans.extend(l.spans);
+                        Line::from(spans).style(l.style)
+                    })
+                    .collect()
+            }),
+            Item::User(_) | Item::Steer { .. } => {
+                let who = self.turn_agents(i).first().map(|a| a.to_string()).unwrap_or_else(|| self.app.turn.agent.name.clone());
+                theme::as_agent(&who, || self.item_body(i, width, full))
+            }
+            _ => self.item_body(i, width, full),
+        }
     }
 
     /// User prompts and steers share one band, one blank row above and below, full width.
@@ -2348,6 +2364,7 @@ impl Ui {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        theme::set_agent(&self.app.turn.agent.name);
         let orientation = self.app.rt.settings.tab_orientation.as_str();
         let hidden = self.app.rt.settings.tab_hidden;
         let vertical = !hidden && orientation == "vertical";

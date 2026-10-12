@@ -179,8 +179,9 @@ fn short_model(m: &str) -> &str {
 /// Horizontal: one row. Vertical: a card of `CARD` rows per tab, then a + row, then the divider.
 pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<Line<'static>>, Strip) {
     let mut out = Strip::default();
-    let glyph = |status: TabStatus| match status {
-        TabStatus::Working => (SPIN[spin % SPIN.len()], theme::accent()),
+    // A tab at work shows in the color of its own agent.
+    let glyph = |status: TabStatus, agent: &str| match status {
+        TabStatus::Working => (SPIN[spin % SPIN.len()], theme::agent(agent)),
         TabStatus::Done => ("●", theme::ok()),
         TabStatus::Error => ("!", theme::err()),
         TabStatus::Idle => ("·", theme::dim()),
@@ -195,7 +196,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
         for (i, t) in tabs.iter().enumerate() {
             let y0 = area.y + (i * CARD) as u16;
             let st = style(t.active);
-            let (g, c) = glyph(t.status);
+            let (g, c) = glyph(t.status, &t.agent);
             let idx = format!(" {} ", i + 1);
             // Row 1: glyph, number, title, then " ×" at the right edge.
             let room = w.saturating_sub(1 + 1 + idx.len() + 2);
@@ -212,7 +213,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
             let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, short_model(&t.model)) };
             lines.push(Line::from(vec![Span::styled(pad(&clip(&who, w), w), theme::agent(&t.agent)), divider()]));
             let detail_style = match t.status {
-                TabStatus::Working => theme::accent(),
+                TabStatus::Working => theme::agent(&t.agent),
                 TabStatus::Done => theme::ok(),
                 TabStatus::Error => theme::err(),
                 TabStatus::Idle => theme::dim(),
@@ -242,7 +243,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
             spans.push(Span::styled("│", theme::dim()));
             x += 1;
         }
-        let (g, c) = glyph(t.status);
+        let (g, c) = glyph(t.status, &t.agent);
         let st = style(t.active);
         let w = (5 + format!("{}", i + 1).len() + max.min(name(&t.title).chars().count())) as u16;
         spans.push(Span::styled(" ", st));
