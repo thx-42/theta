@@ -440,13 +440,18 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         }
         None => parent.agent.clone(),
     };
-    let model = agents::model_of(&agent, &rt.settings)
-        .filter(|_| named)
-        .or_else(|| parent.agent.subagent_model.clone())
-        .unwrap_or(rt.task_model("subagent", &parent.model).await);
-    // named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
-    let effort = agents::effort_of(&agent, &rt.settings)
-        .filter(|_| named)
+    // `model: "main"` escalates to the orchestrator's own model; an unknown name falls back to the defaults.
+    let asked = args.get("model").and_then(|v| v.as_str()).and_then(|m| if m == "main" { Some(parent.model.clone()) } else { rt.resolve(m).ok().map(|_| m.to_string()) });
+    let model = match asked {
+        Some(m) => m,
+        None => agents::model_of(&agent, &rt.settings)
+            .filter(|_| named)
+            .or_else(|| parent.agent.subagent_model.clone())
+            .unwrap_or(rt.task_model("subagent", &parent.model).await),
+    };
+    // `effort` argument > named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
+    let effort = args.get("effort").and_then(|v| v.as_str()).filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max")).map(String::from)
+        .or_else(|| agents::effort_of(&agent, &rt.settings).filter(|_| named))
         .or_else(|| parent.agent.subagent_effort.clone())
         .or_else(|| Some(rt.settings.models.subagent_effort.clone()).filter(|e| !e.is_empty()))
         .unwrap_or_else(|| parent.effort.clone());

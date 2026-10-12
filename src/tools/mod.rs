@@ -113,7 +113,7 @@ pub const OPT_IN: &[&str] = &["ls", "find", "write_plan", "ask", "handoff", "lis
 
 pub fn task_def(agents: &[String]) -> ToolDef {
     def("task", &format!("Delegate a self-contained task to a subagent with a fresh context; only its final report returns. Use for broad searches or independent work. Agents: {}.", agents.join(", ")),
-        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 words"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return a job id at once; the report arrives later"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent"}},"required":["description","prompt"]}))
+        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 words"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return a job id at once; the report arrives later"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent"},"model":{"type":"string","description":"Override the subagent model: `main` = your own (escalate a step that failed twice) or provider/model"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]}},"required":["description","prompt"]}))
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
