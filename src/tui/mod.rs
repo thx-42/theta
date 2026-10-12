@@ -2193,21 +2193,11 @@ impl Ui {
     // ---------- drawing ----------
 
     /// Assistant and tool parts get a gutter bar in the color of the agent that wrote them.
-    /// Everything accented inside an item (bullets, headings, spinner) takes the color of its agent;
+    /// Everything accented inside an item (bullet, headings, spinner) takes the color of its agent;
     /// a prompt keeps its white `›`, its agent label names who answered.
     fn item_lines(&self, i: usize, width: usize, full: bool) -> Vec<Line<'static>> {
         match &self.items[i] {
-            Item::Assistant { agent, .. } | Item::Tool { agent, .. } => theme::as_agent(agent, || {
-                let bar = Span::styled("▎ ", theme::accent());
-                self.item_body(i, width.saturating_sub(2), full)
-                    .into_iter()
-                    .map(|l| {
-                        let mut spans = vec![bar.clone()];
-                        spans.extend(l.spans);
-                        Line::from(spans).style(l.style)
-                    })
-                    .collect()
-            }),
+            Item::Assistant { agent, .. } | Item::Tool { agent, .. } => theme::as_agent(agent, || self.item_body(i, width, full)),
             Item::User(_) | Item::Steer { .. } => {
                 let who = self.turn_agents(i).first().map(|a| a.to_string()).unwrap_or_else(|| self.app.turn.agent.name.clone());
                 theme::as_agent(&who, || self.item_body(i, width, full))
@@ -2277,7 +2267,13 @@ impl Ui {
                     if full && !thinking.trim().is_empty() {
                         out.push(Line::default());
                     }
-                    out.extend(markdown::render(text, width));
+                    // A bullet on the first line, the rest indented under it.
+                    for (n, l) in markdown::render(text, width.saturating_sub(2)).into_iter().enumerate() {
+                        let mark = if n == 0 { Span::styled("● ", theme::accent()) } else { Span::raw("  ") };
+                        let mut spans = vec![mark];
+                        spans.extend(l.spans);
+                        out.push(Line::from(spans).style(l.style));
+                    }
                 }
                 if out.len() == 1 { vec![] } else { out }
             }
@@ -2290,7 +2286,7 @@ impl Ui {
                     ToolState::Done { ok: true } => ("✓", theme::ok()),
                     ToolState::Done { ok: false } => ("✗", theme::err()),
                 };
-                let mut head = vec![Span::styled(format!("  {icon} "), st), Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)), Span::raw(" ")];
+                let mut head = vec![Span::styled(format!("  {icon} "), st), Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)), Span::raw(" ")];
                 if !who.is_empty() {
                     head.push(Span::styled(format!("({who}) "), theme::agent(who).add_modifier(Modifier::BOLD)));
                 }
@@ -2391,13 +2387,14 @@ impl Ui {
         let input_h = input_lines.len().min(8) as u16 + chips + 2;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
-        let [chat, todo_area, progress, _gap, input_area, status] = Layout::vertical([
+        let [chat, todo_area, progress, _gap, input_area, _gap2, status] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(todo_h),
             Constraint::Length(if show_progress { 1 } else { 0 }),
             Constraint::Length(1),
             Constraint::Length(input_h),
             Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .areas(area);
 
@@ -2520,10 +2517,10 @@ impl Ui {
             }
         }
 
-        // status bar
+        // status bar: who and what model on the first row, the rest (ssh, jobs, remote, session, context, cost) on the second
         let a = &self.app.turn.agent;
         let ag = theme::agent(&a.name);
-        let mut left = vec![
+        let mut top = vec![
             Span::styled(" θ ", theme::logo(&a.name)),
             Span::styled(format!(" {} ", a.name), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(format!("({})", a.scope.label()), theme::dim()),
@@ -2532,18 +2529,25 @@ impl Ui {
             Span::styled(format!(" · {}", self.app.turn.effort), theme::dim()),
         ];
         if !self.verbose() {
-            left.push(Span::styled(" · compact", theme::dim()));
+            top.push(Span::styled(" · compact", theme::dim()));
         }
+        let mut left = vec![Span::raw(" ")];
+        let sep = |left: &mut Vec<Span<'static>>, s: Span<'static>| {
+            if left.len() > 1 {
+                left.push(Span::styled(" · ", theme::dim()));
+            }
+            left.push(s);
+        };
         if let Some(s) = &self.ssh {
-            left.push(Span::styled(format!(" · ⇢ {}:{}", s.host, s.cwd), ag));
+            sep(&mut left, Span::styled(format!("⇢ {}:{}", s.host, s.cwd), ag));
         }
         let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
         if live > 0 {
-            left.push(Span::styled(format!(" · ⚙ {live}"), ag));
+            sep(&mut left, Span::styled(format!("⚙ {live}"), ag));
         }
         match &self.remote_state {
-            RemoteState::Linked => left.push(Span::styled(" · ⇄ remote", ag)),
-            RemoteState::Code { .. } => left.push(Span::styled(" · ⇄ waiting for browser", theme::dim())),
+            RemoteState::Linked => sep(&mut left, Span::styled("⇄ remote", ag)),
+            RemoteState::Code { .. } => sep(&mut left, Span::styled("⇄ waiting for browser", theme::dim())),
             _ => {}
         }
         let ctx_max = self.model_ctx();
@@ -2559,12 +2563,12 @@ impl Ui {
         };
         let lw: usize = left.iter().map(|s| s.content.width()).sum();
         let rw: usize = right.iter().map(|s| s.content.width()).sum();
-        let mut bar = left;
+        let mut second = left;
         if lw + rw < width {
-            bar.push(Span::raw(" ".repeat(width - lw - rw)));
-            bar.extend(right);
+            second.push(Span::raw(" ".repeat(width - lw - rw)));
+            second.extend(right);
         }
-        f.render_widget(Paragraph::new(Line::from(bar)), status);
+        f.render_widget(Paragraph::new(vec![Line::from(top), Line::from(second)]), status);
 
         // overlays
         let prev = self.sel_area;
