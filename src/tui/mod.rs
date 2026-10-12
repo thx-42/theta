@@ -2381,7 +2381,10 @@ impl Ui {
             f.render_widget(Paragraph::new(lines), strip_area);
         }
         self.strip = strip;
-        let width = area.width as usize;
+        // Chat, input and status sit between two blank columns (popups and overlays keep the full area).
+        let margin = if area.width >= 60 { 2 } else { 1 };
+        let main = Rect { x: area.x + margin, width: area.width.saturating_sub(2 * margin), ..area };
+        let width = main.width as usize;
         let (input_lines, cursor) = self.input.layout(width.saturating_sub(2));
         let chips = u16::from(!self.images.is_empty());
         let input_h = input_lines.len().min(8) as u16 + chips + 2;
@@ -2396,10 +2399,10 @@ impl Ui {
             Constraint::Length(1),
             Constraint::Length(2),
         ])
-        .areas(area);
+        .areas(main);
 
         // chat
-        let chat_inner = Rect { x: chat.x + 1, width: chat.width.saturating_sub(2), ..chat };
+        let chat_inner = chat;
         let lines = if self.items.is_empty() { self.splash(chat_inner.height as usize) } else { self.chat_lines(chat_inner.width as usize) };
         let total = lines.len();
         let view = chat_inner.height as usize;

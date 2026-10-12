@@ -190,8 +190,16 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
     let style = |active: bool| if active { theme::sel() } else { theme::dim() };
 
     if vertical {
-        let w = area.width.saturating_sub(1) as usize; // last column is the divider
+        // One blank column on each side of the cards, then the divider on the last column.
+        let w = area.width.saturating_sub(3) as usize;
         let divider = || Span::styled("│", theme::dim());
+        let row = |mut spans: Vec<Span<'static>>| {
+            spans.insert(0, Span::raw(" "));
+            spans.push(Span::raw(" "));
+            spans.push(divider());
+            Line::from(spans)
+        };
+        let x0 = area.x + 1;
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (i, t) in tabs.iter().enumerate() {
             let y0 = area.y + (i * CARD) as u16;
@@ -201,36 +209,35 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool) -> (Vec<
             // Row 1: glyph, number, title, then " ×" at the right edge.
             let room = w.saturating_sub(1 + 1 + idx.len() + 2);
             let title = clip(&name(&t.title), room);
-            lines.push(Line::from(vec![
+            lines.push(row(vec![
                 Span::styled(" ", st),
                 Span::styled(g, st.patch(c)),
                 Span::styled(pad(&format!("{idx}{title}"), w.saturating_sub(4)), st),
                 Span::styled(" ", st),
                 Span::styled("×", st.patch(theme::dim())),
-                divider(),
             ]));
             // Row 2: agent · model. Row 3: what it is doing. Row 4: spacer.
             let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, short_model(&t.model)) };
-            lines.push(Line::from(vec![Span::styled(pad(&clip(&who, w), w), theme::agent(&t.agent)), divider()]));
+            lines.push(row(vec![Span::styled(pad(&clip(&who, w), w), theme::agent(&t.agent))]));
             let detail_style = match t.status {
                 TabStatus::Working => theme::agent(&t.agent),
                 TabStatus::Done => theme::ok(),
                 TabStatus::Error => theme::err(),
                 TabStatus::Idle => theme::dim(),
             };
-            lines.push(Line::from(vec![Span::styled(pad(&clip(&format!("   {}", t.detail), w), w), detail_style), divider()]));
-            lines.push(Line::from(vec![Span::raw(pad("", w)), divider()]));
+            lines.push(row(vec![Span::styled(pad(&clip(&format!("   {}", t.detail), w), w), detail_style)]));
+            lines.push(row(vec![Span::raw(pad("", w))]));
             out.tabs.push((
-                Rect { x: area.x, y: y0, width: w as u16, height: CARD as u16 },
-                Rect { x: area.x + w as u16 - 1, y: y0, width: 1, height: 1 },
+                Rect { x: x0, y: y0, width: w as u16, height: CARD as u16 },
+                Rect { x: x0 + (w as u16).saturating_sub(1), y: y0, width: 1, height: 1 },
             ));
         }
         let y = area.y + (tabs.len() * CARD) as u16;
-        lines.push(Line::from(vec![Span::styled(pad(" + new session", w), theme::accent()), divider()]));
-        out.new = Rect { x: area.x, y, width: w as u16, height: 1 };
+        lines.push(row(vec![Span::styled(pad(" + new session", w), theme::accent())]));
+        out.new = Rect { x: x0, y, width: w as u16, height: 1 };
         // Keep the divider running down the empty space below the cards.
         while lines.len() < area.height as usize {
-            lines.push(Line::from(vec![Span::raw(pad("", w)), divider()]));
+            lines.push(row(vec![Span::raw(pad("", w))]));
         }
         return (lines, out);
     }
