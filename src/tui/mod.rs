@@ -880,8 +880,8 @@ impl Ui {
             "/session" => match arg {
                 "" | "new" => self.new_tab(),
                 "close" => self.close_tab(),
-                "hide" => self.set_tab_orientation("hidden"),
-                "show" => self.set_tab_orientation("horizontal"),
+                "hide" => self.set_tab_hidden(true),
+                "show" => self.set_tab_hidden(false),
                 n if n.starts_with("width") => match n["width".len()..].trim().parse::<u16>() {
                     Ok(w) => self.set_tab_width(w),
                     Err(_) => self.notify(format!("usage: /session width <{}-{}>", tabs::WIDTH_MIN, tabs::WIDTH_MAX)),
@@ -1999,7 +1999,7 @@ impl Ui {
                 self.update_settings("tools.rtk", v.clone().into(), |s| s.tools.rtk = v);
             }
             5 => {
-                let v = cycle(&["horizontal", "vertical", "hidden"], &s.tab_orientation);
+                let v = cycle(&["horizontal", "vertical"], &s.tab_orientation);
                 self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
             }
             6 => {
@@ -2137,15 +2137,15 @@ impl Ui {
 
     fn draw(&mut self, f: &mut Frame) {
         let orientation = self.app.rt.settings.tab_orientation.as_str();
-        let vertical = orientation == "vertical";
-        let hidden = orientation == "hidden";
+        let hidden = self.app.rt.settings.tab_hidden;
+        let vertical = !hidden && orientation == "vertical";
         let infos = self.tab_infos();
         let width = self.drag.unwrap_or(self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX));
-        let (strip_area, area) = if vertical {
+        let (strip_area, area) = if hidden {
+            (Rect::default(), f.area())
+        } else if vertical {
             let [a, b] = Layout::horizontal([Constraint::Length(width), Constraint::Min(20)]).areas(f.area());
             (a, b)
-        } else if hidden {
-            (Rect::default(), f.area())
         } else {
             let [a, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(f.area());
             (a, b)
@@ -2986,15 +2986,14 @@ impl Ui {
             .collect()
     }
 
-    fn set_tab_orientation(&mut self, v: &str) {
-        let v = v.to_string();
-        self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
+    fn set_tab_hidden(&mut self, hidden: bool) {
+        self.update_settings("tab_hidden", hidden.into(), |s| s.tab_hidden = hidden);
     }
 
-    /// alt+b: hide the tab bar, or bring it back (horizontal).
+    /// ctrl+x b: hide the tab bar, or bring it back in its saved orientation.
     fn toggle_tab_bar(&mut self) {
-        let hidden = self.app.rt.settings.tab_orientation == "hidden";
-        self.set_tab_orientation(if hidden { "horizontal" } else { "hidden" });
+        let hidden = !self.app.rt.settings.tab_hidden;
+        self.set_tab_hidden(hidden);
     }
 
     fn set_tab_width(&mut self, w: u16) {
