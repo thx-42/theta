@@ -155,11 +155,13 @@ pub struct ToolSettings {
     pub max_lines: usize,
     /// Tools disabled globally.
     pub disabled: Vec<String>,
+    /// Lines of read/grep/find/ls/bash output Auto itself receives (0 = no cap); larger reads belong to subagents.
+    pub auto_max_lines: usize,
 }
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![] }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], auto_max_lines: 80 }
     }
 }
 

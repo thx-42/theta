@@ -337,7 +337,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 }
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
+                let mut out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -355,6 +355,14 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else {
                     tools::run(&name, &args, &ctx).await
                 };
+                // The orchestrator's context is the expensive one: its own reads stay small, big ones go to a subagent.
+                let cap = rt.settings.tools.auto_max_lines;
+                if cap > 0 && turn.depth == 0 && turn.agent.delegate_all && matches!(name.as_str(), "read" | "grep" | "find" | "ls" | "bash") {
+                    let (t, cut) = tools::truncate_middle(&out.content, cap);
+                    if cut {
+                        out.content = format!("{t}\n[cut to {cap} lines: you are the orchestrator — have a subagent read or run larger things and report conclusions]");
+                    }
+                }
                 if name == "todo" {
                     let _ = tx.send(Event::Todos(ctx.todos.lock().unwrap().clone()));
                 }
