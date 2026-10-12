@@ -316,9 +316,26 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
             break;
         }
-        let futs = calls.into_iter().map(|(id, name, args)| {
+        // Parallel subagents of one agent share a prompt prefix: let the first one write the cache, the others then read it.
+        let mut seen_tasks: Vec<String> = Vec::new();
+        let staggered: Vec<bool> = calls
+            .iter()
+            .map(|(_, name, args)| {
+                if name != "task" {
+                    return false;
+                }
+                let who = args.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let again = seen_tasks.contains(&who);
+                seen_tasks.push(who);
+                again
+            })
+            .collect();
+        let futs = calls.into_iter().zip(staggered).map(|((id, name, args), stagger)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
+                if stagger {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                }
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
                 let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
