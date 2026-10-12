@@ -322,7 +322,18 @@ struct DirView {
     sel: usize,
 }
 
+/// Ctrl+x leader keys, shown while the leader is armed.
+const LEADER: &[(&str, &str)] = &[
+    ("1 … 9", "go to tab"),
+    ("n", "new session tab"),
+    ("w", "close session tab"),
+    ("b", "hide / show tab bar"),
+    ("j", "background jobs"),
+    ("h / l", "previous / next tab"),
+];
+
 enum Overlay {
+    Leader,
     Pick(Picker),
     Dir(DirView),
     Jobs(JobsView),
@@ -1529,7 +1540,7 @@ impl Ui {
         if k.kind == KeyEventKind::Release {
             return;
         }
-        if self.overlay.is_some() {
+        if self.overlay.is_some() && !self.leader {
             return self.overlay_key(k);
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1541,6 +1552,7 @@ impl Ui {
         }
         // Leader (ctrl+x) then one key: vim-like, no Option/Alt needed.
         if std::mem::take(&mut self.leader) {
+            self.overlay = None;
             match k.code {
                 KeyCode::Char(c @ '1'..='9') => {
                     let n = c as usize - '1' as usize;
@@ -1552,6 +1564,7 @@ impl Ui {
                 KeyCode::Char('j') => self.open_jobs(),
                 KeyCode::Char('h') => self.step_tab(-1),
                 KeyCode::Char('l') => self.step_tab(1),
+                KeyCode::Esc => {}
                 _ => self.notify("leader: unknown key"),
             }
             return;
@@ -1559,7 +1572,7 @@ impl Ui {
         match k.code {
             KeyCode::Char('x') if ctrl => {
                 self.leader = true;
-                self.notify("leader: n w b j h l 1-9");
+                self.overlay = Some(Overlay::Leader);
             }
             // Tab keys: alt, because ctrl+tab and ctrl+shift+t belong to terminal emulators such as Warp.
             KeyCode::Char(c @ '1'..='9') if alt => {
@@ -1816,7 +1829,7 @@ impl Ui {
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
-            Overlay::Help => {}
+            Overlay::Help | Overlay::Leader => {}
             Overlay::Mcp(mut v) => {
                 let rows = self.app.rt.mcp.rows();
                 let name = rows.get(v.sel).map(|r| r.name.clone());
@@ -2636,6 +2649,7 @@ impl Ui {
         let iw = w.saturating_sub(6) as usize;
         let content = match ov {
             Overlay::Help => COMMANDS.len() + 18,
+            Overlay::Leader => LEADER.len() + 2,
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
@@ -2825,6 +2839,12 @@ impl Ui {
                     l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())]));
                 }
                 f.render_widget(Paragraph::new(l).block(block("θ help")), r);
+            }
+            Overlay::Leader => {
+                let mut l: Vec<Line> = LEADER.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("  {k:<12}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())])).collect();
+                l.push(Line::default());
+                l.push(hint(" a key to run · esc cancel "));
+                f.render_widget(Paragraph::new(l).block(block("θ ctrl+x")), r);
             }
             Overlay::Pick(p) => {
                 let vis = p.visible();
