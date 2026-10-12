@@ -434,6 +434,40 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
     tools::ToolOut::ok(format!("started background subagent {id}: {label}\nIts report arrives in a later message; use `job` (output, kill) to look at it or stop it."))
 }
 
+/// stdout of `git <args>` in `cwd`; None outside a repository or on failure.
+async fn git(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let o = tokio::process::Command::new("git").args(args).current_dir(cwd).output().await.ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Fingerprint of the working tree (git status + diff size).
+async fn tree_state(cwd: &std::path::Path) -> Option<String> {
+    Some(git(cwd, &["status", "--porcelain"]).await? + &git(cwd, &["diff", "HEAD", "--shortstat"]).await.unwrap_or_default())
+}
+
+/// The check the harness runs itself after a subagent changed files: setting, else detected from the project.
+fn verify_command(settings: &crate::config::Settings, cwd: &std::path::Path) -> Option<String> {
+    match settings.tools.verify.trim() {
+        "off" => None,
+        "" if cwd.join("Cargo.toml").exists() => Some("cargo test --quiet".into()),
+        "" if cwd.join("go.mod").exists() => Some("go test ./...".into()),
+        "" => None,
+        c => Some(c.into()),
+    }
+}
+
+/// Run `cmd` and summarize: "ok", or the failure with the tail of its output. The agent's own word is not proof.
+async fn verify(cwd: &std::path::Path, cmd: &str, timeout: u64) -> String {
+    let out = crate::jobs::Out::default();
+    let code = tools::shell::run_into(cmd, cwd, &out, Some(std::time::Duration::from_secs(timeout))).await;
+    if code == 0 {
+        return format!("[verify `{cmd}`: ok]");
+    }
+    let text = out.text();
+    let tail: Vec<&str> = text.lines().rev().take(30).collect();
+    format!("[verify `{cmd}`: FAILED (exit {code})]\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+}
+
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
 /// `log` (background jobs) receives one line per tool call the subagent makes.
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
@@ -495,6 +529,9 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
     });
+    // A subagent that can write is checked by the harness, not by its own report.
+    let writes = !agents::is_readonly(&turn.agent);
+    let before = if writes { tree_state(&rt.cwd).await } else { None };
     let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
     let _ = forward.await;
     res?;
@@ -505,7 +542,17 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         Some((i, _)) => format!("{}… [report cut, see transcript]", &answer[..i]),
         None => answer,
     };
-    Ok(tools::ToolOut::ok(format!("{answer}\n[transcript: {transcript}]")))
+    let mut checks = String::new();
+    if let Some(before) = before
+        && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
+            if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
+                checks = format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await);
+            }
+            if let Some(stat) = git(&rt.cwd, &["diff", "HEAD", "--shortstat"]).await.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+                checks.push_str(&format!("\n[changed since HEAD: {stat}]"));
+            }
+        }
+    Ok(tools::ToolOut::ok(format!("{answer}{checks}\n[transcript: {transcript}]")))
 }
 
 /// Name the session from its first exchange using the title model.
@@ -540,6 +587,20 @@ mod tests {
         let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
         assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
         assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
+    }
+
+    #[tokio::test]
+    async fn verify_reports_ok_and_failure_tail() {
+        let dir = std::env::temp_dir();
+        assert_eq!(verify(&dir, "true", 10).await, "[verify `true`: ok]");
+        let bad = verify(&dir, "echo boom; exit 3", 10).await;
+        assert!(bad.contains("FAILED (exit 3)") && bad.contains("boom"), "{bad}");
+        let mut st = crate::config::Settings::default();
+        assert_eq!(verify_command(&st, &dir), None);
+        st.tools.verify = "make check".into();
+        assert_eq!(verify_command(&st, &dir).as_deref(), Some("make check"));
+        st.tools.verify = "off".into();
+        assert_eq!(verify_command(&st, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))), None);
     }
 
     #[test]
