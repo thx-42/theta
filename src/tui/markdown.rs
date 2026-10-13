@@ -33,74 +33,82 @@ pub fn wrap(spans: Vec<Span<'static>>, width: usize, first: Vec<Span<'static>>, 
     let indent_w: usize = indent.iter().map(|s| s.content.width()).sum();
     let start_w = cur_w;
     let mut at_start = true;
+    // Tokens run across span boundaries: a word styled in pieces (bold, code, link) stays one token.
+    let mut tokens: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut buf: Vec<(char, Style)> = Vec::new();
     for span in spans {
         let style = span.style;
-        // Split into words keeping whitespace attached as separate tokens.
-        let text = span.content.to_string();
-        let mut tokens: Vec<String> = Vec::new();
-        let mut buf = String::new();
-        for c in text.chars() {
+        for c in span.content.chars() {
             if c == '\n' {
                 if !buf.is_empty() { tokens.push(std::mem::take(&mut buf)); }
-                tokens.push("\n".into());
+                tokens.push(vec![('\n', style)]);
             } else if c == ' ' {
-                if !buf.is_empty() && !buf.ends_with(' ') { tokens.push(std::mem::take(&mut buf)); }
-                buf.push(c);
+                if buf.last().is_some_and(|(p, _)| *p != ' ') { tokens.push(std::mem::take(&mut buf)); }
+                buf.push((c, style));
             } else {
-                if buf.ends_with(' ') { tokens.push(std::mem::take(&mut buf)); }
-                buf.push(c);
+                if buf.last().is_some_and(|(p, _)| *p == ' ') { tokens.push(std::mem::take(&mut buf)); }
+                buf.push((c, style));
             }
         }
-        if !buf.is_empty() { tokens.push(buf); }
-        for tok in tokens {
-            if tok == "\n" {
-                lines.push(Line::from(std::mem::take(&mut cur)));
-                cur = indent.clone();
-                cur_w = indent_w;
-                at_start = true;
-                continue;
-            }
-            let w = tok.width();
-            let is_space = tok.starts_with(' ');
-            if cur_w + w > width && cur_w > indent_w.max(start_w) {
-                lines.push(finish(std::mem::take(&mut cur)));
-                cur = indent.clone();
-                cur_w = indent_w;
-                at_start = true;
-                if is_space { continue; }
-            }
-            if is_space && at_start && cur_w == indent_w && !lines.is_empty() {
-                continue;
-            }
-            if w > width.saturating_sub(cur_w) && !is_space {
-                // Hard-break long tokens (URLs, paths).
-                let mut piece = String::new();
-                let mut pw = 0;
-                for c in tok.chars() {
-                    let cw = c.width().unwrap_or(0);
-                    if cur_w + pw + cw > width && (pw > 0 || cur_w > indent_w) {
-                        cur.push(Span::styled(std::mem::take(&mut piece), style));
-                        lines.push(Line::from(std::mem::take(&mut cur)));
-                        cur = indent.clone();
-                        cur_w = indent_w;
-                        pw = 0;
-                    }
-                    piece.push(c);
-                    pw += cw;
+    }
+    if !buf.is_empty() { tokens.push(buf); }
+    for tok in tokens {
+        if tok[0].0 == '\n' {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur = indent.clone();
+            cur_w = indent_w;
+            at_start = true;
+            continue;
+        }
+        let w: usize = tok.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+        let is_space = tok[0].0 == ' ';
+        if cur_w + w > width && cur_w > indent_w.max(start_w) {
+            lines.push(finish(std::mem::take(&mut cur)));
+            cur = indent.clone();
+            cur_w = indent_w;
+            at_start = true;
+            if is_space { continue; }
+        }
+        if is_space && at_start && cur_w == indent_w && !lines.is_empty() {
+            continue;
+        }
+        if w > width.saturating_sub(cur_w) && !is_space {
+            // Hard-break long tokens (URLs, paths).
+            let mut pw = 0;
+            for (c, st) in tok {
+                let cw = c.width().unwrap_or(0);
+                if cur_w + cw > width && (pw > 0 || cur_w > indent_w) {
+                    lines.push(Line::from(std::mem::take(&mut cur)));
+                    cur = indent.clone();
+                    cur_w = indent_w;
+                    pw = 0;
                 }
-                cur.push(Span::styled(piece, style));
-                cur_w += pw;
-            } else {
-                cur.push(Span::styled(tok, style));
-                cur_w += w;
+                cur.push(Span::styled(c.to_string(), st));
+                cur_w += cw;
+                pw += cw;
             }
-            at_start = false;
+        } else {
+            cur.extend(group(&tok));
+            cur_w += w;
         }
+        at_start = false;
     }
     if !cur.is_empty() {
         lines.push(Line::from(cur));
     }
     lines
+}
+
+/// Chars of one token as spans, merging neighbours of the same style.
+fn group(tok: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut out: Vec<(String, Style)> = Vec::new();
+    for (c, st) in tok {
+        match out.last_mut() {
+            Some((s, last)) if last == st => s.push(*c),
+            _ => out.push((c.to_string(), *st)),
+        }
+    }
+    out.into_iter().map(|(s, st)| Span::styled(s, st)).collect()
 }
 
 struct R {
@@ -401,5 +409,13 @@ mod tests {
     fn wraps_words() {
         let out = plain(&wrap(vec![Span::raw("aaa bbb ccc")], 10, vec![], vec![Span::raw("  ")]));
         assert_eq!(out, vec!["aaa bbb", "  ccc"]);
+    }
+
+    #[test]
+    fn keeps_word_across_styled_spans() {
+        // "lmnop" is styled in two pieces: it must not be cut at the span boundary
+        let spans = vec![Span::raw("aaa bbb lmn"), Span::styled("op", Style::default().add_modifier(Modifier::BOLD))];
+        let out = plain(&wrap(spans, 10, vec![], vec![Span::raw("  ")]));
+        assert_eq!(out, vec!["aaa bbb", "  lmnop"]);
     }
 }
