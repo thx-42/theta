@@ -384,30 +384,58 @@ impl Editor {
             self.cur = start;
         }
     }
-    /// Byte index of the char under visual (row, col) for `width`, same wrap as `layout`.
-    fn at(&self, width: usize, row: usize, col: usize) -> usize {
-        let width = width.max(4);
-        let (mut line, mut w) = (0, 0);
-        for (i, c) in self.text.char_indices() {
+    /// Visual rows as byte ranges (newlines excluded). A word that does not fit the row end moves to the next row; only a word longer than a row is cut.
+    fn rows(&self, width: usize) -> Vec<(usize, usize)> {
+        let t = &self.text;
+        let mut rows = vec![];
+        let (mut start, mut w, mut after_space) = (0, 0, None);
+        for (i, c) in t.char_indices() {
             if c == '\n' {
-                if line == row {
-                    return i;
-                }
-                line += 1;
-                w = 0;
+                rows.push((start, i));
+                (start, w, after_space) = (i + 1, 0, None);
                 continue;
             }
             let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > width {
-                line += 1;
-                w = 0;
+            if w + cw > width && i > start {
+                match after_space.take() {
+                    Some(sp) => {
+                        rows.push((start, sp));
+                        start = sp;
+                        w = unicode_width::UnicodeWidthStr::width(&t[sp..i]);
+                    }
+                    None => {
+                        rows.push((start, i));
+                        start = i;
+                        w = 0;
+                    }
+                }
+                if w + cw > width {
+                    rows.push((start, i));
+                    start = i;
+                    w = 0;
+                }
             }
-            if line > row || (line == row && w + cw > col) {
-                return i;
+            if c == ' ' {
+                after_space = Some(i + 1);
             }
             w += cw;
         }
-        self.text.len()
+        rows.push((start, t.len()));
+        rows
+    }
+    /// Byte index of the char under visual (row, col) for `width`, same wrap as `layout`.
+    fn at(&self, width: usize, row: usize, col: usize) -> usize {
+        let width = width.max(4);
+        let Some(&(s, e)) = self.rows(width).get(row) else { return self.text.len() };
+        let mut w = 0;
+        for (i, c) in self.text[s..e].char_indices() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > col {
+                return s + i;
+            }
+            w += cw;
+        }
+        e
     }
     fn word_left(&mut self) {
         let t = self.text[..self.cur].trim_end();
@@ -443,34 +471,16 @@ impl Editor {
     /// Wrapped lines (char-level) and cursor (row, col) for `width`.
     fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
         let width = width.max(4);
-        let mut lines = vec![String::new()];
-        let mut w = 0;
-        let mut cursor = (0, 0);
-        for (i, c) in self.text.char_indices() {
-            if i == self.cur {
-                cursor = (lines.len() - 1, w);
-            }
-            if c == '\n' {
-                lines.push(String::new());
-                w = 0;
-                continue;
-            }
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > width {
-                lines.push(String::new());
-                w = 0;
-            }
-            lines.last_mut().unwrap().push(c);
-            w += cw;
+        let mut rows = self.rows(width);
+        let mut row = rows.iter().rposition(|&(s, _)| s <= self.cur).unwrap_or(0);
+        let mut col = unicode_width::UnicodeWidthStr::width(&self.text[rows[row].0..self.cur]);
+        if self.cur >= self.text.len() && col >= width {
+            rows.push((self.text.len(), self.text.len()));
+            row += 1;
+            col = 0;
         }
-        if self.cur >= self.text.len() {
-            if w >= width {
-                lines.push(String::new());
-                w = 0;
-            }
-            cursor = (lines.len() - 1, w);
-        }
-        (lines, cursor)
+        let lines = rows.iter().map(|&(s, e)| self.text[s..e].to_string()).collect();
+        (lines, (row, col))
     }
 }
 
@@ -3790,6 +3800,11 @@ mod tests {
         let e = super::Editor { text: "abcdefgh".into(), cur: 0 };
         assert_eq!(e.at(4, 0, 2), 2);
         assert_eq!(e.at(4, 1, 1), 5);
+        // a word that does not fit the row end moves down whole; a word longer than a row is still cut
+        let e = super::Editor { text: "aaa bbbbbb".into(), cur: 0 };
+        assert_eq!(e.layout(6).0, vec!["aaa ", "bbbbbb"]);
+        let e = super::Editor { text: "abcdefghij".into(), cur: 0 };
+        assert_eq!(e.layout(4).0, vec!["abcd", "efgh", "ij"]);
     }
 
     #[test]
