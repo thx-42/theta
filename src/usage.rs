@@ -156,8 +156,11 @@ pub fn stats(catalog: &Catalog) -> Vec<String> {
     let mut by_model: BTreeMap<String, Totals> = BTreeMap::new();
     let mut by_day: BTreeMap<i64, Totals> = BTreeMap::new();
     let mut sessions = 0;
-    let dirs = std::fs::read_dir(config::home().join("sessions")).into_iter().flatten().flatten();
-    for file in dirs.filter_map(|d| std::fs::read_dir(d.path()).ok()).flatten().flatten() {
+    let home = config::home();
+    let projects = std::fs::read_dir(home.join("sessions")).into_iter().flatten().flatten().filter_map(|d| std::fs::read_dir(d.path()).ok()).flatten().flatten();
+    // Subagent transcripts (Build, Explore) live apart: their own model and usage per message.
+    let subagents = std::fs::read_dir(home.join("cache/subagents")).into_iter().flatten().flatten();
+    for file in projects.chain(subagents) {
         if file.path().extension().is_none_or(|x| x != "jsonl") {
             continue;
         }
