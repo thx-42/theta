@@ -101,6 +101,18 @@ async fn get_json(http: &reqwest::Client, url: &str) -> Option<Value> {
     r.json().await.ok()
 }
 
+/// Protected-resource metadata URLs to try: RFC 9728 path form (`/.well-known/oauth-protected-resource/v1`) first, then the root form.
+fn resource_meta_urls(url: &reqwest::Url) -> Vec<String> {
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    let mut v = Vec::new();
+    if !path.is_empty() {
+        v.push(format!("{origin}/.well-known/oauth-protected-resource{path}"));
+    }
+    v.push(format!("{origin}/.well-known/oauth-protected-resource"));
+    v
+}
+
 /// OAuth login for an HTTP server: discovery, dynamic client registration, PKCE code flow.
 pub async fn login(name: &str, cfg: &McpServer, io: &mut Io) -> Result<()> {
     if cfg.url.is_empty() {
@@ -108,12 +120,19 @@ pub async fn login(name: &str, cfg: &McpServer, io: &mut Io) -> Result<()> {
     }
     let http = reqwest::Client::new();
     let resource = expand(&cfg.url);
-    let origin = reqwest::Url::parse(&resource)?.origin().ascii_serialization();
-    let as_url = get_json(&http, &format!("{origin}/.well-known/oauth-protected-resource"))
-        .await
-        .and_then(|v| v["authorization_servers"][0].as_str().map(|s| s.trim_end_matches('/').to_string()))
-        .unwrap_or(origin);
-    let meta = get_json(&http, &format!("{as_url}/.well-known/oauth-authorization-server")).await.unwrap_or(json!({}));
+    let ru = reqwest::Url::parse(&resource)?;
+    let mut as_url = ru.origin().ascii_serialization();
+    for u in resource_meta_urls(&ru) {
+        let found = get_json(&http, &u).await.and_then(|v| v["authorization_servers"][0].as_str().map(|s| s.trim_end_matches('/').to_string()));
+        if let Some(a) = found {
+            as_url = a;
+            break;
+        }
+    }
+    let meta = match get_json(&http, &format!("{as_url}/.well-known/oauth-authorization-server")).await {
+        Some(m) => m,
+        None => get_json(&http, &format!("{as_url}/.well-known/openid-configuration")).await.unwrap_or(json!({})),
+    };
     let endpoint = |k: &str, default: &str| meta[k].as_str().map(String::from).unwrap_or(format!("{as_url}{default}"));
     let (authorize, token_url) = (endpoint("authorization_endpoint", "/authorize"), endpoint("token_endpoint", "/token"));
     let redirect = format!("http://localhost:{OAUTH_PORT}/callback");
@@ -502,6 +521,14 @@ mod tests {
         let sse = "event: message\ndata: {\"id\":1,\"result\":{}}\n\nevent: message\ndata: {\"id\":2,\"result\":{\"ok\":true}}\n\n";
         assert_eq!(parse_sse(sse, 2).unwrap()["result"]["ok"], true);
         assert!(parse_sse(sse, 9).is_err());
+    }
+
+    #[test]
+    fn resource_meta_path_form_first() {
+        let u = reqwest::Url::parse("https://mcp.trello.com/v1/").unwrap();
+        assert_eq!(resource_meta_urls(&u), ["https://mcp.trello.com/.well-known/oauth-protected-resource/v1", "https://mcp.trello.com/.well-known/oauth-protected-resource"]);
+        let u = reqwest::Url::parse("https://mcp.example.com").unwrap();
+        assert_eq!(resource_meta_urls(&u), ["https://mcp.example.com/.well-known/oauth-protected-resource"]);
     }
 
     #[tokio::test]
