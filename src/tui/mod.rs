@@ -1392,7 +1392,7 @@ impl Ui {
     }
 
     fn mcp_login(&mut self, n: String) {
-        let Some(cfg) = self.app.rt.mcp.config(&n) else { return };
+        let Some(cfg) = self.app.rt.settings.mcp.get(&n).cloned() else { return self.notify(format!("`{n}` is not in settings.toml")) };
         let (say, mut said) = unbounded_channel();
         let (paste_tx, paste) = unbounded_channel();
         let tx = self.login_tx.clone();
@@ -1417,12 +1417,11 @@ impl Ui {
 
     /// Prompt that asks theta to diagnose one MCP server. Goes in the input bar; the user sends it.
     fn mcp_diagnose_prompt(&self, name: &str) -> String {
-        let mcp = &self.app.rt.mcp;
         let state = match self.mcp_rows.iter().find(|r| r.name == name).and_then(|r| r.error.clone()) {
             Some(e) => format!("Error: {e}"),
             None => "Error: none (no connection error reported)".into(),
         };
-        let cfg = mcp.config(name).unwrap_or_default();
+        let cfg = self.app.rt.settings.mcp.get(name).cloned().unwrap_or_default();
         let target = if cfg.url.is_empty() { format!("stdio command `{} {}`", cfg.command, cfg.args.join(" ")) } else { format!("HTTP url `{}`", cfg.url) };
         let env = if cfg.env.is_empty() { "none".to_string() } else { cfg.env.keys().cloned().collect::<Vec<_>>().join(", ") };
         format!(
@@ -1844,6 +1843,7 @@ impl Ui {
                         return;
                     }
                     (KeyCode::Char('l'), Some(n)) => return self.mcp_login(n),
+                    (KeyCode::Char('l' | 'o' | 'd' | 'r') | KeyCode::Enter, None) => self.notify("no MCP server listed yet"),
                     (KeyCode::Char('o'), Some(n)) => match crate::mcp::logout(&n) {
                         Ok(()) => {
                             self.notify(format!("logged out of {n}"));
@@ -2787,7 +2787,7 @@ impl Ui {
                     l.push(Line::from(vec![Span::styled(if i == v.sel { " › " } else { "   " }, theme::accent()), Span::styled(text, sel)]));
                 }
                 if let Some(r) = rows.get(v.sel) {
-                    let c = self.app.rt.mcp.config(&r.name).unwrap_or_default();
+                    let c = self.app.rt.settings.mcp.get(&r.name).cloned().unwrap_or_default();
                     let target = if c.url.is_empty() { format!("{} {}", c.command, c.args.join(" ")) } else { c.url.clone() };
                     l.push(Line::default());
                     l.push(Line::from(Span::styled(format!(" {target}"), theme::dim())));
