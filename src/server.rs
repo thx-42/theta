@@ -273,7 +273,10 @@ impl Server {
                         }
                     }
                 }
-                Req::Reload => self.reload().await,
+                Req::Reload => {
+                    self.reload().await;
+                    let _ = out.send(Push::Mcp(self.base.mcp.rows()));
+                }
                 Req::SaveTabs { cwd, open } => {
                     let mut before = Vec::new();
                     update_tabs(&cwd, |t| before = std::mem::replace(&mut t.open, open.clone()));
@@ -295,8 +298,14 @@ impl Server {
                     }
                 }
                 Req::McpConnect(name) => {
-                    let mcp = self.base.mcp.clone();
-                    tokio::spawn(async move { mcp.connect(&name).await });
+                    let (mcp, out) = (self.base.mcp.clone(), out.clone());
+                    tokio::spawn(async move {
+                        mcp.connect(&name).await;
+                        let _ = out.send(Push::Mcp(mcp.rows()));
+                    });
+                }
+                Req::McpRows => {
+                    let _ = out.send(Push::Mcp(self.base.mcp.rows()));
                 }
                 Req::McpStatus => {
                     let l = self.base.mcp.status();
@@ -633,7 +642,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             }
             let _ = live.session.lock().unwrap().set_leaf(target);
         }
-        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
+        Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::McpRows | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
         Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
     }
 }

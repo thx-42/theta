@@ -509,6 +509,8 @@ struct Ui {
     overlay: Option<Overlay>,
     todos: Vec<Todo>,
     jobs: Vec<JobInfo>,
+    /// MCP servers as the daemon reports them (`Req::McpRows`); the pop-up and the diagnosis prompt read this.
+    mcp_rows: Vec<crate::mcp::Row>,
     /// Link to theta-server, shared by every tab; `remote_asked` = this TUI ran `/remote` and wants the code shown.
     remote_state: RemoteState,
     remote_asked: bool,
@@ -1385,6 +1387,7 @@ impl Ui {
 
     /// `/mcp`: pop-up listing the MCP servers; keys act on the selected one.
     fn mcp_command(&mut self) {
+        self.remote.send(Req::McpRows);
         self.overlay = Some(Overlay::Mcp(McpView { sel: 0 }));
     }
 
@@ -1415,7 +1418,7 @@ impl Ui {
     /// Prompt that asks theta to diagnose one MCP server. Goes in the input bar; the user sends it.
     fn mcp_diagnose_prompt(&self, name: &str) -> String {
         let mcp = &self.app.rt.mcp;
-        let state = match mcp.rows().into_iter().find(|r| r.name == name).and_then(|r| r.error) {
+        let state = match self.mcp_rows.iter().find(|r| r.name == name).and_then(|r| r.error.clone()) {
             Some(e) => format!("Error: {e}"),
             None => "Error: none (no connection error reported)".into(),
         };
@@ -1829,7 +1832,7 @@ impl Ui {
         match ov {
             Overlay::Help | Overlay::Leader => {}
             Overlay::Mcp(mut v) => {
-                let rows = self.app.rt.mcp.rows();
+                let rows = &self.mcp_rows;
                 let name = rows.get(v.sel).map(|r| r.name.clone());
                 match (k.code, name) {
                     (KeyCode::Esc | KeyCode::Char('q'), _) => return,
@@ -2652,7 +2655,7 @@ impl Ui {
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
-            Overlay::Mcp(_) => self.app.rt.mcp.rows().len().max(1) + 6,
+            Overlay::Mcp(_) => self.mcp_rows.len().max(1) + 6,
             Overlay::Activity(_) => self.activity().len().max(1) + 3,
             Overlay::Pick(p) => p.rows().max(1) + 1,
             Overlay::Tree(t) => t.rows.len() + 2,
@@ -2761,7 +2764,7 @@ impl Ui {
                 }
             }
             Overlay::Mcp(v) => {
-                let rows = self.app.rt.mcp.rows();
+                let rows = &self.mcp_rows;
                 let mut l = Vec::new();
                 if rows.is_empty() {
                     l.push(Line::from(Span::styled(" no MCP servers — add [mcp.<name>] to settings.toml", theme::dim())));
@@ -3555,6 +3558,7 @@ impl Ui {
             Push::Remote { state, url } => self.on_remote(state, &url),
             Push::Overview(_) | Push::Tabs { .. } => {} // web clients / handled in on_tab_push
             Push::Jobs(l) => self.jobs = l,
+            Push::Mcp(r) => self.mcp_rows = r,
             Push::Ssh(i) => self.ssh = i,
             Push::Dir { cwd, mut entries } => {
                 entries.sort_by_key(|e| (!e.ends_with('/'), e.to_lowercase()));
@@ -3607,6 +3611,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         overlay: None,
         todos: vec![],
         jobs: snap.jobs.clone(),
+        mcp_rows: vec![],
         remote_state: RemoteState::Off,
         remote_asked: false,
         ssh: None,

@@ -50,6 +50,8 @@ pub enum Req {
     Reload,
     McpConnect(String),
     McpStatus,
+    /// State of every MCP server of the daemon; answered with `Push::Mcp`.
+    McpRows,
     /// Is an agent run active in any session? Answered with `Push::Busy`.
     Busy,
     /// Stop a background job of the attached session.
@@ -167,6 +169,8 @@ pub enum Push {
     Notice(String),
     Err(String),
     Busy(bool),
+    /// MCP servers as the daemon holds them: the TUI has no connection of its own.
+    Mcp(Vec<crate::mcp::Row>),
     /// Background jobs of the session changed (started, ended or killed).
     Jobs(Vec<JobInfo>),
     JobOutput { id: String, text: String },

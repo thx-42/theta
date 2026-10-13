@@ -368,6 +368,7 @@ struct Slot {
 }
 
 /// One server's state, as shown in the `/mcp` pop-up.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub name: String,
     pub http: bool,
