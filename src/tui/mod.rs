@@ -2250,7 +2250,7 @@ impl Ui {
         let used: usize = left.width() + label.iter().map(|s| s.width()).sum::<usize>();
         let mut top = vec![left, Span::raw(" ".repeat(width.saturating_sub(used)))];
         top.extend(label);
-        let mut out = vec![Line::from(top).style(band)];
+        let mut out = vec![Line::default(), Line::from(top).style(band)];
         for l in markdown::wrap(spans, width, vec![Span::styled("› ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
             let fill = width.saturating_sub(l.width());
             let mut s = l.spans;
@@ -2258,6 +2258,7 @@ impl Ui {
             out.push(Line::from(s).style(band));
         }
         out.push(Line::from(" ".repeat(width)).style(band));
+        out.push(Line::default());
         out
     }
 
