@@ -172,6 +172,9 @@ fn read(p: &Path) -> Option<String> {
 
 /// SOUL (global, then project) + agent prompt + auto skills + environment + project context file.
 /// `with_guides`: the theta guides are for the main agent; subagents skip them (smaller cold prefix).
+/// Models drift to `bash` for everything; the dedicated tools cap output, respect .gitignore and are counted in the UI.
+const TOOL_RULE: &str = "# Tools\nUse `read`, `grep`, `find` and `ls` to look at files and `edit`/`write` to change them. Use `bash` only to run commands (builds, tests, git, services), not for cat, sed, head, grep, find or ls.";
+
 pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, with_guides: bool) -> String {
     let mut parts = Vec::new();
     if let Some(s) = read(&config::home().join("SOUL.md")) {
@@ -188,6 +191,7 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, wi
         }
     }
     parts.push(agent.prompt.clone());
+    parts.push(TOOL_RULE.to_string());
     if !skills.is_empty() {
         parts.push(skills.to_string());
     }
