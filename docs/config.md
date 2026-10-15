@@ -9,6 +9,7 @@ Created on first run with defaults; the file is only written when missing.
 - `model`: `provider/model`, default `anthropic/claude-sonnet-5-5`.
 - `effort`: `low | medium | high | xhigh | max`, default `medium`.
 - `verbose`: `full | compact`. `full` shows tool calls and thinking.
+- `[diff]`: `scope = session | turn | unpushed`, `view = popup | split` (defaults of `/diff`, also in `/settings`).
 - `tab_orientation`: `horizontal | vertical | hidden`. `tab_width`: 14-60, sidebar columns.
 - `agent`: default agent name, default `Build`.
 

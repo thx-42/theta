@@ -9,6 +9,7 @@ mod catalog;
 mod client;
 mod compact;
 mod config;
+mod diff;
 mod dump;
 mod hooks;
 mod jobs;

@@ -41,6 +41,8 @@ pub struct Settings {
     pub verbose: String,
     /// Session tab bar: horizontal (top row) | vertical (left sidebar)
     pub tab_orientation: String,
+    /// Color theme id: one of /theme's ids
+    pub theme: String,
     /// Tab bar hidden (ctrl+x b); keeps tab_orientation for when it comes back
     pub tab_hidden: bool,
     /// Sidebar width in columns (vertical tab bar only)
@@ -54,6 +56,7 @@ pub struct Settings {
     pub tools: ToolSettings,
     pub web: WebSettings,
     pub remote: RemoteSettings,
+    pub diff: DiffSettings,
     pub skills: SkillSettings,
     /// MCP servers, keyed by name (`[mcp.<name>]`)
     pub mcp: BTreeMap<String, McpServer>,
@@ -70,6 +73,7 @@ impl Default for Settings {
             effort: "medium".into(),
             verbose: "full".into(),
             tab_orientation: "horizontal".into(),
+            theme: "theta".into(),
             tab_hidden: false,
             tab_width: 24,
             agent: "Build".into(),
@@ -79,6 +83,7 @@ impl Default for Settings {
             tools: ToolSettings::default(),
             web: WebSettings::default(),
             remote: RemoteSettings::default(),
+            diff: DiffSettings::default(),
             skills: SkillSettings::default(),
             mcp: BTreeMap::new(),
             providers: BTreeMap::new(),
@@ -210,6 +215,22 @@ pub struct WebSettings {
 impl Default for WebSettings {
     fn default() -> Self {
         WebSettings { backend: "exa".into() }
+    }
+}
+
+/// `/diff`: what to show and where.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffSettings {
+    /// session (since the conversation began) | turn (last message) | unpushed (vs upstream, committed or not)
+    pub scope: String,
+    /// popup | split (side pane next to the chat)
+    pub view: String,
+}
+
+impl Default for DiffSettings {
+    fn default() -> Self {
+        DiffSettings { scope: "session".into(), view: "popup".into() }
     }
 }
 
@@ -401,6 +422,7 @@ const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>
 model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
+theme = "theta"                 # color theme: one of /theme's ids
 tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
 tab_hidden = false               # ctrl+x b toggles; orientation is kept
 tab_width = 24                   # sidebar width in columns (14-60)
@@ -458,6 +480,10 @@ subagent = ["caveman", "ponytail"]   # also injected into every subagent (token-
 # [linters]
 # py = "ruff check {file}"
 # rs = "cargo clippy --quiet"
+
+[diff]
+scope = "session"        # session | turn | unpushed
+view = "popup"           # popup | split
 
 [web]
 backend = "exa"          # exa | firecrawl | brave | tavily | duckduckgo

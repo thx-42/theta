@@ -5,7 +5,9 @@
 - `/session [new | close | hide | show | <n> | width <n>]`: session tabs.
 - `/tree`: browse and fork the conversation tree.
 - `/undo`: remove the last turn, put its prompt back in the input.
+- `/diff [session | turn | unpushed] [popup | split | close]`: what changed in the working tree: since the conversation began, since the last message, or not yet pushed (vs upstream, committed or not). No argument uses `[diff]` in settings. `split` shows a pane beside the chat (wheel scrolls it, refreshed when a run ends; needs 100+ columns); in the popup `tab` cycles the scope.
 - `/model`: pick model. `/effort [low|medium|high|xhigh|max]`: reasoning effort.
+- `/theme [name]`: color theme (theta, light, opencode, tokyonight, catppuccin, gruvbox, nord, dracula, ... run `/theme` for the full list), saved as `theme` in settings. Each theme reshuffles agent colors.
 - `/agent`: pick agent. See `agents.md`.
 - `/skills`: list skills. See `skills.md`.
 - `/mcp`: pop-up of MCP servers (reconnect, login, logout, diagnose). See `mcp.md`.

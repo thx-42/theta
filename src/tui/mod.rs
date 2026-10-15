@@ -22,7 +22,7 @@ use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEvent
 use futures::StreamExt;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
@@ -35,13 +35,94 @@ use unicode_width::UnicodeWidthStr;
 
 pub mod theme {
     use ratatui::style::{Color, Modifier, Style};
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-    /// Stable color from an agent name: FNV-1a hash → hue, fixed saturation/lightness → 6×6×6 color cube.
-    pub fn color_for(name: &str) -> u8 {
-        let h = name.to_lowercase().bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193));
+    /// One palette. `seed` is mixed into the agent-name hash, so every theme gives each agent its own colors.
+    pub struct Theme {
+        pub id: &'static str,
+        pub seed: u32,
+        /// Saturation and lightness of agent colors.
+        pub sat: f32,
+        pub light: f32,
+        pub fg: Color,
+        pub dim: Color,
+        pub code: Color,
+        pub link: Color,
+        pub ok: Color,
+        pub err: Color,
+        /// Selected row, and the band behind the prompt and user messages.
+        pub sel: Color,
+        pub band: Color,
+        /// Text on the θ badge.
+        pub on_accent: Color,
+    }
+
+    const fn ix(n: u8) -> Color { Color::Indexed(n) }
+    const fn rgb(h: u32) -> Color { Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8) }
+    /// `c` = fg, dim, code, link, ok, err, sel, band, on_accent as 0xRRGGBB.
+    const fn th(id: &'static str, seed: u32, c: [u32; 9]) -> Theme {
+        Theme { id, seed, sat: 0.70, light: 0.66, fg: rgb(c[0]), dim: rgb(c[1]), code: rgb(c[2]), link: rgb(c[3]), ok: rgb(c[4]), err: rgb(c[5]), sel: rgb(c[6]), band: rgb(c[7]), on_accent: rgb(c[8]) }
+    }
+
+    pub const THEMES: &[Theme] = &[
+        Theme { id: "theta", seed: 0, sat: 0.75, light: 0.62, fg: Color::White, dim: Color::DarkGray, code: Color::Yellow, link: Color::Blue, ok: Color::Green, err: Color::Red, sel: ix(236), band: ix(237), on_accent: Color::Black },
+        Theme { id: "midnight", seed: 1, sat: 0.60, light: 0.70, fg: ix(255), dim: ix(244), code: ix(180), link: ix(75), ok: ix(114), err: ix(203), sel: ix(235), band: ix(234), on_accent: ix(232) },
+        Theme { id: "ember", seed: 2, sat: 0.90, light: 0.58, fg: ix(223), dim: ix(137), code: ix(214), link: ix(173), ok: ix(107), err: ix(196), sel: ix(52), band: ix(237), on_accent: ix(0) },
+        Theme { id: "forest", seed: 3, sat: 0.55, light: 0.60, fg: ix(194), dim: ix(65), code: ix(186), link: ix(109), ok: ix(71), err: ix(167), sel: ix(22), band: ix(235), on_accent: ix(0) },
+        Theme { id: "ocean", seed: 4, sat: 0.70, light: 0.64, fg: ix(195), dim: ix(67), code: ix(222), link: ix(81), ok: ix(79), err: ix(210), sel: ix(17), band: ix(236), on_accent: ix(0) },
+        Theme { id: "light", seed: 5, sat: 0.70, light: 0.36, fg: ix(0), dim: ix(243), code: ix(130), link: ix(25), ok: ix(28), err: ix(160), sel: ix(253), band: ix(254), on_accent: ix(255) },
+        // palettes of the opencode themes; every one is a dark background, so agents get the same saturation and lightness
+        th("opencode", 10, [0xeeeeee, 0x808080, 0xfab283, 0x5c9cff, 0x7fd88f, 0xe06c75, 0x1e1e1e, 0x141414, 0x0a0a0a]),
+        th("tokyonight", 11, [0xc8d3f5, 0x636da6, 0xffc777, 0x82aaff, 0xc3e88d, 0xff757f, 0x2f334d, 0x222436, 0x1e2030]),
+        th("everforest", 12, [0xd3c6aa, 0x859289, 0xdbbc7f, 0x7fbbb3, 0xa7c080, 0xe67e80, 0x3d484d, 0x343f44, 0x2d353b]),
+        th("ayu", 13, [0xe6e1cf, 0x5c6773, 0xe6b450, 0x59c2ff, 0xaad94c, 0xf07178, 0x273747, 0x1f2430, 0x0b0e14]),
+        th("catppuccin", 14, [0xcdd6f4, 0x6c7086, 0xf9e2af, 0x89b4fa, 0xa6e3a1, 0xf38ba8, 0x45475a, 0x313244, 0x1e1e2e]),
+        th("catppuccin-macchiato", 15, [0xcad3f5, 0x6e738d, 0xeed49f, 0x8aadf4, 0xa6da95, 0xed8796, 0x494d64, 0x363a4f, 0x24273a]),
+        th("gruvbox", 16, [0xebdbb2, 0x928374, 0xfabd2f, 0x83a598, 0xb8bb26, 0xfb4934, 0x504945, 0x3c3836, 0x282828]),
+        th("kanagawa", 17, [0xdcd7ba, 0x727169, 0xe6c384, 0x7e9cd8, 0x98bb6c, 0xc34043, 0x2d4f67, 0x2a2a37, 0x1f1f28]),
+        th("nord", 18, [0xeceff4, 0x616e88, 0xebcb8b, 0x88c0d0, 0xa3be8c, 0xbf616a, 0x434c5e, 0x3b4252, 0x2e3440]),
+        th("matrix", 19, [0x62ff94, 0x1c6b48, 0xe6ff57, 0x30b3ff, 0x62ff94, 0xff4b4b, 0x1e2a1e, 0x0e1a12, 0x0a0e0a]),
+        th("one-dark", 20, [0xabb2bf, 0x5c6370, 0xe5c07b, 0x61afef, 0x98c379, 0xe06c75, 0x3e4451, 0x2c313a, 0x21252b]),
+        th("dracula", 21, [0xf8f8f2, 0x6272a4, 0xf1fa8c, 0x8be9fd, 0x50fa7b, 0xff5555, 0x44475a, 0x343746, 0x282a36]),
+        th("github", 22, [0xc9d1d9, 0x8b949e, 0xe3b341, 0x58a6ff, 0x3fb950, 0xf85149, 0x30363d, 0x21262d, 0x0d1117]),
+        th("monokai", 23, [0xf8f8f2, 0x75715e, 0xe6db74, 0x66d9ef, 0xa6e22e, 0xf92672, 0x49483e, 0x3e3d32, 0x272822]),
+        th("nightowl", 24, [0xd6deeb, 0x637777, 0xecc48d, 0x82aaff, 0xaddb67, 0xef5350, 0x1d3b53, 0x0b2942, 0x011627]),
+        th("palenight", 25, [0xa6accd, 0x676e95, 0xffcb6b, 0x82aaff, 0xc3e88d, 0xf07178, 0x3a3f58, 0x32364a, 0x292d3e]),
+        th("rosepine", 26, [0xe0def4, 0x6e6a86, 0xf6c177, 0x9ccfd8, 0xc4a7e7, 0xeb6f92, 0x403d52, 0x26233a, 0x191724]),
+        th("solarized", 27, [0x93a1a1, 0x586e75, 0xb58900, 0x268bd2, 0x859900, 0xdc322f, 0x0f4452, 0x073642, 0x002b36]),
+        th("synthwave84", 28, [0xffffff, 0x848bbd, 0xfede5d, 0x36f9f6, 0x72f1b8, 0xfe4450, 0x34294f, 0x262335, 0x241b2f]),
+        th("vesper", 29, [0xffffff, 0x8b8b8b, 0xffc799, 0x99ffe4, 0x99ffe4, 0xff8080, 0x232323, 0x1c1c1c, 0x101010]),
+        th("zenburn", 30, [0xdcdccc, 0x7f9f7f, 0xf0dfaf, 0x8cd0d3, 0x60b48a, 0xcc9393, 0x4f4f4f, 0x3f3f3f, 0x2b2b2b]),
+        th("material", 31, [0xeeffff, 0x546e7a, 0xffcb6b, 0x82aaff, 0xc3e88d, 0xf07178, 0x37474f, 0x2c3b41, 0x212121]),
+        th("cobalt2", 32, [0xffffff, 0x6c8fb5, 0xffc600, 0x80fcff, 0x3ad900, 0xff628c, 0x1f4662, 0x193549, 0x15232d]),
+        th("flexoki", 33, [0xcecdc3, 0x878580, 0xd0a215, 0x4385be, 0x879a39, 0xd14d41, 0x343331, 0x282726, 0x1c1b1a]),
+        th("carbonfox", 34, [0xf2f4f8, 0x7b7c7e, 0xf1c21b, 0x78a9ff, 0x25be6a, 0xee5396, 0x2a2a2a, 0x252525, 0x161616]),
+        th("osaka-jade", 35, [0xc1c497, 0x53685b, 0xe5c736, 0x2dd5b7, 0x549e6a, 0xff5345, 0x23372b, 0x1a2b22, 0x111c18]),
+        th("aura", 36, [0xedecee, 0x6d6d6d, 0xffca85, 0x82e2ff, 0x61ffca, 0xff6767, 0x2d2b3d, 0x21202e, 0x15141b]),
+        th("vercel", 37, [0xededed, 0xa1a1a1, 0xffb224, 0x52a8ff, 0x46a758, 0xe5484d, 0x1a1a1a, 0x111111, 0x000000]),
+        th("mercury", 38, [0xdddde5, 0x8d8da0, 0xffd27a, 0x8da4f5, 0x77c599, 0xfc92b4, 0x3b3c4e, 0x2a2b3a, 0x171721]),
+    ];
+
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn current() -> &'static Theme { &THEMES[CURRENT.load(Ordering::Relaxed).min(THEMES.len() - 1)] }
+
+    /// Select a theme by id (unknown ids leave the current one); returns whether it exists.
+    pub fn set(id: &str) -> bool {
+        match THEMES.iter().position(|t| t.id == id) {
+            Some(i) => { CURRENT.store(i, Ordering::Relaxed); true }
+            None => false,
+        }
+    }
+
+    /// Stable color from an agent name: FNV-1a hash seeded by the theme → hue, theme saturation/lightness → 6×6×6 color cube.
+    pub fn color_for(name: &str) -> u8 { color_in(current(), name) }
+
+    pub fn color_in(t: &Theme, name: &str) -> u8 {
+        let init = 0x811c9dc5u32 ^ t.seed.wrapping_mul(0x9e3779b1);
+        let h = name.to_lowercase().bytes().fold(init, |h, b| (h ^ b as u32).wrapping_mul(0x01000193));
         let hue = (h % 360) as f32;
-        let (s, l) = (0.75, 0.62);
+        let (s, l) = (t.sat, t.light);
         let c = (1.0 - (2.0 * l - 1.0f32).abs()) * s;
         let x = c * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
         let (r, g, b) = match hue as u32 / 60 {
@@ -68,15 +149,17 @@ pub mod theme {
     }
     pub fn set_agent(name: &str) { ACCENT.store(color_for(name), Ordering::Relaxed) }
     pub fn agent(name: &str) -> Style { Style::default().fg(Color::Indexed(color_for(name))) }
-    pub fn dim() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn code() -> Style { Style::default().fg(Color::Yellow) }
-    pub fn link() -> Style { Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED) }
-    pub fn ok() -> Style { Style::default().fg(Color::Green) }
-    pub fn err() -> Style { Style::default().fg(Color::Red) }
+    pub fn fg() -> Style { Style::default().fg(current().fg) }
+    pub fn dim() -> Style { Style::default().fg(current().dim) }
+    pub fn code() -> Style { Style::default().fg(current().code) }
+    pub fn link() -> Style { Style::default().fg(current().link).add_modifier(Modifier::UNDERLINED) }
+    pub fn ok() -> Style { Style::default().fg(current().ok) }
+    pub fn err() -> Style { Style::default().fg(current().err) }
     pub fn user() -> Style { Style::default().add_modifier(Modifier::BOLD) }
     /// The θ badge of the status bar, in the color of the active agent.
-    pub fn logo(name: &str) -> Style { Style::default().fg(Color::Black).bg(Color::Indexed(color_for(name))).add_modifier(Modifier::BOLD) }
-    pub fn sel() -> Style { Style::default().bg(Color::Indexed(236)).add_modifier(Modifier::BOLD) }
+    pub fn logo(name: &str) -> Style { Style::default().fg(current().on_accent).bg(Color::Indexed(color_for(name))).add_modifier(Modifier::BOLD) }
+    pub fn sel() -> Style { Style::default().bg(current().sel).add_modifier(Modifier::BOLD) }
+    pub fn band() -> Style { Style::default().bg(current().band) }
 }
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -86,7 +169,7 @@ const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Compu
 
 
 /// Main actions behind ctrl+p, in menu order. Descriptions come from COMMANDS.
-const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/compact", "/verbose", "/copy", "/usage", "/settings", "/login", "/help", "/quit"];
+const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/diff", "/compact", "/verbose", "/copy", "/usage", "/settings", "/login", "/help", "/quit"];
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new session"),
@@ -94,11 +177,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
     ("/tree", "browse and fork the conversation tree"),
     ("/linters", "linters per language and whether they are installed"),
+    ("/theme", "color theme: (none) to pick | <name>"),
     ("/remote", "control theta from a browser: (none) | stop | status"),
     ("/ssh", "run tools on a server: <ssh arguments> | off"),
     ("/cd", "browse the ssh server's folders: (none) opens the explorer | <dir>"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
     ("/undo", "remove the last turn and put its prompt back in the input"),
+    ("/diff", "changes: session | turn | unpushed, popup | split | close"),
     ("/model", "change model"),
     ("/agent", "change agent"),
     ("/skills", "list skills (use $name in a message)"),
@@ -224,6 +309,7 @@ enum Purpose {
     LoginMethod,
     Logout,
     Effort,
+    Theme,
     /// ctrl+p menu: the value is the command to run.
     Actions,
 }
@@ -346,11 +432,37 @@ enum Overlay {
     Activity(ActivityView),
     Tree(tree::TreeView),
     Settings(SettingsView),
+    Diff(DiffView),
     Help,
     Report(String, Vec<String>),
     Ask(AskView),
     Login(LoginView),
     Mcp(McpView),
+}
+
+/// `/diff` output: raw unified-diff lines, shown in a popup or a side pane.
+#[derive(Clone)]
+struct DiffView {
+    scope: String,
+    lines: Vec<String>,
+    scroll: usize,
+}
+
+impl DiffView {
+    /// Styled rows for `height` lines, `width` columns wide.
+    fn render(&self, height: usize, width: usize) -> Vec<Line<'static>> {
+        let mut out = vec![Line::from(Span::styled(format!("{}  ·  {} lines", self.scope, self.lines.len()), theme::dim()))];
+        let n = self.lines.len();
+        for l in self.lines.iter().skip(self.scroll.min(n.saturating_sub(1))).take(height.saturating_sub(1)) {
+            let st = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") { Style::default().add_modifier(Modifier::BOLD) }
+                else if l.starts_with('+') { theme::ok() }
+                else if l.starts_with('-') { theme::err() }
+                else if l.starts_with("@@") { theme::accent() }
+                else { theme::dim() };
+            out.push(Line::from(Span::styled(fit(&l.replace('\t', "    "), width), st)));
+        }
+        out
+    }
 }
 
 /// `/mcp`: MCP servers; the state is read live from the registry, `sel` is the hovered server.
@@ -584,6 +696,11 @@ struct Ui {
     sel_area: Rect,
     /// Clickable rows of the open popup as drawn last frame: (screen row, first col, last col, index).
     ov_hits: std::cell::RefCell<Vec<(u16, u16, u16, usize)>>,
+    /// Working-tree snapshots per session id: (start of conversation, start of last run), for `/diff`.
+    diff_base: std::collections::HashMap<String, (Option<String>, Option<String>)>,
+    /// Side pane of `/diff` (split view) and where it was drawn last frame.
+    diff_pane: Option<DiffView>,
+    diff_rect: Rect,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -852,6 +969,63 @@ impl Ui {
         self.out_tokens = 0;
         self.stream_chars = 0;
         self.scroll_top = None;
+        self.take_diff_base();
+    }
+
+    /// Remember the tree as it is when a run starts: `turn` diffs against it, `session` against the first one.
+    fn take_diff_base(&mut self) {
+        let Ok(tree) = crate::diff::snapshot(&self.app.rt.cwd) else { return };
+        let id = self.app.session.lock().unwrap().id.clone();
+        let e = self.diff_base.entry(id).or_default();
+        e.0.get_or_insert_with(|| tree.clone());
+        e.1 = Some(tree);
+    }
+
+    /// `/diff [session|turn|unpushed] [popup|split] | close`; no argument = the configured scope and view.
+    fn open_diff(&mut self, arg: &str) {
+        let cfg = self.app.rt.settings.diff.clone();
+        let (mut scope, mut view) = (cfg.scope, cfg.view);
+        for w in arg.split_whitespace() {
+            match w {
+                "close" => {
+                    self.diff_pane = None;
+                    if matches!(self.overlay, Some(Overlay::Diff(_))) {
+                        self.overlay = None;
+                    }
+                    return;
+                }
+                "popup" | "split" => view = w.to_string(),
+                s if crate::diff::SCOPES.contains(&s) => scope = s.to_string(),
+                _ => return self.notify("usage: /diff [session | turn | unpushed] [popup | split | close]"),
+            }
+        }
+        let id = self.app.session.lock().unwrap().id.clone();
+        let (session, turn) = self.diff_base.get(&id).cloned().unwrap_or_default();
+        let lines = match crate::diff::diff(&self.app.rt.cwd, &scope, session.as_deref(), turn.as_deref()) {
+            Ok(t) if t.is_empty() => vec!["no changes".to_string()],
+            Ok(t) => t.lines().map(String::from).collect(),
+            Err(e) => vec![e],
+        };
+        let v = DiffView { scope, lines, scroll: 0 };
+        if view == "split" {
+            self.overlay = None;
+            self.diff_pane = Some(v);
+        } else {
+            self.diff_pane = None;
+            self.overlay = Some(Overlay::Diff(v));
+        }
+    }
+
+    /// Recompute the split pane in place (a run just ended).
+    fn refresh_diff(&mut self) {
+        if let Some(v) = &self.diff_pane {
+            let scope = v.scope.clone();
+            let scroll = v.scroll;
+            self.open_diff(&format!("{scope} split"));
+            if let Some(p) = &mut self.diff_pane {
+                p.scroll = scroll.min(p.lines.len().saturating_sub(1));
+            }
+        }
     }
 
     fn interrupt(&mut self) {
@@ -1023,6 +1197,7 @@ impl Ui {
                 self.mark_seen();
                 self.running = false;
                 self.elapsed = self.started.elapsed();
+                self.refresh_diff();
                 self.flush_queued();
             }
         }
@@ -1065,6 +1240,7 @@ impl Ui {
             },
             "/tree" => self.open_tree(),
             "/undo" => self.undo_turn(),
+            "/diff" => self.open_diff(arg),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
             "/mcp" => self.mcp_command(),
@@ -1110,6 +1286,12 @@ impl Ui {
             }
             "/usage" => self.report("Usage", |rt| Box::pin(async move { crate::usage::usage(&rt).await })),
             "/stats" => self.report("Stats", |rt| Box::pin(async move { tokio::task::spawn_blocking(move || crate::usage::stats(&rt.catalog)).await.unwrap_or_default() })),
+            "/theme" if arg.is_empty() => {
+                let cur = theme::current().id;
+                let items = theme::THEMES.iter().map(|t| item(t.id, if t.id == cur { "current" } else { "" }, t.id)).collect();
+                self.overlay = Some(Overlay::Pick(Picker { title: "Theme".into(), items, filter: String::new(), sel: 0, purpose: Purpose::Theme }));
+            }
+            "/theme" => self.set_theme(arg),
             "/copy" => self.copy_last(),
             "/jobs" => self.open_jobs(),
             "/remote" => {
@@ -1287,6 +1469,15 @@ impl Ui {
         let v = if self.verbose() { "compact" } else { "full" };
         self.update_settings("verbose", v.into(), |s| s.verbose = v.into());
         self.notify(format!("output: {v}"));
+    }
+
+    fn set_theme(&mut self, id: &str) {
+        if !theme::set(id) {
+            let all: Vec<_> = theme::THEMES.iter().map(|t| t.id).collect();
+            return self.notify(format!("unknown theme {id}: {}", all.join(" | ")));
+        }
+        self.update_settings("theme", id.into(), |s| s.theme = id.into());
+        self.notify(format!("theme: {id}"));
     }
 
     fn set_effort(&mut self, e: &str) {
@@ -1586,6 +1777,7 @@ impl Ui {
             }
             Purpose::Logout => self.logout(&value),
             Purpose::Effort => self.set_effort(&value),
+            Purpose::Theme => self.set_theme(&value),
             Purpose::Actions => self.command(&value),
         }
     }
@@ -2154,6 +2346,25 @@ impl Ui {
                 }
                 self.overlay = Some(Overlay::Pick(p));
             }
+            Overlay::Diff(mut v) => {
+                let last = v.lines.len().saturating_sub(1);
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return,
+                    KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => v.scroll = (v.scroll + 1).min(last),
+                    KeyCode::PageUp => v.scroll = v.scroll.saturating_sub(15),
+                    KeyCode::PageDown => v.scroll = (v.scroll + 15).min(last),
+                    KeyCode::Home => v.scroll = 0,
+                    KeyCode::End => v.scroll = last,
+                    // Tab / s: the next scope, recomputed
+                    KeyCode::Tab | KeyCode::Char('s') => {
+                        let i = crate::diff::SCOPES.iter().position(|x| *x == v.scope).unwrap_or(0);
+                        return self.open_diff(&format!("{} popup", crate::diff::SCOPES[(i + 1) % 3]));
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::Diff(v));
+            }
             Overlay::Tree(mut t) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2222,6 +2433,8 @@ impl Ui {
                 ("rtk filters".into(), s.tools.rtk.clone()),
                 ("Tab bar".into(), s.tab_orientation.clone()),
                 ("Tab bar width".into(), format!("{} cols", s.tab_width)),
+                ("Diff scope".into(), s.diff.scope.clone()),
+                ("Diff view".into(), s.diff.view.clone()),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
@@ -2319,6 +2532,14 @@ impl Ui {
                 };
                 self.set_tab_width(w);
             }
+            7 => {
+                let v = cycle(&crate::diff::SCOPES, &s.diff.scope);
+                self.update_settings("diff.scope", v.clone().into(), |s| s.diff.scope = v);
+            }
+            8 => {
+                let v = cycle(&["popup", "split"], &s.diff.view);
+                self.update_settings("diff.view", v.clone().into(), |s| s.diff.view = v);
+            }
             _ => {}
         }
     }
@@ -2342,7 +2563,7 @@ impl Ui {
     /// User prompts and steers share one band, one blank row above and below, full width.
     /// The top row names the agents that answered, right-aligned; a steer also labels itself on the left (`steer`: delivered?).
     fn user_lines(&self, i: usize, t: &str, width: usize, steer: Option<bool>) -> Vec<Line<'static>> {
-        let band = Style::default().bg(Color::Indexed(237));
+        let band = theme::band();
         let spans = vec![Span::styled(t.to_string(), theme::user())];
         let mut label: Vec<Span> = Vec::new();
         for (k, name) in self.turn_agents(i).into_iter().enumerate() {
@@ -2360,7 +2581,7 @@ impl Ui {
         let mut top = vec![left, Span::raw(" ".repeat(width.saturating_sub(used)))];
         top.extend(label);
         let mut out = vec![Line::default(), Line::from(top).style(band)];
-        for l in markdown::wrap(spans, width, vec![Span::styled("› ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
+        for l in markdown::wrap(spans, width, vec![Span::styled("› ", theme::fg().add_modifier(Modifier::BOLD))], vec![Span::raw("  ")]) {
             let fill = width.saturating_sub(l.width());
             let mut s = l.spans;
             s.push(Span::raw(" ".repeat(fill)));
@@ -2516,6 +2737,20 @@ impl Ui {
             f.render_widget(Paragraph::new(lines), strip_area);
         }
         self.strip = strip;
+        // Split diff: a pane on the right, the chat keeps the rest (terminals under 100 columns get a popup instead).
+        let (area, pane) = if self.diff_pane.is_some() && area.width >= 100 {
+            let [l, r] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
+            (l, Some(r))
+        } else {
+            (area, None)
+        };
+        self.diff_rect = pane.unwrap_or_default();
+        if let (Some(r), Some(v)) = (pane, &self.diff_pane) {
+            let b = UiBlock::bordered().border_type(BorderType::Rounded).border_style(theme::dim()).title(Span::styled(" θ diff ", Style::default().add_modifier(Modifier::BOLD)));
+            let inner = b.inner(r);
+            f.render_widget(b, r);
+            f.render_widget(Paragraph::new(v.render(inner.height as usize, inner.width as usize)), inner);
+        }
         // Chat, input and status sit between two blank columns (popups and overlays keep the full area).
         let margin = if area.width >= 60 { 2 } else { 1 };
         let main = Rect { x: area.x + margin, width: area.width.saturating_sub(2 * margin), ..area };
@@ -2595,7 +2830,7 @@ impl Ui {
                 let tok = self.out_tokens + self.stream_chars as u64 / 4;
                 let tok = if tok >= 1000 { format!("{:.1}k", tok as f64 / 1000.0) } else { tok.to_string() };
                 spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · "), theme::dim()));
-                spans.push(Span::styled("esc", Style::default().fg(Color::White)));
+                spans.push(Span::styled("esc", theme::fg()));
                 spans.push(Span::styled(" to interrupt)  ", theme::dim()));
                 spans.extend(self.counts.spans());
                 if !matches!(self.status.as_str(), "thinking" | "writing") && !self.status.starts_with("compacting") && !self.status.starts_with("waiting") {
@@ -2613,11 +2848,11 @@ impl Ui {
 
         // input
         // Lighter band with one blank row above and below the text.
-        let band = Style::default().bg(Color::Indexed(237));
+        let band = theme::band();
         f.render_widget(UiBlock::default().style(band), input_area);
         let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
         let skip = cursor.0.saturating_sub(7);
-        let prompt = Style::default().fg(Color::White);
+        let prompt = theme::fg();
         let mut il: Vec<Line> = Vec::new();
         if !self.images.is_empty() {
             let mut spans = vec![Span::raw("  ")];
@@ -2657,7 +2892,7 @@ impl Ui {
                     let desc = fit(d, w.saturating_sub(name_w + 2));
                     let pad = " ".repeat(w.saturating_sub(name_w + 2 + desc.width()));
                     Line::from(vec![
-                        Span::styled(format!(" {name:<name_w$}"), st.patch(Style::default().fg(Color::White))),
+                        Span::styled(format!(" {name:<name_w$}"), st.patch(theme::fg())),
                         Span::styled(format!(" {desc}{pad}"), st.patch(theme::dim())),
                     ])
                 }).collect();
@@ -2732,7 +2967,7 @@ impl Ui {
         const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
         let accent = theme::agent(&a.name);
-        let white = Style::default().fg(Color::White);
+        let white = theme::fg();
         let mut out: Vec<Line<'static>> = LOGO
             .iter()
             .enumerate()
@@ -2785,6 +3020,7 @@ impl Ui {
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
+            Overlay::Diff(v) => v.lines.len().min(60) + 3,
             Overlay::Mcp(_) => self.mcp_rows.len().max(1) + 6,
             Overlay::Activity(_) => self.activity().len().max(1) + 3,
             Overlay::Pick(p) => p.rows().max(1) + 1,
@@ -2983,12 +3219,12 @@ impl Ui {
                     ("pgup pgdn shift+↑↓ wheel", "scroll"),
                     ("ctrl+c ×2 / ctrl+d", "quit"),
                 ] {
-                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), Style::default().fg(Color::White)), Span::styled(d, theme::dim())]));
+                    l.push(Line::from(vec![Span::styled(format!("  {k:<26}"), theme::fg()), Span::styled(d, theme::dim())]));
                 }
                 l.push(Line::default());
                 l.push(Line::from(Span::styled("Commands", theme::accent().add_modifier(Modifier::BOLD))));
                 for (c, d) in COMMANDS {
-                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), Style::default().fg(Color::White)), Span::styled(*d, theme::dim())]));
+                    l.push(Line::from(vec![Span::styled(format!("  {c:<26}"), theme::fg()), Span::styled(*d, theme::dim())]));
                 }
                 f.render_widget(Paragraph::new(l).block(block("θ help")), r);
             }
@@ -3039,6 +3275,12 @@ impl Ui {
                     l.push(Line::from(Span::styled("  no match", theme::dim())));
                 }
                 f.render_widget(Paragraph::new(l).block(block(&p.title)), r);
+            }
+            Overlay::Diff(v) => {
+                let rows = h.saturating_sub(4) as usize;
+                let mut l = v.render(rows, iw);
+                l.push(hint(" ↑↓ pgup pgdn scroll · tab next scope · esc close "));
+                f.render_widget(Paragraph::new(l).block(block("θ diff")), r);
             }
             Overlay::Tree(t) => {
                 let rows = h.saturating_sub(4) as usize;
@@ -3100,7 +3342,7 @@ fn hint(keys: &'static str) -> Line<'static> {
         let (lead, body) = seg.split_at(seg.len() - seg.trim_start().len());
         let (key, rest) = body.split_once(' ').map_or((body, ""), |(k, r)| (k, r));
         spans.push(Span::raw(lead));
-        spans.push(Span::styled(key.to_string(), Style::default().fg(Color::White)));
+        spans.push(Span::styled(key.to_string(), theme::fg()));
         if !rest.is_empty() {
             spans.push(Span::styled(format!(" {rest}"), theme::dim()));
         }
@@ -3751,6 +3993,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let (tab_tx, mut tab_rx) = unbounded_channel();
     let (opened_tx, mut opened_rx) = unbounded_channel();
     let (shell_tx, mut shell_rx) = unbounded_channel::<String>();
+    theme::set(&rt.settings.theme);
     let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
     let app = App { rt, session: Arc::new(Mutex::new(Session::mirror(vec![]))), turn };
     let mut ui = Ui {
@@ -3811,6 +4054,9 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         marquee: 0,
         input_hit: (Rect::default(), 0, 0),
         ov_hits: Default::default(),
+        diff_base: Default::default(),
+        diff_pane: None,
+        diff_rect: Rect::default(),
         sidebar: Rect::default(),
         drag: None,
         sel: None,
@@ -3861,6 +4107,20 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if ui.overlay.is_some() && !ui.ov_hits.borrow().is_empty() => {
                         let code = if m.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
                         ui.overlay_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if matches!(ui.overlay, Some(Overlay::Diff(_))) => {
+                        let code = if m.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                        for _ in 0..3 {
+                            ui.overlay_key(KeyEvent::new(code, KeyModifiers::NONE));
+                        }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if ui.overlay.is_none() && ui.diff_pane.is_some() && ui.diff_rect.contains(ratatui::layout::Position::new(m.column, m.row)) =>
+                    {
+                        let up = m.kind == MouseEventKind::ScrollUp;
+                        if let Some(p) = &mut ui.diff_pane {
+                            p.scroll = if up { p.scroll.saturating_sub(3) } else { (p.scroll + 3).min(p.lines.len().saturating_sub(1)) };
+                        }
                     }
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),
@@ -3980,6 +4240,10 @@ mod tests {
         assert_eq!(color_for("Build"), color_for("build"));
         assert_ne!(color_for("Build"), color_for("Plan"));
         assert!((16..232).contains(&color_for("Review")));
+        // a theme's seed reshuffles agent colors
+        use super::theme::{color_in, THEMES};
+        let moved = ["Build", "Plan", "Review", "Auto"].iter().filter(|n| color_in(&THEMES[0], n) != color_in(&THEMES[2], n)).count();
+        assert!(moved >= 3);
     }
 
     #[test]
