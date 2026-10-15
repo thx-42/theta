@@ -1999,13 +1999,19 @@ impl Ui {
                                 let t = out.rsplit_once("[transcript: ")?.1;
                                 Some(t.split(']').next()?.to_string())
                             });
-                            if kind == "agent"
-                                && let Some(path) = path
-                                && self.open_sub(path)
-                            {
-                                return;
+                            let mut why = String::new();
+                            if kind == "agent" {
+                                match path {
+                                    Some(path) if self.open_sub(path.clone()) => return,
+                                    Some(path) => why = format!("cannot read transcript {path}"),
+                                    None => why = format!("no transcript known for call {id} (expected {})", crate::agent::sub_transcript(&id).display()),
+                                }
                             }
-                            let lines = if out.is_empty() { vec!["(no output yet)".to_string()] } else { out.lines().map(String::from).collect() };
+                            let mut lines: Vec<String> = if out.is_empty() { vec!["(no output yet)".to_string()] } else { out.lines().map(String::from).collect() };
+                            if !why.is_empty() {
+                                lines.insert(0, why);
+                                lines.insert(1, String::new());
+                            }
                             self.overlay = Some(Overlay::Report(format!("θ {kind} · {label}"), lines));
                             return;
                         }
