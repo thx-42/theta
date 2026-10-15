@@ -20,7 +20,8 @@ pub fn run(target: Option<&str>) -> Result<()> {
     };
     let mut out = String::new();
     render(&path, 0, &mut HashSet::new(), &mut out)?;
-    print!("{out}");
+    crate::tui::copy_osc52(&out);
+    eprintln!("session copied to clipboard ({} bytes)", out.len());
     Ok(())
 }
 

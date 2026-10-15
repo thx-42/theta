@@ -3000,6 +3000,14 @@ fn normalize_paste(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ").chars().filter(|c| *c == '\n' || !c.is_control()).collect()
 }
 
+/// Copy via OSC 52: the local terminal's clipboard, also over SSH.
+pub(crate) fn copy_osc52(text: &str) {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    let _ = std::io::Write::write_all(&mut out, format!("\x1b]52;c;{b64}\x07").as_bytes());
+    let _ = std::io::Write::flush(&mut out);
+}
+
 fn clipboard(text: &str) -> bool {
     let cmds: &[&[&str]] = if cfg!(target_os = "macos") { &[&["pbcopy"]] } else { &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "-b", "-i"]] };
     for c in cmds {
@@ -3362,10 +3370,7 @@ impl Ui {
     /// Mouse release: copy the selection to the clipboard via OSC 52 (the local terminal's clipboard, also over SSH).
     fn sel_end(&mut self) {
         let Some(text) = self.sel_text() else { return };
-        let b64 = base64::engine::general_purpose::STANDARD.encode(text);
-        let mut out = std::io::stdout();
-        let _ = std::io::Write::write_all(&mut out, format!("\x1b]52;c;{b64}\x07").as_bytes());
-        let _ = std::io::Write::flush(&mut out);
+        copy_osc52(&text);
     }
 
     /// Per selected row: (row, first col, last col), limited to `sel_area`.
