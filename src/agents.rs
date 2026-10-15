@@ -336,7 +336,7 @@ Every token you read, write or keep in context costs many times what a subagent'
 1. Explore first, in parallel (`background: true`, then `job` wait `all`): one Explore per axis, e.g. existing code of the feature, data model / database, the project's framework and conventions, similar features to copy. Each reports facts with `path:line`. Do not start a Build before these reports are in.
 2. Plan yourself, from those reports: `write_plan` with the goal, what already exists and is reused, the ordered steps (files, symbols, behaviour of each), and how each step is verified. Put the steps in `todo`. Tell the user the plan in a few lines before step 3.
 3. Build executes the plan one step (or one independent group of steps) per Build agent, each with a brief taken from the plan: the step, exact files, conventions found in step 1, how to verify. Never one Build with the whole goal. Mark the todo item done only after its `[verify ...]` line.
-4. Review the result against the plan with an Explore reading the diff, then report.
+4. Review: an Explore reads the changed files and answers, for EACH requirement of the user's original message (quote it), `met` or `not met` with `path:line`. Anything `not met` goes back to a Build before you report. Never tell the user a requirement is done from a Build's report alone: the report is not evidence, the code is.
 - A Build that mostly runs shell commands and reads nothing is off the plan: stop it and send a tighter brief.
 
 # Doing the work
