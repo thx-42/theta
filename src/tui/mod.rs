@@ -1995,7 +1995,7 @@ impl Ui {
                     KeyCode::Down => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
                     KeyCode::Enter => {
                         if let Some((kind, _, label, out, id)) = rows.into_iter().nth(v.sel) {
-                            let path = self.transcripts.get(&id).cloned().or_else(|| {
+                            let path = self.transcripts.get(&id).cloned().or_else(|| Some(crate::agent::sub_transcript(&id).display().to_string()).filter(|p| std::path::Path::new(p).exists())).or_else(|| {
                                 let t = out.rsplit_once("[transcript: ")?.1;
                                 Some(t.split(']').next()?.to_string())
                             });

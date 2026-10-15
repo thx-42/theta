@@ -475,6 +475,12 @@ async fn verify(cwd: &std::path::Path, cmd: &str, timeout: u64) -> String {
 }
 
 /// `task` tool: run another agent in a fresh, unlisted session and return its final answer.
+/// Transcript of the subagent started by tool call `id`: derivable from the id, so it stays findable when the run is killed before it reports.
+pub fn sub_transcript(id: &str) -> PathBuf {
+    let name: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    crate::config::home().join("cache/subagents").join(format!("{name}.jsonl"))
+}
+
 /// `log` (background jobs) receives one line per tool call the subagent makes.
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).context("prompt required")?;
@@ -512,7 +518,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         }
         None => {
             let mut s = Session::new(&rt.cwd);
-            s.path = dir.join(format!("{}.jsonl", s.id));
+            s.path = sub_transcript(call_id);
             s
         }
     };
