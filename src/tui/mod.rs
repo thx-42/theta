@@ -35,7 +35,7 @@ use unicode_width::UnicodeWidthStr;
 
 pub mod theme {
     use ratatui::style::{Color, Modifier, Style};
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     /// One palette. `seed` is mixed into the agent-name hash, so every theme gives each agent its own colors.
     pub struct Theme {
@@ -55,22 +55,24 @@ pub mod theme {
         pub band: Color,
         /// Text on the θ badge.
         pub on_accent: Color,
+        /// Whole-screen background, used when `theme_bg` is on.
+        pub bg: Color,
     }
 
     const fn ix(n: u8) -> Color { Color::Indexed(n) }
     const fn rgb(h: u32) -> Color { Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8) }
     /// `c` = fg, dim, code, link, ok, err, sel, band, on_accent as 0xRRGGBB.
     const fn th(id: &'static str, seed: u32, c: [u32; 9]) -> Theme {
-        Theme { id, seed, sat: 0.70, light: 0.66, fg: rgb(c[0]), dim: rgb(c[1]), code: rgb(c[2]), link: rgb(c[3]), ok: rgb(c[4]), err: rgb(c[5]), sel: rgb(c[6]), band: rgb(c[7]), on_accent: rgb(c[8]) }
+        Theme { id, seed, sat: 0.70, light: 0.66, fg: rgb(c[0]), dim: rgb(c[1]), code: rgb(c[2]), link: rgb(c[3]), ok: rgb(c[4]), err: rgb(c[5]), sel: rgb(c[6]), band: rgb(c[7]), on_accent: rgb(c[8]), bg: rgb(c[8]) }
     }
 
     pub const THEMES: &[Theme] = &[
-        Theme { id: "theta", seed: 0, sat: 0.75, light: 0.62, fg: Color::White, dim: Color::DarkGray, code: Color::Yellow, link: Color::Blue, ok: Color::Green, err: Color::Red, sel: ix(236), band: ix(237), on_accent: Color::Black },
-        Theme { id: "midnight", seed: 1, sat: 0.60, light: 0.70, fg: ix(255), dim: ix(244), code: ix(180), link: ix(75), ok: ix(114), err: ix(203), sel: ix(235), band: ix(234), on_accent: ix(232) },
-        Theme { id: "ember", seed: 2, sat: 0.90, light: 0.58, fg: ix(223), dim: ix(137), code: ix(214), link: ix(173), ok: ix(107), err: ix(196), sel: ix(52), band: ix(237), on_accent: ix(0) },
-        Theme { id: "forest", seed: 3, sat: 0.55, light: 0.60, fg: ix(194), dim: ix(65), code: ix(186), link: ix(109), ok: ix(71), err: ix(167), sel: ix(22), band: ix(235), on_accent: ix(0) },
-        Theme { id: "ocean", seed: 4, sat: 0.70, light: 0.64, fg: ix(195), dim: ix(67), code: ix(222), link: ix(81), ok: ix(79), err: ix(210), sel: ix(17), band: ix(236), on_accent: ix(0) },
-        Theme { id: "light", seed: 5, sat: 0.70, light: 0.36, fg: ix(0), dim: ix(243), code: ix(130), link: ix(25), ok: ix(28), err: ix(160), sel: ix(253), band: ix(254), on_accent: ix(255) },
+        Theme { id: "theta", seed: 0, sat: 0.75, light: 0.62, fg: Color::White, dim: Color::DarkGray, code: Color::Yellow, link: Color::Blue, ok: Color::Green, err: Color::Red, sel: ix(236), band: ix(237), on_accent: Color::Black, bg: ix(234) },
+        Theme { id: "midnight", seed: 1, sat: 0.60, light: 0.70, fg: ix(255), dim: ix(244), code: ix(180), link: ix(75), ok: ix(114), err: ix(203), sel: ix(235), band: ix(234), on_accent: ix(232), bg: ix(233) },
+        Theme { id: "ember", seed: 2, sat: 0.90, light: 0.58, fg: ix(223), dim: ix(137), code: ix(214), link: ix(173), ok: ix(107), err: ix(196), sel: ix(52), band: ix(237), on_accent: ix(0), bg: ix(233) },
+        Theme { id: "forest", seed: 3, sat: 0.55, light: 0.60, fg: ix(194), dim: ix(65), code: ix(186), link: ix(109), ok: ix(71), err: ix(167), sel: ix(22), band: ix(235), on_accent: ix(0), bg: ix(234) },
+        Theme { id: "ocean", seed: 4, sat: 0.70, light: 0.64, fg: ix(195), dim: ix(67), code: ix(222), link: ix(81), ok: ix(79), err: ix(210), sel: ix(17), band: ix(236), on_accent: ix(0), bg: ix(233) },
+        Theme { id: "light", seed: 5, sat: 0.70, light: 0.36, fg: ix(0), dim: ix(243), code: ix(130), link: ix(25), ok: ix(28), err: ix(160), sel: ix(253), band: ix(254), on_accent: ix(255), bg: ix(255) },
         // palettes of the opencode themes; every one is a dark background, so agents get the same saturation and lightness
         th("opencode", 10, [0xeeeeee, 0x808080, 0xfab283, 0x5c9cff, 0x7fd88f, 0xe06c75, 0x1e1e1e, 0x141414, 0x0a0a0a]),
         th("tokyonight", 11, [0xc8d3f5, 0x636da6, 0xffc777, 0x82aaff, 0xc3e88d, 0xff757f, 0x2f334d, 0x222436, 0x1e2030]),
@@ -104,6 +106,12 @@ pub mod theme {
     ];
 
     static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static BG: AtomicBool = AtomicBool::new(false);
+    pub fn set_bg(on: bool) { BG.store(on, Ordering::Relaxed) }
+    /// Base style of the whole screen: the theme's background and text when `theme_bg` is on, the terminal's otherwise.
+    pub fn base() -> Style {
+        if BG.load(Ordering::Relaxed) { Style::default().bg(current().bg).fg(current().fg) } else { Style::default() }
+    }
 
     pub fn current() -> &'static Theme { &THEMES[CURRENT.load(Ordering::Relaxed).min(THEMES.len() - 1)] }
 
@@ -2435,6 +2443,8 @@ impl Ui {
                 ("Tab bar width".into(), format!("{} cols", s.tab_width)),
                 ("Diff scope".into(), s.diff.scope.clone()),
                 ("Diff view".into(), s.diff.view.clone()),
+                ("Theme".into(), s.theme.clone()),
+                ("Theme background".into(), if s.theme_bg { "on — theme paints the background".into() } else { "off — terminal background".into() }),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
@@ -2539,6 +2549,16 @@ impl Ui {
             8 => {
                 let v = cycle(&["popup", "split"], &s.diff.view);
                 self.update_settings("diff.view", v.clone().into(), |s| s.diff.view = v);
+            }
+            9 => {
+                let ids: Vec<&str> = theme::THEMES.iter().map(|t| t.id).collect();
+                let v = cycle(&ids, &s.theme);
+                self.set_theme(&v);
+            }
+            10 => {
+                let v = !s.theme_bg;
+                theme::set_bg(v);
+                self.update_settings("theme_bg", v.into(), |s| s.theme_bg = v);
             }
             _ => {}
         }
@@ -2715,6 +2735,7 @@ impl Ui {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        f.render_widget(UiBlock::default().style(theme::base()), f.area());
         theme::set_agent(&self.app.turn.agent.name);
         let orientation = self.app.rt.settings.tab_orientation.as_str();
         let hidden = self.app.rt.settings.tab_hidden;
@@ -2885,6 +2906,8 @@ impl Ui {
                 let w = input_area.width as usize;
                 let r = Rect { x: input_area.x, y: input_area.y.saturating_sub(h), width: input_area.width, height: h };
                 f.render_widget(Clear, r);
+        f.render_widget(UiBlock::default().style(theme::base()), r);
+                f.render_widget(UiBlock::default().style(theme::base()), r);
                 let name_w = m.iter().map(|(c, _)| c.width()).max().unwrap_or(0).max(10).min(w / 2);
                 let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
@@ -3994,6 +4017,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let (opened_tx, mut opened_rx) = unbounded_channel();
     let (shell_tx, mut shell_rx) = unbounded_channel::<String>();
     theme::set(&rt.settings.theme);
+    theme::set_bg(rt.settings.theme_bg);
     let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
     let app = App { rt, session: Arc::new(Mutex::new(Session::mirror(vec![]))), turn };
     let mut ui = Ui {

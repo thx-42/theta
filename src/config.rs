@@ -43,6 +43,8 @@ pub struct Settings {
     pub tab_orientation: String,
     /// Color theme id: one of /theme's ids
     pub theme: String,
+    /// Paint the whole screen in the theme's background instead of the terminal's
+    pub theme_bg: bool,
     /// Tab bar hidden (ctrl+x b); keeps tab_orientation for when it comes back
     pub tab_hidden: bool,
     /// Sidebar width in columns (vertical tab bar only)
@@ -74,6 +76,7 @@ impl Default for Settings {
             verbose: "full".into(),
             tab_orientation: "horizontal".into(),
             theme: "theta".into(),
+            theme_bg: false,
             tab_hidden: false,
             tab_width: 24,
             agent: "Build".into(),
@@ -422,6 +425,7 @@ const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>
 model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
+theme_bg = false                # theme paints the background
 theme = "theta"                 # color theme: one of /theme's ids
 tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
 tab_hidden = false               # ctrl+x b toggles; orientation is kept
