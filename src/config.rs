@@ -348,7 +348,7 @@ pub fn write_docs() -> Result<Vec<&'static str>> {
 /// Install the shipped agents. `.shipped` records the hash of the version last written (or offered):
 /// an agent still equal to it is replaced silently; an edited one is kept, the new version goes
 /// next to it as `<name>.md.new` and its diff is shown once on a terminal.
-fn sync_agents(dir: &Path) {
+pub fn sync_agents(dir: &Path) {
     use crate::update::sha256;
     use std::io::IsTerminal;
     let manifest = dir.join(".shipped");

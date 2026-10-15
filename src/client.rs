@@ -29,7 +29,10 @@ fn spawn_daemon() -> Result<()> {
     let logs = crate::config::home().join("cache/logs");
     std::fs::create_dir_all(&logs)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(logs.join("daemon.log"))?;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    // Linux reports a replaced binary (after `theta update`) as "<path> (deleted)": the file at <path> is the new one.
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")).map(std::path::PathBuf::from).unwrap_or(exe);
+    let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // New session: closing the terminal must not take the daemon down with it.
     unsafe {

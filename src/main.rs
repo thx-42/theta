@@ -196,12 +196,22 @@ async fn main() -> Result<()> {
         return match action.as_deref() {
             None => server::serve().await,
             Some("stop") => {
-                if let Ok(sock) = tokio::net::UnixStream::connect(proto::socket_path()).await {
-                    let mut line = serde_json::to_string(&proto::Req::Shutdown)?;
-                    line.push('\n');
-                    tokio::io::AsyncWriteExt::write_all(&mut { sock }, line.as_bytes()).await?;
+                let Ok(mut sock) = tokio::net::UnixStream::connect(proto::socket_path()).await else {
+                    println!("  =-.-=  no daemon running");
+                    return Ok(());
+                };
+                let mut line = serde_json::to_string(&proto::Req::Shutdown)?;
+                line.push('\n');
+                tokio::io::AsyncWriteExt::write_all(&mut sock, line.as_bytes()).await?;
+                drop(sock);
+                for _ in 0..50 {
+                    if tokio::net::UnixStream::connect(proto::socket_path()).await.is_err() {
+                        println!("   /\\_/\\\n  ( -.- )  daemon stopped. zzz\n   > ^ <");
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                Ok(())
+                bail!("daemon did not stop")
             }
             Some(a) => bail!("unknown action `{a}` (stop)"),
         };
@@ -297,6 +307,9 @@ async fn main() -> Result<()> {
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
         Some(Cmd::Docs) => {
+            let agents = config::home().join("agents");
+            std::fs::create_dir_all(&agents)?;
+            config::sync_agents(&agents); // `install.sh` and `theta update` run this: agents follow the binary
             let changed = config::write_docs()?;
             let dir = config::home().join("docs");
             if changed.is_empty() {
