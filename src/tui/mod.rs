@@ -582,6 +582,8 @@ struct Ui {
     frame: Buffer,
     /// Area the selection is limited to: the open popup, else the main area.
     sel_area: Rect,
+    /// Clickable rows of the open popup as drawn last frame: (screen row, first col, last col, index).
+    ov_hits: std::cell::RefCell<Vec<(u16, u16, u16, usize)>>,
 }
 
 /// A tab opened in the background: its connection, pushes and first snapshot.
@@ -1897,6 +1899,36 @@ impl Ui {
         self.scroll_top = if top >= max_top as i64 { None } else { Some(top.max(0) as usize) };
     }
 
+    /// Mouse over a popup row: `click` also activates it (Enter). Returns whether the popup took the event.
+    fn overlay_mouse(&mut self, col: u16, row: u16, click: bool) -> bool {
+        let hit = self.ov_hits.borrow().iter().find(|(y, a, b, _)| *y == row && col >= *a && col <= *b).map(|h| h.3);
+        let Some(i) = hit else { return false };
+        match self.overlay.as_mut() {
+            Some(Overlay::Settings(v)) if i >= usize::MAX - 1 => {
+                if click {
+                    v.tab = if i == usize::MAX { SettingsTab::General } else { SettingsTab::Models };
+                    v.sel = 0;
+                }
+                return true;
+            }
+            Some(Overlay::Settings(v)) => v.sel = i,
+            Some(Overlay::Pick(p)) => p.sel = i,
+            Some(Overlay::Dir(v)) => v.sel = i,
+            Some(Overlay::Jobs(v)) => v.sel = i,
+            Some(Overlay::Activity(v)) => v.sel = i,
+            Some(Overlay::Tree(t)) => t.sel = i,
+            Some(Overlay::Ask(a)) => a.sel = i,
+            Some(Overlay::Mcp(v)) => v.sel = i,
+            _ => return false,
+        }
+        // free-text answer and MCP reconnect: selecting is enough
+        let select_only = matches!(&self.overlay, Some(Overlay::Mcp(_))) || matches!(&self.overlay, Some(Overlay::Ask(a)) if a.sel == a.options.len());
+        if click && !select_only {
+            self.overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        true
+    }
+
     fn overlay_key(&mut self, k: KeyEvent) {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
@@ -2765,10 +2797,18 @@ impl Ui {
         let h = area.height.saturating_sub(4).min(content.max(min_h) + 4);
         let r = Rect { x: (area.width - w) / 2, y: (area.height.saturating_sub(h)) / 3, width: w, height: h };
         f.render_widget(Clear, r);
+        // list rows start below the border and padding; `hit` records one row's screen position
+        let (y0, x0, x1) = (r.y + 2, r.x + 2, r.x + r.width.saturating_sub(2));
+        let hit = |row: usize, idx: usize| self.ov_hits.borrow_mut().push((y0 + row as u16, x0, x1, idx));
+        self.ov_hits.borrow_mut().clear();
         let block = |t: &str| UiBlock::bordered().padding(Padding::uniform(1)).border_type(BorderType::Rounded).border_style(theme::accent()).title(Span::styled(format!(" {t} "), Style::default().add_modifier(Modifier::BOLD)));
         match ov {
             Overlay::Ask(a) => {
                 let mut l = vec![Line::from(Span::styled(a.question.clone(), Style::default().add_modifier(Modifier::BOLD))), Line::default()];
+                let first = wrapped_rows(&a.question, iw) + 1;
+                for i in 0..=a.options.len() {
+                    hit(first + i, i);
+                }
                 for (i, o) in a.options.iter().enumerate() {
                     let st = if i == a.sel { theme::sel() } else { Style::default() };
                     l.push(Line::from(vec![Span::styled(format!(" {} ", if i == a.sel { "›" } else { " " }), theme::accent()), Span::styled(format!("{}. {o}", i + 1), st)]));
@@ -2788,6 +2828,9 @@ impl Ui {
             Overlay::Dir(v) => {
                 let rows = h.saturating_sub(4) as usize;
                 let top = (v.sel + 1).saturating_sub(rows);
+                for n in 0..v.entries.len().saturating_sub(top).min(rows) {
+                    hit(n, top + n);
+                }
                 let l: Vec<Line> = v.entries.iter().enumerate().skip(top).take(rows).map(|(i, e)| {
                     let dir = e.ends_with('/') || e == "..";
                     let st = if i == v.sel { theme::sel() } else if dir { theme::accent() } else { theme::dim() };
@@ -2800,6 +2843,9 @@ impl Ui {
                 let rows = self.activity();
                 let vis = h.saturating_sub(3) as usize;
                 let top = (v.sel + 1).saturating_sub(vis);
+                for n in 0..rows.len().saturating_sub(top).min(vis) {
+                    hit(n, top + n);
+                }
                 let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _, _))| {
                     let (mark, st) = match state {
                         None => ("●", theme::accent()),
@@ -2832,6 +2878,7 @@ impl Ui {
                     f.render_widget(Paragraph::new(l).block(block(&format!("θ job {id} · {label}"))), r);
                 } else {
                     for (i, j) in self.jobs.iter().enumerate() {
+                        hit(i, i);
                         let (mark, st) = match j.status {
                             JobStatus::Running => ("●", theme::accent()),
                             JobStatus::Done(0) => ("✓", theme::dim()),
@@ -2868,6 +2915,7 @@ impl Ui {
                     l.push(Line::from(Span::styled(" no MCP servers — add [mcp.<name>] to settings.toml", theme::dim())));
                 }
                 for (i, r) in rows.iter().enumerate() {
+                    hit(i, i);
                     let (mark, st, state) = if !r.enabled {
                         ("○", theme::dim(), "disabled".to_string())
                     } else if let Some(t) = r.tools {
@@ -2963,6 +3011,7 @@ impl Ui {
                 let mut l = vec![Line::from(vec![Span::styled("filter › ", theme::dim()), Span::raw(p.filter.clone()), Span::styled("▏", theme::accent())])];
                 let mut body = Vec::new();
                 let mut sel_row = 0;
+                let mut at = Vec::new();
                 for (n, &i) in vis.iter().enumerate() {
                     let it = &p.items[i];
                     if !it.group.is_empty() && (n == 0 || p.items[vis[n - 1]].group != it.group) {
@@ -2971,6 +3020,7 @@ impl Ui {
                     if n == p.sel {
                         sel_row = body.len();
                     }
+                    at.push(body.len());
                     let st = if n == p.sel { theme::sel() } else { Style::default() };
                     let indent = if it.group.is_empty() { " " } else { "   " };
                     let label: String = it.label.chars().take(iw * 3 / 5).collect();
@@ -2979,6 +3029,11 @@ impl Ui {
                     body.push(Line::from(vec![Span::styled(format!("{indent}{label}{}", " ".repeat(pad)), st), Span::styled(detail, st.patch(theme::dim()))]));
                 }
                 let start = sel_row.saturating_sub(rows.saturating_sub(1));
+                for (n, &b) in at.iter().enumerate() {
+                    if b >= start && b < start + rows {
+                        hit(1 + b - start, n);
+                    }
+                }
                 l.extend(body.into_iter().skip(start).take(rows));
                 if vis.is_empty() {
                     l.push(Line::from(Span::styled("  no match", theme::dim())));
@@ -2988,6 +3043,9 @@ impl Ui {
             Overlay::Tree(t) => {
                 let rows = h.saturating_sub(4) as usize;
                 let start = t.sel.saturating_sub(rows.saturating_sub(1));
+                for n in 0..t.rows.len().saturating_sub(start).min(rows) {
+                    hit(n, start + n);
+                }
                 let mut l = Vec::new();
                 for (n, row) in t.rows.iter().enumerate().skip(start).take(rows) {
                     let st = if n == t.sel { theme::sel() } else { Style::default() };
@@ -3014,7 +3072,10 @@ impl Ui {
             Overlay::Settings(view) => {
                 let tab = |t: SettingsTab, label: &str| Span::styled(format!(" {label} "), if view.tab == t { theme::sel() } else { theme::dim() });
                 let mut l = vec![Line::from(vec![tab(SettingsTab::General, "General"), Span::raw(" "), tab(SettingsTab::Models, "Models")]), Line::default()];
+                // tab labels: " General " then " Models "; their indices are past any row
+                self.ov_hits.borrow_mut().extend([(y0, x0, x0 + 8, usize::MAX), (y0, x0 + 10, x0 + 17, usize::MAX - 1)]);
                 for (i, (k, v)) in self.settings_rows(view.tab).iter().enumerate() {
+                    hit(2 + i, i);
                     let st = if i == view.sel { theme::sel() } else { Style::default() };
                     l.push(Line::from(vec![Span::styled(format!(" {k:<22}"), st.patch(theme::dim())), Span::styled(v.clone(), st)]));
                 }
@@ -3501,6 +3562,10 @@ impl Ui {
 
     /// Mouse moved: the tab under it scrolls its title from the start.
     fn on_hover(&mut self, col: u16, row: u16) {
+        if self.overlay.is_some() {
+            self.overlay_mouse(col, row, false);
+            return;
+        }
         let hover = self.strip.tabs.iter().position(|(tab, _)| tabs::hit(*tab, col, row));
         if hover != self.hover {
             self.hover = hover;
@@ -3511,6 +3576,7 @@ impl Ui {
     /// Mouse on the tab strip: × closes, the title switches, + opens a new session.
     fn on_click(&mut self, col: u16, row: u16) {
         if self.overlay.is_some() {
+            self.overlay_mouse(col, row, true);
             return;
         }
         let (r, skip, w) = self.input_hit;
@@ -3744,6 +3810,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         hover: None,
         marquee: 0,
         input_hit: (Rect::default(), 0, 0),
+        ov_hits: Default::default(),
         sidebar: Rect::default(),
         drag: None,
         sel: None,
@@ -3791,6 +3858,10 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                     }
                 }
                 Some(Ok(CEvent::Mouse(m))) => match m.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if ui.overlay.is_some() && !ui.ov_hits.borrow().is_empty() => {
+                        let code = if m.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                        ui.overlay_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),
                     MouseEventKind::Moved => ui.on_hover(m.column, m.row),
