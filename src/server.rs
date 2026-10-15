@@ -273,9 +273,13 @@ impl Server {
                         }
                     }
                 }
+                // Spawned: a slow reload (MCP, credentials) must not hold up this client's next request.
                 Req::Reload => {
-                    self.reload().await;
-                    let _ = out.send(Push::Mcp(self.base.mcp.rows()));
+                    let (srv, out) = (self.clone(), out.clone());
+                    tokio::spawn(async move {
+                        srv.reload().await;
+                        let _ = out.send(Push::Mcp(srv.base.mcp.rows()));
+                    });
                 }
                 Req::SaveTabs { cwd, open } => {
                     let mut before = Vec::new();

@@ -42,6 +42,8 @@ pub struct Resolved {
 #[derive(Clone, Default)]
 pub struct Auth {
     store: Arc<Mutex<BTreeMap<String, Cred>>>,
+    /// Serializes token refreshes; the store lock is never held over the network.
+    refreshing: Arc<Mutex<()>>,
 }
 
 fn path() -> std::path::PathBuf {
@@ -70,7 +72,7 @@ impl Auth {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Auth { store: Arc::new(Mutex::new(store)) }
+        Auth { store: Arc::new(Mutex::new(store)), ..Default::default() }
     }
 
     /// Re-read `auth.json` (another process logged in or out).
@@ -106,20 +108,36 @@ impl Auth {
     }
 
     pub async fn resolve(&self, p: &Provider) -> Result<Resolved> {
-        let mut store = self.store.lock().await;
-        match store.get(&p.id).cloned() {
+        let cred = self.store.lock().await.get(&p.id).cloned();
+        match cred {
             Some(Cred::ApiKey { key }) => return Ok(Resolved { token: key, ..Default::default() }),
             Some(Cred::Oauth { access, refresh, expires, account_id }) => {
                 let kind = p.oauth.context("provider has no OAuth support")?;
                 let (access, account_id) = if now_ms() + 60_000 >= expires {
-                    let fresh = refresh_token(kind, &refresh).await.context("OAuth refresh failed, run /login again")?;
-                    let out = match &fresh {
-                        Cred::Oauth { access, account_id, .. } => (access.clone(), account_id.clone()),
-                        _ => unreachable!(),
-                    };
-                    store.insert(p.id.clone(), fresh);
-                    save_store(&store)?;
-                    out
+                    let _one = self.refreshing.lock().await;
+                    // another task may have refreshed while this one waited
+                    let current = self.store.lock().await.get(&p.id).cloned();
+                    match current {
+                        Some(Cred::Oauth { access, account_id, expires, .. }) if now_ms() + 60_000 < expires => (access, account_id),
+                        other => {
+                            let refresh = match other {
+                                Some(Cred::Oauth { refresh, .. }) => refresh,
+                                _ => refresh,
+                            };
+                            let fresh = tokio::time::timeout(std::time::Duration::from_secs(20), refresh_token(kind, &refresh))
+                                .await
+                                .context("OAuth refresh timed out, try again or run /login again")?
+                                .context("OAuth refresh failed, run /login again")?;
+                            let out = match &fresh {
+                                Cred::Oauth { access, account_id, .. } => (access.clone(), account_id.clone()),
+                                _ => unreachable!(),
+                            };
+                            let mut store = self.store.lock().await;
+                            store.insert(p.id.clone(), fresh);
+                            save_store(&store)?;
+                            out
+                        }
+                    }
                 } else {
                     (access, account_id)
                 };
