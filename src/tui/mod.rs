@@ -309,6 +309,16 @@ struct JobsView {
     polled: Instant,
 }
 
+/// A subagent's own conversation, rendered like the main one; `scroll` holds the main chat's scroll while it is open.
+struct SubView {
+    path: String,
+    items: Vec<Item>,
+    cache: Vec<Option<(usize, bool, Vec<Line<'static>>)>>,
+    dirty: Vec<bool>,
+    scroll: Option<usize>,
+    polled: Instant,
+}
+
 /// Left arrow on an empty prompt: subagents and shell commands of this session, newest first.
 struct ActivityView {
     sel: usize,
@@ -489,6 +499,10 @@ struct Ui {
     items: Vec<Item>,
     cache: Vec<Option<(usize, bool, Vec<Line<'static>>)>>,
     dirty: Vec<bool>,
+    /// Subagent chat shown in place of the conversation (esc goes back).
+    sub: Option<SubView>,
+    /// `task` call id → transcript path of its subagent.
+    transcripts: std::collections::HashMap<String, String>,
     input: Editor,
     history: Vec<String>,
     hist: Option<usize>,
@@ -985,7 +999,9 @@ impl Ui {
             }
             Event::Title(t) => self.notify(format!("session: {t}")),
             Event::Sub { id, event } => {
-                if let Event::ToolStart { name, .. } = *event {
+                if let Event::Transcript(p) = *event {
+                    self.transcripts.insert(id, p);
+                } else if let Event::ToolStart { name, .. } = *event {
                     self.counts.add(&name);
                     if let Some(i) = self.items.iter().rposition(|it| matches!(it, Item::Tool { id: tid, .. } if *tid == id)) {
                         if let Item::Tool { sub, .. } = &mut self.items[i] {
@@ -995,6 +1011,7 @@ impl Ui {
                     }
                 }
             }
+            Event::Transcript(_) => {}
             Event::Error(e) => {
                 self.close_streaming();
                 self.push(Item::Error(e));
@@ -1113,23 +1130,65 @@ impl Ui {
         }
     }
 
+    /// Load a subagent transcript into a `SubView` (false when it cannot be read).
+    fn load_sub(&mut self, path: &str) -> Option<(Vec<Item>, Vec<Option<(usize, bool, Vec<Line<'static>>)>>, Vec<bool>)> {
+        let s = Session::open(std::path::Path::new(path)).ok()?;
+        let msgs: Vec<Msg> = s.path_to(s.leaf.as_deref()).into_iter().filter_map(|e| if let Kind::Msg { msg, .. } = &e.kind { Some(msg.clone()) } else { None }).collect();
+        let main = (std::mem::take(&mut self.items), std::mem::take(&mut self.cache), std::mem::take(&mut self.dirty));
+        for m in &msgs {
+            self.add_msg_items(m);
+        }
+        let built = (std::mem::replace(&mut self.items, main.0), std::mem::replace(&mut self.cache, main.1), std::mem::replace(&mut self.dirty, main.2));
+        Some(built)
+    }
+
+    fn open_sub(&mut self, path: String) -> bool {
+        let Some((items, cache, dirty)) = self.load_sub(&path) else { return false };
+        let scroll = self.scroll_top.take();
+        self.sub = Some(SubView { path, items, cache, dirty, scroll, polled: Instant::now() });
+        true
+    }
+
+    fn close_sub(&mut self) {
+        if let Some(v) = self.sub.take() {
+            self.scroll_top = v.scroll;
+        }
+    }
+
+    /// Re-read the open subagent transcript about once a second while its run is live.
+    fn poll_sub(&mut self) {
+        let Some(v) = &self.sub else { return };
+        if v.polled.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let path = v.path.clone();
+        if let Some((items, cache, dirty)) = self.load_sub(&path)
+            && let Some(v) = &mut self.sub
+        {
+            v.polled = Instant::now();
+            if items.len() != v.items.len() {
+                (v.items, v.cache, v.dirty) = (items, cache, dirty);
+            }
+        }
+    }
+
     fn open_jobs(&mut self) {
         self.overlay = Some(Overlay::Jobs(JobsView { sel: 0, view: None, text: String::new(), polled: Instant::now() }));
     }
 
     /// Subagent and shell tool calls, newest first: (kind, state (None = running, Some(ok)), label, output).
-    fn activity(&self) -> Vec<(&'static str, Option<bool>, String, String)> {
+    fn activity(&self) -> Vec<(&'static str, Option<bool>, String, String, String)> {
         self.items
             .iter()
             .rev()
             .filter_map(|it| match it {
-                Item::Tool { name, summary, state, out, .. } if name == "task" || name == "bash" => {
+                Item::Tool { id, name, summary, state, out, .. } if name == "task" || name == "bash" => {
                     let kind = if name == "task" { "agent" } else { "shell" };
                     let done = match state {
                         ToolState::Running => None,
                         ToolState::Done { ok } => Some(*ok),
                     };
-                    Some((kind, done, summary.clone(), out.clone()))
+                    Some((kind, done, summary.clone(), out.clone(), id.clone()))
                 }
                 _ => None,
             })
@@ -1618,6 +1677,8 @@ impl Ui {
                 }
             }
             KeyCode::Char('d') if ctrl && self.input.text.is_empty() => self.quit = true,
+            KeyCode::Esc if self.sub.is_some() => self.close_sub(),
+            KeyCode::Enter if self.sub.is_some() => self.notify("esc goes back to the conversation"),
             KeyCode::Esc => {
                 if self.running {
                     if self.esc_at.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
@@ -1933,7 +1994,17 @@ impl Ui {
                     KeyCode::Up => v.sel = v.sel.saturating_sub(1),
                     KeyCode::Down => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
                     KeyCode::Enter => {
-                        if let Some((kind, _, label, out)) = rows.into_iter().nth(v.sel) {
+                        if let Some((kind, _, label, out, id)) = rows.into_iter().nth(v.sel) {
+                            let path = self.transcripts.get(&id).cloned().or_else(|| {
+                                let t = out.rsplit_once("[transcript: ")?.1;
+                                Some(t.split(']').next()?.to_string())
+                            });
+                            if kind == "agent"
+                                && let Some(path) = path
+                                && self.open_sub(path)
+                            {
+                                return;
+                            }
                             let lines = if out.is_empty() { vec!["(no output yet)".to_string()] } else { out.lines().map(String::from).collect() };
                             self.overlay = Some(Overlay::Report(format!("θ {kind} · {label}"), lines));
                             return;
@@ -2429,7 +2500,17 @@ impl Ui {
 
         // chat
         let chat_inner = chat;
-        let lines = if self.items.is_empty() { self.splash(chat_inner.height as usize) } else { self.chat_lines(chat_inner.width as usize) };
+        if let Some(v) = &mut self.sub {
+            std::mem::swap(&mut self.items, &mut v.items);
+            std::mem::swap(&mut self.cache, &mut v.cache);
+            std::mem::swap(&mut self.dirty, &mut v.dirty);
+        }
+        let lines = if self.items.is_empty() && self.sub.is_none() { self.splash(chat_inner.height as usize) } else { self.chat_lines(chat_inner.width as usize) };
+        if let Some(v) = &mut self.sub {
+            std::mem::swap(&mut self.items, &mut v.items);
+            std::mem::swap(&mut self.cache, &mut v.cache);
+            std::mem::swap(&mut self.dirty, &mut v.dirty);
+        }
         let total = lines.len();
         let view = chat_inner.height as usize;
         self.last_total = total;
@@ -2713,7 +2794,7 @@ impl Ui {
                 let rows = self.activity();
                 let vis = h.saturating_sub(3) as usize;
                 let top = (v.sel + 1).saturating_sub(vis);
-                let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _))| {
+                let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _, _))| {
                     let (mark, st) = match state {
                         None => ("●", theme::accent()),
                         Some(true) => ("✓", theme::dim()),
@@ -3605,6 +3686,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         items: vec![],
         cache: vec![],
         dirty: vec![],
+        sub: None,
+        transcripts: Default::default(),
         input: Editor::default(),
         history: vec![],
         hist: None,
@@ -3736,6 +3819,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 }
                 ui.marquee += 1;
                 ui.poll_job();
+                ui.poll_sub();
             }
         }
         if ui.overlay.is_none()

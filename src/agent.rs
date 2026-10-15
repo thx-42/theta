@@ -41,6 +41,8 @@ pub enum Event {
     Handoff { agent: String },
     /// Progress from a subagent spawned by tool call `id`.
     Sub { id: String, event: Box<Event> },
+    /// Transcript file of the subagent started by tool call `id` (sent inside `Sub`).
+    Transcript(String),
     Error(String),
     /// A run (turn, compaction or side question) began.
     Started,
@@ -516,6 +518,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     };
     s.add_msg(Msg::user(prompt), None)?;
     let transcript = s.path.display().to_string();
+    let _ = tx.send(Event::Sub { id: call_id.to_string(), event: Box::new(Event::Transcript(transcript.clone())) });
     let session = Arc::new(Mutex::new(s));
     let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel();
     let turn = Turn { agent, model, effort, depth: parent.depth + 1 };
