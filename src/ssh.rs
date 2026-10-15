@@ -248,7 +248,7 @@ pub fn closed(slot: &Slot) -> bool {
 /// Environment note for the system prompt.
 pub fn prompt_note(h: &Host) -> String {
     format!(
-        "# Remote host\nYour read, write, edit, ls, find, grep and bash tools run over SSH on `{}` ({}), not on the machine theta started on. Relative paths and the shell start in `{}`. Project instructions above come from the local machine; todo, web and plan tools stay local.",
+        "# Remote host\nYour read, write, edit, ls, find, grep and bash tools run over SSH on `{}` ({}), not on the machine theta started on. Relative paths and the shell start in `{}`. Use read, grep, find and ls to look at files and edit to change them; bash is for running commands. Project instructions above come from the local machine; todo, web and plan tools stay local.",
         h.name,
         h.info.replace('\n', " "),
         h.cwd()
