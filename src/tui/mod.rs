@@ -3421,7 +3421,7 @@ pub(crate) fn copy_osc52(text: &str) {
     let _ = std::io::Write::flush(&mut out);
 }
 
-fn clipboard(text: &str) -> bool {
+pub(crate) fn clipboard(text: &str) -> bool {
     let cmds: &[&[&str]] = if cfg!(target_os = "macos") { &[&["pbcopy"]] } else { &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "-b", "-i"]] };
     for c in cmds {
         // stderr silenced: xclip's "Can't open display" would print over the TUI and stick

@@ -17,6 +17,7 @@ mod lint;
 mod llm;
 mod proto;
 mod relay;
+mod sample;
 mod server;
 mod session;
 mod ssh;
@@ -84,7 +85,7 @@ enum Cmd {
         /// Session file or id; default: the latest session of this directory.
         session: Option<String>,
     },
-    /// The background server (started automatically on first use). `theta daemon stop` stops it.
+    /// The background server (started automatically on first use). `theta daemon stop` stops it, `theta daemon sample` copies a diagnostic snapshot of it.
     Daemon { action: Option<String> },
     /// Serve tool calls over stdin/stdout for `/ssh` (started on the server by theta itself).
     #[command(hide = true)]
@@ -214,7 +215,8 @@ async fn main() -> Result<()> {
                 }
                 bail!("daemon did not stop")
             }
-            Some(a) => bail!("unknown action `{a}` (stop)"),
+            Some("sample") => sample::run_sample(),
+            Some(a) => bail!("unknown action `{a}` (stop | sample)"),
         };
     }
     if let Some(Cmd::SshAgent) = &cli.cmd {
