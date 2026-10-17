@@ -144,11 +144,13 @@ pub struct Compaction {
     pub keep_recent_tokens: u64,
     /// Absolute ceiling (tokens) for the trigger, so huge windows do not grow unbounded; 0 = none.
     pub max_tokens: u64,
+    /// Above this many context tokens, old tool results are shortened (no model call); 0 = never.
+    pub prune_tokens: u64,
 }
 
 impl Default for Compaction {
     fn default() -> Self {
-        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000, max_tokens: 150_000 }
+        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000, max_tokens: 150_000, prune_tokens: 60_000 }
     }
 }
 
@@ -167,11 +169,13 @@ pub struct ToolSettings {
     pub verify: String,
     /// Lines of read/grep/find/ls/bash output Auto itself receives (0 = no cap); larger reads belong to subagents.
     pub auto_max_lines: usize,
+    /// Model calls after which a subagent must stop and write a handoff report (0 = never).
+    pub checkpoint_steps: usize,
 }
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80 }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80, checkpoint_steps: 40 }
     }
 }
 
@@ -312,6 +316,43 @@ pub fn set_global(key: &str, value: toml::Value) -> Result<()> {
     Ok(())
 }
 
+/// sha256 of every DEFAULT_AUTO_SOUL shipped before; add the current one's hash here when it changes.
+const SHIPPED_AUTO_SOULS: [&str; 4] = [
+    "fd0daae85700f041b464bdb696021a63fa4b77db7a22dab9b24c8ffe1aac5bac",
+    "7f22cfc138a69fe436daf1e71aa8988b2d4d91c3be111c889dd82573a8306c5a",
+    "889663e1048dda6448eb64ff38d2f7d13dc2b3f86890c8512969fb55864e7c72",
+    "9312f8bb14a55537d82d6f9ca5f2190705316226971485a1d9aac052151a1e61",
+];
+
+/// Overwrite `path` with `new`, first copying an existing different file to `<path>.bak`.
+fn replace_with_backup(path: &Path, new: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|cur| cur != new) {
+        std::fs::copy(path, format!("{}.bak", path.display()))?;
+    }
+    std::fs::write(path, new)?;
+    Ok(())
+}
+
+/// SOUL.md is written once (yours to edit). SOUL.Auto.md follows the binary while it is still a version theta
+/// shipped. `force` rewrites both, keeping a `.bak` of what was there.
+pub fn sync_souls(force: bool) -> Result<()> {
+    let h = home();
+    let soul = h.join("SOUL.md");
+    let auto_soul = h.join("SOUL.Auto.md");
+    let cur = std::fs::read(&auto_soul).ok();
+    let stale = cur.as_ref().is_none_or(|c| SHIPPED_AUTO_SOULS.contains(&crate::update::sha256(c).as_str()));
+    for (path, new, replace) in [(&soul, crate::agents::DEFAULT_SOUL, force || !soul.exists()), (&auto_soul, crate::agents::DEFAULT_AUTO_SOUL, force || stale)] {
+        let had = std::fs::read_to_string(path).ok();
+        if replace && had.as_deref() != Some(new) {
+            replace_with_backup(path, new)?;
+            if had.is_some() {
+                eprintln!("theta: {} updated to the new version{}", path.display(), if force { " (yours kept as .bak)" } else { "" });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create ~/.theta with defaults on first run.
 pub fn bootstrap() -> Result<()> {
     let h = home();
@@ -319,16 +360,8 @@ pub fn bootstrap() -> Result<()> {
     std::fs::create_dir_all(h.join("skills"))?;
     std::fs::create_dir_all(h.join("sessions"))?;
     std::fs::create_dir_all(h.join("cache"))?;
-    let soul = h.join("SOUL.md");
-    if !soul.exists() {
-        std::fs::write(&soul, crate::agents::DEFAULT_SOUL)?;
-    }
-    // Per-agent SOUL: written once, never overwritten (yours to edit).
-    let auto_soul = h.join("SOUL.Auto.md");
-    if !auto_soul.exists() {
-        std::fs::write(&auto_soul, crate::agents::DEFAULT_AUTO_SOUL)?;
-    }
-    sync_agents(&h.join("agents"));
+    sync_souls(false)?;
+    sync_agents(&h.join("agents"), false);
     let changed = write_docs()?;
     if !changed.is_empty() {
         eprintln!("theta: guides updated in {}: {}", h.join("docs").display(), changed.join(", "));
@@ -372,7 +405,8 @@ pub fn write_docs() -> Result<Vec<&'static str>> {
 /// Install the shipped agents. `.shipped` records the hash of the version last written (or offered):
 /// an agent still equal to it is replaced silently; an edited one is kept, the new version goes
 /// next to it as `<name>.md.new` and its diff is shown once on a terminal.
-pub fn sync_agents(dir: &Path) {
+/// `force` rewrites every agent that differs from the shipped one, keeping yours as `<name>.md.bak`.
+pub fn sync_agents(dir: &Path, force: bool) {
     use crate::update::sha256;
     use std::io::IsTerminal;
     let manifest = dir.join(".shipped");
@@ -398,6 +432,15 @@ pub fn sync_agents(dir: &Path) {
         let cur_hash = sha256(cur.as_bytes());
         if cur_hash == new_hash {
             shipped.insert(name.into(), new_hash);
+        } else if force {
+            match replace_with_backup(&path, new) {
+                Ok(()) => {
+                    shipped.insert(name.into(), new_hash);
+                    let _ = std::fs::remove_file(dir.join(format!("{name}.md.new")));
+                    eprintln!("theta: agent {name} rewritten (yours kept as {name}.md.bak)");
+                }
+                Err(e) => eprintln!("theta: cannot rewrite agent {name}: {e:#}"),
+            }
         } else if old.as_deref() == Some(&cur_hash) {
             // untouched since we wrote it
             if std::fs::write(&path, new).is_ok() {
@@ -452,6 +495,7 @@ enabled = true
 threshold = 0.8
 keep_recent_tokens = 20000
 max_tokens = 150000      # compact at the lower of threshold x window and this; 0 = no ceiling
+prune_tokens = 60000     # above this, old tool outputs are shortened before any summary (no model call); 0 = never
 
 [tools]
 rtk = "auto"             # route shell commands through rtk when installed
@@ -459,6 +503,7 @@ bash_timeout = 120
 max_lines = 300
 # verify = ""            # run after a subagent changed files; "" = detect (Cargo.toml, go.mod), "off" = never
 # auto_max_lines = 80    # lines of read/grep/bash output the Auto agent itself receives; 0 = no cap
+# checkpoint_steps = 40  # model calls after which a subagent writes a handoff report for Auto; 0 = never
 disabled = []
 
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
@@ -513,7 +558,7 @@ mod sync_tests {
         let dir = std::env::temp_dir().join(format!("theta-sync-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        sync_agents(&dir);
+        sync_agents(&dir, false);
         assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), crate::agents::DEFAULT_PLAN);
         // Pretend the shipped Plan was an older text we wrote: untouched => replaced.
         let old = "old plan";
@@ -522,14 +567,19 @@ mod sync_tests {
         let m = std::fs::read_to_string(dir.join(".shipped")).unwrap();
         let line = m.lines().find(|l| l.starts_with("Plan ")).unwrap().to_string();
         std::fs::write(dir.join(".shipped"), m.replace(&line, &format!("Plan {hash}"))).unwrap();
-        sync_agents(&dir);
+        sync_agents(&dir, false);
         assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), crate::agents::DEFAULT_PLAN);
         // Edited by the user and shipped version changed: kept, proposal written aside.
         std::fs::write(dir.join("Plan.md"), "mine").unwrap();
         std::fs::write(dir.join(".shipped"), m.replace(&line, "Plan 0000")).unwrap();
-        sync_agents(&dir);
+        sync_agents(&dir, false);
         assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), "mine");
         assert_eq!(std::fs::read_to_string(dir.join("Plan.md.new")).unwrap(), crate::agents::DEFAULT_PLAN);
+        // Forced: rewritten, the user's copy kept as .bak, the stale proposal gone.
+        sync_agents(&dir, true);
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md")).unwrap(), crate::agents::DEFAULT_PLAN);
+        assert_eq!(std::fs::read_to_string(dir.join("Plan.md.bak")).unwrap(), "mine");
+        assert!(!dir.join("Plan.md.new").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

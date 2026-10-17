@@ -214,7 +214,12 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
 /// Hard cap (chars) on a subagent report; reviewers get room for a defect list.
 const REPORT_CAP: usize = 6000;
 
-const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size, terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.";
+/// Subagents (often a cheaper model) drift into workarounds when blocked; the orchestrator can unblock them, they cannot.
+const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing around it. Every tool call must move that step forward: no docs, refactors, cleanup, reviews of unrelated files or git unless the brief asks.\nWhen something stands in the way (a refused command, a missing tool or binary, missing access, credentials or a service, a check you cannot fix in two tries), do not work around it:\n- never build a replacement for a missing tool (your own parser, linter, interpreter binding, test harness, mock runtime);\n- never redo a refused command another way (python, awk, another shell command): use the tool the refusal names;\n- never search for passwords, keys or connection strings, and never change a live database or service the brief did not name (read-only MCP probes are fine);\n- never install packages unless the brief says so.\nInstead: finish what you can, mark the blocked check `not verified` with the reason, and report it as a blocker, or stop and ask (`questions:`). A blocker reported in one line is worth more to the orchestrator than an hour of workaround.";
+
+const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
+
+const CHECKPOINT_MSG: &str = "Checkpoint: stop calling tools now. Your next message is a handoff report for the orchestrator (up to 3000 characters): what is done, what is not done, files touched (path:line), what was verified and how, blockers, and the exact next step. Do not continue the work in this message.";
 
 /// Run until the model answers without tool calls. Appends everything to `session`.
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
@@ -222,6 +227,8 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
     let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra), turn.depth == 0);
     if turn.depth > 0 {
+        system.push_str("\n\n");
+        system.push_str(WORK_RULE);
         system.push_str("\n\n");
         system.push_str(REPORT_RULE);
     }
@@ -235,9 +242,20 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let mut overflow_retry = false;
     let mut nudges = 0u8;
     let mut stalls = 0u8;
+    let mut steps = 0usize;
+    let mut checkpoints = 0usize;
     let mut compact_failed = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
+        // A subagent that runs long hands its state back so the orchestrator can re-steer (resume or re-split).
+        let cp = rt.settings.tools.checkpoint_steps;
+        if turn.depth > 0 && cp > 0 && steps / cp > checkpoints {
+            checkpoints = steps / cp;
+            session.lock().unwrap().add_msg(Msg::user(CHECKPOINT_MSG), None)?;
+        }
+        if rt.settings.compaction.enabled && compact::prune_needed(&session.lock().unwrap(), &rt.settings) {
+            compact::prune(&rt, &session)?;
+        }
         if rt.settings.compaction.enabled && !compact_failed && compact::needed(&session.lock().unwrap(), &model, &rt.settings) {
             let _ = tx.send(Event::Compacting);
             match compact::run(&rt, &session, &turn.model).await {
@@ -279,6 +297,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             session.lock().unwrap().add_msg(resp.msg.clone(), Some(resp.usage.clone()))?;
         }
         let _ = tx.send(Event::Step { usage: resp.usage.clone(), model: model.key() });
+        steps += 1;
         if calls.is_empty() {
             if drain_steer(&steer, &session, &tx, &rt, turn.depth) {
                 continue;
@@ -346,6 +365,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 let mut out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
+                } else if let Some(open) = (name == "task" && turn.depth == 0 && writes_files(&rt, &turn, &args)).then(|| tools::fs::open_questions(&ctx.session_id)).filter(|q| !q.is_empty()) {
+                    // Building on a guess costs more round trips than settling it first.
+                    tools::ToolOut::err(format!("The plan still has open questions:\n{}\nSettle each one first (an Explore with that exact question, an MCP test, or `ask` for a user decision), write the answer and its evidence into the plan, empty `## Open questions`, then start the Build.", open.join("\n")))
                 } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
                     background_subagent(&rt, &turn, &id, &args, &tx)
                 } else if name == "task" {
@@ -419,6 +441,15 @@ async fn handoff(rt: &Runtime, args: &Value, tx: &Tx) -> tools::ToolOut {
     out
 }
 
+/// Whether this `task` call would start an agent that can change files (resolved like `subagent` does).
+fn writes_files(rt: &Runtime, parent: &Turn, args: &Value) -> bool {
+    let agent = match args.get("agent").and_then(|v| v.as_str()) {
+        Some(n) => agents::find(&rt.agents, n),
+        None => Some(&parent.agent),
+    };
+    agent.is_some_and(|a| !agents::is_readonly(a))
+}
+
 /// `task` with `background`: run the subagent as a job and return its id at once; the report comes back as a message.
 fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx) -> tools::ToolOut {
     let label = args.get("description").and_then(|v| v.as_str()).unwrap_or("subagent").to_string();
@@ -427,11 +458,12 @@ fn background_subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value,
         Box::pin(async move {
             match subagent(&rt2, &parent, &call_id, &args, &tx, Some(&out)).await {
                 Ok(r) => {
-                    out.push(&r.content);
+                    // The live `→ tool` trace is done with: the job's output becomes the report alone.
+                    out.set(&r.content);
                     i32::from(r.is_error)
                 }
                 Err(e) => {
-                    out.push(&format!("{e:#}"));
+                    out.set(&format!("{e:#}"));
                     1
                 }
             }
@@ -545,10 +577,16 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     // A subagent that can write is checked by the harness, not by its own report.
     let writes = !agents::is_readonly(&turn.agent);
     let before = if writes { tree_state(&rt.cwd).await } else { None };
+    let who = turn.agent.name.clone();
     let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
     let _ = forward.await;
     res?;
     let answer = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
+    // Whole transcript, resumes included: lets the orchestrator see a step that burns tokens without progress.
+    let (calls, input) = session.lock().unwrap().entries.iter().fold((0u64, 0u64), |(n, t), e| match &e.kind {
+        crate::session::Kind::Msg { usage: Some(u), .. } => (n + 1, t + u.input + u.cache_read + u.cache_write),
+        _ => (n, t),
+    });
     // The 600-char rule is only a prompt: cap what actually enters the orchestrator's context.
     let answer = match answer.char_indices().nth(REPORT_CAP) {
         _ if answer.is_empty() => "(subagent returned no text)".into(),
@@ -565,7 +603,13 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
                 checks.push_str(&format!("\n[changed since HEAD: {stat}]"));
             }
         }
-    Ok(tools::ToolOut::ok(format!("{answer}{checks}\n[transcript: {transcript}]")))
+    // A resume without `agent` would run as the orchestrator itself: name the agent to continue.
+    let next = if answer.trim_start().to_lowercase().starts_with("questions:") {
+        format!("\n[{who} is waiting for your answers: task agent=\"{who}\" resume=<transcript> prompt=<one answer per question>]")
+    } else {
+        format!("\n[to continue it: task agent=\"{who}\" resume=<transcript>]")
+    };
+    Ok(tools::ToolOut::ok(format!("{answer}{checks}\n[cost: {calls} model calls, {}k input tokens]{next}\n[transcript: {transcript}]", input / 1000)))
 }
 
 /// Name the session from its first exchange using the title model.

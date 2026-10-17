@@ -122,8 +122,31 @@ async fn effective(cmd: &str, ctx: &ToolCtx) -> String {
     if use_rtk { rtk_rewrite(cmd).await.unwrap_or(cmd.to_string()) } else { cmd.to_string() }
 }
 
+/// A command that only views files (cat, sed -n, grep…): `read`/`grep` do it in fewer, capped, cache-aware calls.
+fn viewing_only(cmd: &str) -> bool {
+    if cmd.contains('>') || cmd.contains("$(") || cmd.contains('`') || cmd.contains('\n') {
+        return false;
+    }
+    let mut parts: Vec<&str> = cmd.split(['|', ';', '&']).map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.first().is_some_and(|p| p.starts_with("cd ")) {
+        parts.remove(0);
+    }
+    !parts.is_empty()
+        && parts.iter().all(|p| {
+            let mut w = p.split_whitespace();
+            match w.next() {
+                Some("cat" | "head" | "tail" | "grep" | "rg" | "nl") => true,
+                Some("sed") => w.next() == Some("-n") && !p.contains(" -i"),
+                _ => false,
+            }
+        })
+}
+
 pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let cmd = s(args, "command").context("command required")?.to_string();
+    if viewing_only(&cmd) {
+        return Ok(ToolOut::err("Use `read` (path, offset, limit) to view files and `grep` (pattern, path, glob, context) to search; several in one turn when independent. `bash` is for running things. Do not get around this with python, awk or another command."));
+    }
     let effective = effective(&cmd, ctx).await;
     if super::b(args, "background") {
         let (run, cwd, timeout) = (effective.clone(), ctx.cwd.clone(), n(args, "timeout").map(Duration::from_secs));
@@ -179,5 +202,15 @@ mod tests {
     fn compacts() {
         let raw = "\x1b[32mok\x1b[0m\nsame\nsame\nsame\n\n\n\n10%\r50%\r100%\nend";
         assert_eq!(super::compact(raw), "ok\nsame  (×3)\n\n100%\nend");
+    }
+
+    #[test]
+    fn viewing_commands_go_to_read_and_grep() {
+        for c in ["cat a.rs", "cd x && sed -n '1,30p' f.lua", "grep -rn foo . | head -20", "head -50 a; tail b"] {
+            assert!(super::viewing_only(c), "{c}");
+        }
+        for c in ["cargo test", "sed -i 's/a/b/' f", "grep foo f > out", "ls", "git grep foo", "find . -name x", "cat a | python3 x.py", "cd x && cargo build"] {
+            assert!(!super::viewing_only(c), "{c}");
+        }
     }
 }

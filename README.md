@@ -80,7 +80,7 @@ Sous-commandes : `login [provider]`, `logout <provider>`, `models [filtre]`, `ag
 
 Canaux : `stable` (branche `main`, releases) ou `nightly` (branche `dev`, prereleases `dev-v…` publiées à chaque push sur `dev`). Le script demande le canal ; `--stable` / `--dev` le fixent sans menu. Le canal est gardé dans `~/.theta/install` et `theta update` suit ce canal. Un binaire nightly affiche `(dev)` à côté du logo.
 
-Mise à jour depuis θ lui-même : `theta update` cherche la dernière release, vérifie le sha256 et remplace le binaire (`--check` pour seulement regarder, `--force` pour réinstaller ou remplacer un build local). Si le daemon tourne, `theta daemon stop` le relance sur la nouvelle version.
+Mise à jour depuis θ lui-même : `theta update` cherche la dernière release, vérifie le sha256 et remplace le binaire (`--check` pour seulement regarder, `--force` pour réinstaller ou remplacer un build local). Elle met aussi à jour les guides, les agents et `SOUL.Auto.md` livrés, sauf ceux que tu as modifiés. `theta force-update` réinstalle même si tu es à jour et réécrit tout, agents et SOUL modifiés compris (ton ancienne version est gardée en `.bak`). Si le daemon tourne, `theta daemon stop` le relance sur la nouvelle version.
 
 Les agents livrés (`Build`, `Plan`, `Auto`) suivent la mise à jour : un agent non modifié est remplacé ; un agent que tu as édité est conservé, la nouvelle version est écrite en `<Agent>.md.new` et son diff est affiché une fois sur un terminal.
 

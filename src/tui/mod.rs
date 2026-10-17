@@ -232,6 +232,7 @@ pub fn tool_summary(name: &str, args: &Value) -> String {
         "web_fetch" => g("url"),
         "todo" => format!("{} items", args.get("todos").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0)),
         "task" => g("description"),
+        "write_plan" => format!("{} lines", g("content").lines().count()),
         "ask" => g("question"),
         "handoff" => format!("→ {} · {}", args.get("agent").and_then(|v| v.as_str()).unwrap_or("Build"), g("summary")),
         _ => args.to_string(),
@@ -2677,6 +2678,16 @@ impl Ui {
                 if out.len() == 1 { vec![] } else { out }
             }
             Item::Tool { name, summary, state, out, display, sub, who, .. } => {
+                // The plan is what the user reviews before Build starts: shown whole, in compact mode too.
+                if let (true, Some(plan), ToolState::Done { ok: true }) = (name == "write_plan", display, state) {
+                    let mut out = vec![Line::default(), Line::from(Span::styled("  plan", theme::accent().add_modifier(Modifier::BOLD)))];
+                    out.extend(markdown::render(plan, width.saturating_sub(2)).into_iter().map(|l| {
+                        let mut spans = vec![Span::raw("  ")];
+                        spans.extend(l.spans);
+                        Line::from(spans).style(l.style)
+                    }));
+                    return out;
+                }
                 if !full {
                     return vec![];
                 }

@@ -29,6 +29,9 @@ impl Out {
             o.drain(..cut);
         }
     }
+    pub fn set(&self, s: &str) {
+        *self.0.lock().unwrap() = s.to_string();
+    }
     pub fn text(&self) -> String {
         self.0.lock().unwrap().clone()
     }
@@ -138,7 +141,7 @@ impl Jobs {
             j.info.status = Status::Done(code);
             j.info.ended = Some(now());
             j.abort = None;
-            let body = crate::tools::shell::compact(&j.out.text());
+            let body = if j.info.kind == Kind::Agent { j.out.text() } else { crate::tools::shell::compact(&j.out.text()) };
             ((!(quiet_ok && code == 0 && body.trim().is_empty())).then(|| note(&j.info, &body)), j.info.kind == Kind::Agent)
         };
         if let Some(n) = note {
@@ -248,7 +251,8 @@ fn note(i: &JobInfo, body: &str) -> String {
         Status::Done(c) => format!("failed (exit {c})"),
         _ => "stopped".into(),
     };
-    let (body, _) = crate::tools::truncate_middle(body, NOTE_LINES);
+    // A subagent's report is already capped (REPORT_CAP) and is what the orchestrator plans from: never cut it.
+    let body = if i.kind == Kind::Agent { body.to_string() } else { crate::tools::truncate_middle(body, NOTE_LINES).0 };
     let what = match i.kind {
         Kind::Shell => "shell",
         Kind::Lint => "lint",
@@ -284,6 +288,17 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains(&loud) && notes[0].contains("failed (exit 3)") && notes[0].ends_with("hi"));
         assert!(jobs.take_pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn subagent_report_reaches_the_orchestrator_whole() {
+        let jobs = Jobs::default();
+        let report: String = (0..60).map(|i| format!("fact {i} at a.rs:{i}\n")).collect();
+        let r = report.clone();
+        jobs.spawn(Kind::Agent, "explore".into(), false, move |o| Box::pin(async move { o.push("→ read\n"); o.set(&r); 0 }));
+        jobs.wait(true).await;
+        let notes = jobs.take_pending();
+        assert!(notes[0].ends_with(&report) && !notes[0].contains("→ read"));
     }
 
     #[tokio::test]

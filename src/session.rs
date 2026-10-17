@@ -16,6 +16,8 @@ pub enum Kind {
     Msg { msg: Msg, #[serde(default, skip_serializing_if = "Option::is_none")] usage: Option<Usage> },
     /// Summary replacing everything on the path before `first_kept`.
     Compaction { summary: String, first_kept: String, tokens_before: u64 },
+    /// Tool results before `upto` are sent shortened: cheap context relief, no summary.
+    Prune { upto: String },
     Title { title: String },
     /// Active branch switched to `target` (empty = root).
     Leaf { target: String },
@@ -257,6 +259,10 @@ impl Session {
         self.append(Kind::Compaction { summary, first_kept, tokens_before }, true)
     }
 
+    pub fn add_prune(&mut self, upto: String) -> Result<String> {
+        self.append(Kind::Prune { upto }, true)
+    }
+
     pub fn set_title(&mut self, title: String) -> Result<()> {
         self.title = Some(title.clone());
         if self.written {
@@ -305,13 +311,13 @@ impl Session {
         self.index.get(id).map(|&i| &self.entries[i])
     }
 
-    /// Entries from root to `leaf` (message and compaction entries only).
+    /// Entries from root to `leaf` (message, compaction and prune entries only).
     pub fn path_to(&self, leaf: Option<&str>) -> Vec<&Entry> {
         let mut out = Vec::new();
         let mut cur = leaf.map(String::from);
         while let Some(id) = cur {
             let Some(e) = self.get(&id) else { break };
-            if matches!(e.kind, Kind::Msg { .. } | Kind::Compaction { .. }) {
+            if matches!(e.kind, Kind::Msg { .. } | Kind::Compaction { .. } | Kind::Prune { .. }) {
                 out.push(e);
             }
             cur = e.parent.clone();
@@ -337,9 +343,34 @@ impl Session {
                 }
                 start = c + 1;
             }
+        // Latest prune since the compaction: results before `upto` go shortened; thinking before the prune entry is
+        // dropped (its prefix changed, as after a compaction).
+        let (upto, pruned_at) = path[start..]
+            .iter()
+            .rposition(|e| matches!(e.kind, Kind::Prune { .. }))
+            .map(|p| start + p)
+            .and_then(|p| match &path[p].kind {
+                Kind::Prune { upto } => Some((path.iter().position(|e| &e.id == upto).unwrap_or(p), p)),
+                _ => None,
+            })
+            .unwrap_or((0, 0));
+        let base = out.len();
         for e in &path[start..] {
             if let Kind::Msg { msg, .. } = &e.kind {
                 out.push(msg.clone());
+            }
+        }
+        if pruned_at > 0 {
+            let mut i = base;
+            for (k, e) in path[start..].iter().enumerate() {
+                let Kind::Msg { .. } = e.kind else { continue };
+                if start + k < pruned_at {
+                    out[i] = strip_thinking(&out[i]);
+                }
+                if start + k < upto {
+                    shorten_results(&mut out[i]);
+                }
+                i += 1;
             }
         }
         out
@@ -357,7 +388,7 @@ impl Session {
     pub fn children(&self, id: Option<&str>) -> Vec<&Entry> {
         self.entries
             .iter()
-            .filter(|e| e.parent.as_deref() == id && matches!(e.kind, Kind::Msg { .. } | Kind::Compaction { .. }))
+            .filter(|e| e.parent.as_deref() == id && matches!(e.kind, Kind::Msg { .. } | Kind::Compaction { .. } | Kind::Prune { .. }))
             .collect()
     }
 
@@ -371,6 +402,18 @@ fn strip_thinking(m: &Msg) -> Msg {
     let mut m = m.clone();
     m.content.retain(|b| !matches!(b, Block::Thinking { .. }));
     m
+}
+
+/// Characters of a pruned tool result still sent: enough to recall what the call returned.
+const PRUNED_KEEP: usize = 200;
+
+fn shorten_results(m: &mut Msg) {
+    for b in &mut m.content {
+        if let Block::ToolResult { content, .. } = b
+            && let Some((i, _)) = content.char_indices().nth(PRUNED_KEEP) {
+                *content = format!("{}… [old output dropped to save context; run the tool again if you need it]", &content[..i]);
+            }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +447,25 @@ mod tests {
         assert!(c[0].text().contains("sum"));
         assert_eq!(c[1].text(), "alt");
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn prune_shortens_old_results_and_keeps_recent_ones() {
+        let mut s = Session::blank(Path::new(""));
+        let big = "x".repeat(1000);
+        let call = |id: &str| Msg { role: Role::Assistant, content: vec![Block::Thinking { text: "t".into(), signature: None }, Block::ToolCall { id: id.into(), name: "read".into(), args: serde_json::json!({}), sig: None }], model: None };
+        let res = |id: &str| Msg { role: Role::User, content: vec![Block::ToolResult { id: id.into(), content: big.clone(), is_error: false }], model: None };
+        let msgs = [call("a"), res("a"), call("b"), res("b")];
+        for (i, m) in msgs.into_iter().enumerate() {
+            s.apply(Entry { id: format!("m{i}"), parent: (i > 0).then(|| format!("m{}", i - 1)), ts: 0, kind: Kind::Msg { msg: m, usage: None } });
+        }
+        s.apply(Entry { id: "p".into(), parent: Some("m3".into()), ts: 0, kind: Kind::Prune { upto: "m2".into() } });
+        let c = s.context();
+        assert_eq!(c.len(), 4);
+        let result = |m: &Msg| match &m.content[0] { Block::ToolResult { content, .. } => content.clone(), _ => unreachable!() };
+        assert!(result(&c[1]).len() < 400 && result(&c[1]).contains("old output dropped"));
+        assert_eq!(result(&c[3]), big);
+        assert!(c[2].content.iter().all(|b| !matches!(b, Block::Thinking { .. })), "thinking before the prune entry is dropped");
     }
 
     #[test]

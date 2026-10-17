@@ -90,6 +90,19 @@ pub fn write(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
 }
 
 /// One plan per session: `~/.theta/plan/<session id>.md`. The model cannot choose the file.
+/// Lines of the plan's `## Open questions` section that are still open ("none" or empty = settled).
+pub fn open_questions(session_id: &str) -> Vec<String> {
+    let Ok(plan) = std::fs::read_to_string(config::home().join("plan").join(format!("{session_id}.md"))) else { return vec![] };
+    plan.lines()
+        .skip_while(|l| !l.trim_start().to_lowercase().starts_with("## open questions"))
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with("## "))
+        .map(|l| l.trim().trim_start_matches(['-', '*']).trim())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("none") && !l.eq_ignore_ascii_case("(none)"))
+        .map(String::from)
+        .collect()
+}
+
 pub fn write_plan(args: &Value, session_id: &str) -> Result<ToolOut> {
     if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.starts_with('.') {
         bail!("no session to attach the plan to");
@@ -99,7 +112,9 @@ pub fn write_plan(args: &Value, session_id: &str) -> Result<ToolOut> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{session_id}.md"));
     std::fs::write(&path, content)?;
-    Ok(ToolOut::ok(format!("wrote plan {}", path.display())))
+    let mut out = ToolOut::ok(format!("wrote plan {}", path.display()));
+    out.display = Some(content.to_string());
+    Ok(out)
 }
 
 pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
@@ -353,8 +368,15 @@ mod tests {
         unsafe { std::env::set_var("THETA_HOME", &home) };
         let out = write_plan(&serde_json::json!({"content": "# plan"}), "abc123").unwrap();
         assert!(!out.is_error);
+        assert_eq!(out.display.as_deref(), Some("# plan"));
         assert_eq!(std::fs::read_to_string(home.join("plan/abc123.md")).unwrap(), "# plan");
         assert!(write_plan(&serde_json::json!({"content": "x"}), "../evil").is_err());
+        assert!(open_questions("abc123").is_empty() && open_questions("missing").is_empty());
+        let draft = "# p\n## Open questions\n- Q1 does RegisterNpc return a key? → MCP test\n\n## Steps\nS1 x";
+        write_plan(&serde_json::json!({"content": draft}), "abc123").unwrap();
+        assert_eq!(open_questions("abc123"), vec!["Q1 does RegisterNpc return a key? → MCP test"]);
+        write_plan(&serde_json::json!({"content": "## Open questions\n- none\n## Steps"}), "abc123").unwrap();
+        assert!(open_questions("abc123").is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

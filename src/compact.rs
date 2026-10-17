@@ -47,7 +47,8 @@ pub fn current_tokens(s: &Session) -> u64 {
         match &e.kind {
             Kind::Msg { usage: Some(u), .. } => return u.context() + estimate_tokens(&tail),
             Kind::Msg { msg, .. } => tail.push(msg.clone()),
-            Kind::Compaction { .. } => break,
+            // Usage reported before these shrank the context is stale: estimate what is sent now.
+            Kind::Compaction { .. } | Kind::Prune { .. } => break,
             _ => {}
         }
     }
@@ -61,6 +62,55 @@ pub fn needed(s: &Session, model: &Model, settings: &Settings) -> bool {
         limit = limit.min(c.max_tokens as f64);
     }
     model.context > 0 && current_tokens(s) as f64 > limit
+}
+
+/// Old tool results take most of a long agent run's context: shorten them before paying for a summary.
+pub fn prune_needed(s: &Session, settings: &Settings) -> bool {
+    let p = settings.compaction.prune_tokens;
+    p > 0 && current_tokens(s) > p
+}
+
+/// Shorten every tool result older than the recent `keep_recent_tokens`. False when nothing old enough to prune.
+pub fn prune(rt: &Runtime, session: &Arc<Mutex<Session>>) -> Result<bool> {
+    let mut s = session.lock().unwrap();
+    let path = s.path_to(s.leaf.as_deref());
+    let start = path.iter().rposition(|e| matches!(e.kind, Kind::Compaction { .. } | Kind::Prune { .. })).map(|i| i + 1).unwrap_or(0);
+    let keep = rt.settings.compaction.keep_recent_tokens;
+    let Some(cut) = cut_point(&path[start..], keep) else { return Ok(false) };
+    // Each prune changes the cached prefix once: only worth it when it frees a real amount.
+    let freed: usize = path[start..start + cut]
+        .iter()
+        .filter_map(|e| if let Kind::Msg { msg, .. } = &e.kind { Some(msg) } else { None })
+        .flat_map(|m| &m.content)
+        .map(|b| if let Block::ToolResult { content, .. } = b { content.len().saturating_sub(200) / 4 } else { 0 })
+        .sum();
+    if (freed as u64) < keep / 2 {
+        return Ok(false);
+    }
+    let upto = path[start + cut].id.clone();
+    s.add_prune(upto)?;
+    drop(s);
+    rt.read_cache.lock().unwrap().clear();
+    Ok(true)
+}
+
+/// Index where the kept tail starts: at a user text or assistant message (never a tool result), so tool calls stay
+/// paired with their results, and at least `keep` tokens back when possible.
+fn cut_point(entries: &[&crate::session::Entry], keep: u64) -> Option<usize> {
+    let mut acc = 0;
+    let mut cut = None;
+    for (i, e) in entries.iter().enumerate().rev() {
+        let Kind::Msg { msg, .. } = &e.kind else { continue };
+        acc += estimate_tokens(std::slice::from_ref(msg));
+        let boundary = msg.role == Role::Assistant || msg.content.iter().all(|b| !matches!(b, Block::ToolResult { .. }));
+        if boundary && i > 0 {
+            cut = Some(i);
+            if acc >= keep {
+                break;
+            }
+        }
+    }
+    cut
 }
 
 pub fn serialize(msgs: &[Msg]) -> String {
@@ -97,23 +147,8 @@ pub async fn run(rt: &Runtime, session: &Arc<Mutex<Session>>, main_model: &str) 
             _ => None,
         });
         let entries = &path[start..];
-        // Cut before a user text or assistant message (never a tool result), so tool calls stay paired with their results.
         // The summary is a user message, so the kept tail may start with an assistant turn.
-        let keep = rt.settings.compaction.keep_recent_tokens;
-        let mut acc = 0;
-        let mut cut = None;
-        for (i, e) in entries.iter().enumerate().rev() {
-            let Kind::Msg { msg, .. } = &e.kind else { continue };
-            acc += estimate_tokens(std::slice::from_ref(msg));
-            let boundary = msg.role == Role::Assistant || msg.content.iter().all(|b| !matches!(b, Block::ToolResult { .. }));
-            if boundary && i > 0 {
-                cut = Some(i);
-                if acc >= keep {
-                    break;
-                }
-            }
-        }
-        let Some(cut) = cut else { bail!("nothing to compact yet") };
+        let Some(cut) = cut_point(entries, rt.settings.compaction.keep_recent_tokens) else { bail!("nothing to compact yet") };
         let msgs: Vec<Msg> = entries[..cut].iter().filter_map(|e| if let Kind::Msg { msg, .. } = &e.kind { Some(msg.clone()) } else { None }).collect();
         (msgs, previous, entries[cut].id.clone(), before)
     };

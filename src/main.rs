@@ -77,8 +77,14 @@ enum Cmd {
     },
     /// Refresh the model catalog from models.dev.
     Refresh,
-    /// Write the shipped guides to ~/.theta/docs and say which changed (the installer runs this).
-    Docs,
+    /// Sync the shipped guides, agents and SOULs into ~/.theta and say what changed (the installer and `update` run this).
+    Docs {
+        /// Rewrite agents and SOULs even if you edited them (yours are kept as .bak).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reinstall the latest release even when up to date, and rewrite the shipped agents, SOULs and guides.
+    ForceUpdate,
     /// Nightly only: dump a whole session (messages, tool calls, nested subagent transcripts) as Markdown.
     #[command(hide = !update::is_dev())]
     Dump {
@@ -223,7 +229,10 @@ async fn main() -> Result<()> {
         return ssh::agent().await;
     }
     if let Some(Cmd::Update { check, force }) = &cli.cmd {
-        return update::run(*check, *force).await;
+        return update::run(*check, *force, false).await;
+    }
+    if let Some(Cmd::ForceUpdate) = &cli.cmd {
+        return update::run(false, true, true).await;
     }
     if let Some(Cmd::Dump { session }) = &cli.cmd {
         return dump::run(session.as_deref());
@@ -309,10 +318,13 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
-        Some(Cmd::Docs) => {
-            let agents = config::home().join("agents");
-            std::fs::create_dir_all(&agents)?;
-            config::sync_agents(&agents); // `install.sh` and `theta update` run this: agents follow the binary
+        Some(Cmd::Docs { force }) => {
+            // `install.sh` and `theta update` run this with the new binary: agents and SOULs follow it.
+            // build_runtime already ran a normal sync; `--force` rewrites what you edited.
+            if force {
+                config::sync_souls(true)?;
+                config::sync_agents(&config::home().join("agents"), true);
+            }
             let changed = config::write_docs()?;
             let dir = config::home().join("docs");
             if changed.is_empty() {
@@ -322,7 +334,7 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::ForceUpdate | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");

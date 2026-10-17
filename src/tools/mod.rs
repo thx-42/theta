@@ -1,6 +1,6 @@
 //! Built-in tools. Outputs are compacted for token efficiency (rtk-style).
 
-mod fs;
+pub mod fs;
 pub mod shell;
 mod web;
 

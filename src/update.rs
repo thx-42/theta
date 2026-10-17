@@ -192,7 +192,8 @@ async fn restart_daemon(ink: &Ink) {
     }
 }
 
-pub async fn run(check_only: bool, force: bool) -> Result<()> {
+/// `rewrite`: after installing, also overwrite the agents and SOULs you edited (`theta force-update`).
+pub async fn run(check_only: bool, force: bool, rewrite: bool) -> Result<()> {
     let ink = Ink(std::io::stdout().is_terminal());
     println!("{}", ink.paint("35;1", ART));
     println!("{}\n", ink.paint("2", "        ~ update ~"));
@@ -242,7 +243,12 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
         let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
     }
     // This process still holds the old guides: the new binary writes its own.
-    let _ = std::process::Command::new(&exe).arg("docs").status();
+    let mut docs = std::process::Command::new(&exe);
+    docs.arg("docs");
+    if rewrite {
+        docs.arg("--force");
+    }
+    let _ = docs.status();
     ink.cat("^o^", &format!("updated to {}", ink.paint("1", &latest)));
     restart_daemon(&ink).await;
     Ok(())
