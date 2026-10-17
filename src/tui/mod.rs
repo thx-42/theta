@@ -4135,17 +4135,23 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let mut term = setup();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    // A stalled loop must not replay the missed ticks as a burst (the spinner would race).
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     if let Some(p) = initial {
         ui.send(p, vec![]);
     }
     loop {
+        let t_draw = Instant::now();
         let done = term.draw(|f| {
             ui.draw(f);
             ui.sel_highlight(f.buffer_mut());
         })?;
         ui.frame = done.buffer.clone();
+        stall_log("draw", t_draw);
+        let mut arm = "input";
+        let mut t_arm = Instant::now();
         tokio::select! {
-            ev = events.next() => match ev {
+            ev = events.next() => match { t_arm = Instant::now(); ev } {
                 Some(Ok(CEvent::Key(k))) => {
                     ui.sel = None;
                     ui.on_key(k);
@@ -4200,6 +4206,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 _ => {}
             },
             Some((id, p)) = tab_rx.recv() => {
+                arm = "push";
+                t_arm = Instant::now();
                 ui.on_tab_push(id, p);
                 // Drain whatever else is queued before redrawing.
                 while let Ok((id, p)) = tab_rx.try_recv() {
@@ -4210,6 +4218,8 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
             Some(text) = shell_rx.recv() => ui.push(Item::Assistant { text, thinking: String::new(), done: true, agent: ui.app.turn.agent.name.clone() }),
             Some(m) = login_rx.recv() => ui.on_login(m),
             _ = tick.tick() => {
+                arm = "tick";
+                t_arm = Instant::now();
                 if ui.running || ui.tabs.iter().any(|t| t.status == TabStatus::Working) {
                     ui.spin += 1;
                 }
@@ -4218,6 +4228,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                 ui.poll_sub();
             }
         }
+        stall_log(arm, t_arm);
         if ui.overlay.is_none()
             && let Some(a) = ui.asks.pop_front() {
                 ui.overlay = Some(Overlay::Ask(a));
@@ -4234,6 +4245,19 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         println!("θ session saved{live} · resume with: theta -r {}", s.id);
     }
     Ok(())
+}
+
+/// A UI step over 300 ms is logged: the loop is single-threaded, so one slow step freezes everything.
+fn stall_log(what: &str, since: Instant) {
+    if since.elapsed() < Duration::from_millis(300) {
+        return;
+    }
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let dir = crate::config::home().join("cache/logs");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("tui.log")) {
+        use std::io::Write;
+        let _ = writeln!(f, "[{t}] ui step '{what}' took {:?}", since.elapsed());
+    }
 }
 
 #[cfg(test)]
