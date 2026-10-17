@@ -45,7 +45,11 @@ pub async fn complete(
     req: Request<'_>,
     on: OnDelta<'_>,
 ) -> Result<Response> {
+    let t0 = std::time::Instant::now();
     let creds = auth.resolve(provider).await?;
+    if t0.elapsed() > Duration::from_secs(2) {
+        eprintln!("[llm] credential resolve took {:?}", t0.elapsed());
+    }
     // Thinking blocks are only valid for the model that produced them.
     let key = req.model.key();
     let messages: Vec<Msg> = req
@@ -72,6 +76,7 @@ pub async fn complete(
         match res {
             Err(e) if attempt < 3 && is_retryable(&e) => {
                 attempt += 1;
+                eprintln!("[llm] {} retry {attempt}/3 in {}s: {e:#}", req.model.key(), 2u64.pow(attempt));
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
             }
             Err(e) => return Err(e),
