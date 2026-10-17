@@ -207,6 +207,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "subscription limits and resets (Claude, Codex)"),
     ("/stats", "token statistics across all sessions"),
     ("/copy", "copy the last answer"),
+    ("/dump", "nightly: copy the whole session and its subagents as Markdown"),
     ("/reload", "re-read settings, agents, skills, MCP config and the guides"),
     ("/help", "keys and commands"),
     ("/quit", "exit"),
@@ -1301,6 +1302,7 @@ impl Ui {
             }
             "/theme" => self.set_theme(arg),
             "/copy" => self.copy_last(),
+            "/dump" => self.dump(),
             "/jobs" => self.open_jobs(),
             "/remote" => {
                 self.remote_asked = true;
@@ -1422,6 +1424,28 @@ impl Ui {
         let text = self.app.session.lock().unwrap().context().iter().rev().find(|m| m.role == Role::Assistant && !m.text().is_empty()).map(|m| m.text());
         let Some(text) = text else { return self.notify("nothing to copy") };
         self.notify(if clipboard(&text) { "copied" } else { "no clipboard tool found" });
+    }
+
+    /// Nightly only: copy the running session and its subagent transcripts as Markdown.
+    fn dump(&mut self) {
+        if !crate::update::is_dev() {
+            return self.notify("/dump is only available on the nightly (dev) channel");
+        }
+        let (id, cwd) = {
+            let s = self.app.session.lock().unwrap();
+            (s.id.clone(), s.cwd.clone())
+        };
+        if id.is_empty() {
+            return self.notify("nothing to dump");
+        }
+        match crate::dump::markdown(&crate::session::dir_for(&cwd).join(format!("{id}.jsonl"))) {
+            Ok(md) if clipboard(&md) => self.notify(format!("session dumped to clipboard ({} bytes)", md.len())),
+            Ok(md) => {
+                copy_osc52(&md);
+                self.notify(format!("session dumped via OSC 52 ({} bytes)", md.len()));
+            }
+            Err(e) => self.notify(format!("dump failed: {e}")),
+        }
     }
 
     fn compact_now(&mut self) {
@@ -2075,7 +2099,7 @@ impl Ui {
         if !t.starts_with('/') || t.contains([' ', '\n']) {
             return vec![];
         }
-        COMMANDS.iter().filter(|(c, _)| c.starts_with(t)).collect()
+        COMMANDS.iter().filter(|(c, _)| c.starts_with(t) && (*c != "/dump" || crate::update::is_dev())).collect()
     }
 
     fn move_line(&mut self, dir: i32) {

@@ -18,11 +18,17 @@ pub fn run(target: Option<&str>) -> Result<()> {
         Some(t) => session::dir_for(&cwd).join(format!("{t}.jsonl")),
         None => session::list(&cwd).first().map(|i| i.path.clone()).context("no session in this directory")?,
     };
-    let mut out = String::new();
-    render(&path, 0, &mut HashSet::new(), &mut out)?;
+    let out = markdown(&path)?;
     crate::tui::copy_osc52(&out);
     eprintln!("session copied to clipboard ({} bytes)", out.len());
     Ok(())
+}
+
+/// The whole session file as Markdown, subagents included.
+pub fn markdown(path: &std::path::Path) -> Result<String> {
+    let mut out = String::new();
+    render(path, 0, &mut HashSet::new(), &mut out)?;
+    Ok(out)
 }
 
 fn indent(depth: usize, s: &str) -> String {
@@ -79,6 +85,18 @@ fn render(path: &std::path::Path, depth: usize, seen: &mut HashSet<PathBuf>, out
                         Block::Image { mime, data } => format!("**image** {mime} ({} bytes base64)\n", data.len()),
                     };
                     buf.push_str(&text);
+                    // The transcript path derives from the call id: found even when the task was interrupted before its report.
+                    if let Block::ToolCall { id, name, args, .. } = b
+                        && name == "task"
+                    {
+                        let p = crate::agent::sub_transcript(id);
+                        if p.exists() {
+                            nested.push(p);
+                        } else if let Some(prompt) = args.get("prompt").and_then(|v| v.as_str()) {
+                            // Older runs named the transcript with a random id: match it by its first message, the task's prompt.
+                            nested.extend(by_prompt(prompt));
+                        }
+                    }
                     if let Block::ToolResult { content: t, .. } | Block::Text { text: t } = b {
                         for p in transcripts(t) {
                             nested.push(p);
@@ -99,6 +117,18 @@ fn render(path: &std::path::Path, depth: usize, seen: &mut HashSet<PathBuf>, out
 /// Paths in `[transcript: <path>]` markers (the report footer of a `task` result).
 fn transcripts(text: &str) -> Vec<PathBuf> {
     text.split("[transcript: ").skip(1).filter_map(|r| r.split(']').next()).map(PathBuf::from).collect()
+}
+
+/// Subagent transcripts whose first user message is `prompt`.
+fn by_prompt(prompt: &str) -> Vec<PathBuf> {
+    use std::io::BufRead;
+    let Ok(rd) = std::fs::read_dir(crate::config::home().join("cache/subagents")) else { return vec![] };
+    rd.filter_map(|d| d.ok()).map(|d| d.path()).filter(|p| {
+        let Ok(f) = std::fs::File::open(p) else { return false };
+        std::io::BufReader::new(f).lines().skip(1).next().and_then(|l| l.ok()).and_then(|l| serde_json::from_str::<session::Entry>(&l).ok()).is_some_and(
+            |e| matches!(e.kind, Kind::Msg { msg, .. } if msg.role == Role::User && msg.text() == prompt),
+        )
+    }).collect()
 }
 
 #[cfg(test)]
