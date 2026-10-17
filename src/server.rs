@@ -97,6 +97,12 @@ pub async fn serve() -> Result<()> {
     Ok(())
 }
 
+/// One timestamped line in daemon.log (stderr): enough to see which requests reached the daemon when a client looks frozen.
+fn log(msg: &str) {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    eprintln!("[{t}] {msg}");
+}
+
 impl Server {
     async fn runtime_for(&self, cwd: &Path) -> Result<Runtime> {
         if let Some(r) = self.runtimes.lock().unwrap().get(cwd) {
@@ -223,7 +229,13 @@ impl Server {
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(rd).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(req) = serde_json::from_str::<Req>(&line) else { continue };
+                let req = match serde_json::from_str::<Req>(&line) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log(&format!("unreadable request ({e}): {}", line.chars().take(80).collect::<String>()));
+                        continue;
+                    }
+                };
                 if req_tx.send(req).is_err() {
                     break;
                 }
@@ -258,6 +270,7 @@ impl Server {
         let mut current: Option<Arc<Live>> = None;
         let mut forward: Option<tokio::task::JoinHandle<()>> = None;
         while let Some(req) = reqs.recv().await {
+            log(&format!("{} request {}", if local { "local" } else { "relay" }, format!("{req:?}").split(['(', ' ', '{']).next().unwrap_or("")));
             match req {
                 Req::Attach { target, cwd, agent, model } => {
                     if let Some(f) = forward.take() {
