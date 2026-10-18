@@ -144,9 +144,7 @@ fn viewing_only(cmd: &str) -> bool {
 
 pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let cmd = s(args, "command").context("command required")?.to_string();
-    if viewing_only(&cmd) {
-        return Ok(ToolOut::err("Use `read` (path, offset, limit) to view files and `grep` (pattern, path, glob, context) to search; several in one turn when independent. `bash` is for running things. Do not get around this with python, awk or another command."));
-    }
+    let viewing = viewing_only(&cmd);
     let effective = effective(&cmd, ctx).await;
     if super::b(args, "background") {
         let (run, cwd, timeout) = (effective.clone(), ctx.cwd.clone(), n(args, "timeout").map(Duration::from_secs));
@@ -192,6 +190,10 @@ pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     }
     if code != 0 {
         text.push_str(&format!("\n[exit {code}]"));
+    }
+    // A refusal cost a whole extra turn (full context resent) and the model kept retrying: run it, then point to the right tool.
+    if viewing {
+        text.push_str("\n[next time: `read` (path, offset, limit) to view files and `grep` to search, several in one turn]");
     }
     Ok(ToolOut { content: text, is_error: code != 0, display: (effective != cmd).then(|| format!("$ {effective}")) })
 }
