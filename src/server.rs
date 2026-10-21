@@ -182,6 +182,7 @@ impl Server {
         rt.jobs.on_change(move |l| {
             let _ = jobs_sink.send(Push::Jobs(l));
         });
+        let agent = agent.or(session.agent.as_deref());
         let mut turn = crate::make_turn(&rt, agent, model)?;
         if model.is_none()
             && let Some(m) = session.model_for(&turn.agent.name)
@@ -205,6 +206,7 @@ impl Server {
         let mut st = live.st.lock().unwrap();
         if let Some(a) = agent.and_then(|n| agents::find(&st.rt.agents, n).cloned()) {
             let pick = pick_of(live, &a.name);
+            let _ = live.session.lock().unwrap().set_agent(&a.name);
             switch_agent(&mut st, a, pick);
         }
         if let Some(m) = model {
@@ -609,6 +611,7 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
             let mut st = live.st.lock().unwrap();
             if let Some(a) = agents::find(&st.rt.agents, &name).cloned() {
                 let pick = pick_of(live, &a.name);
+                let _ = live.session.lock().unwrap().set_agent(&a.name);
                 switch_agent(&mut st, a, pick);
                 let _ = live.bus.send(meta(&st));
             } else {

@@ -62,6 +62,9 @@ fn render(path: &std::path::Path, depth: usize, seen: &mut HashSet<PathBuf>, out
             Kind::Model { agent, model } => {
                 let _ = writeln!(buf, "_model for {agent}: {}_\n", if model.is_empty() { "default" } else { model });
             }
+            Kind::Agent { agent } => {
+                let _ = writeln!(buf, "_mode: {agent}_\n");
+            }
             Kind::Prune { upto } => {
                 let _ = writeln!(buf, "_old tool outputs shortened up to `{upto}`_\n");
             }

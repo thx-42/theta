@@ -23,6 +23,8 @@ pub enum Kind {
     Leaf { target: String },
     /// Model picked by hand for `agent` in this conversation (empty = back to the agent's own setting).
     Model { agent: String, model: String },
+    /// Agent (mode) in use when the conversation was last left; restored on reopen.
+    Agent { agent: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +47,8 @@ pub struct Session {
     pub leaf: Option<String>,
     /// Model picked by hand per agent (lowercase agent name), replayed from `Kind::Model`.
     models: BTreeMap<String, String>,
+    /// Last agent selected in this conversation, replayed from `Kind::Agent`.
+    pub agent: Option<String>,
     written: bool,
     /// Called with every entry appended after construction (the daemon broadcasts them to attached clients).
     sink: Option<Box<dyn Fn(&Entry) + Send>>,
@@ -167,7 +171,7 @@ impl Session {
     pub fn new(cwd: &Path) -> Session {
         let id = new_id();
         let path = dir_for(cwd).join(format!("{id}.jsonl"));
-        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), written: false, sink: None };
+        let mut s = Session { id: id.clone(), path, cwd: cwd.to_path_buf(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), agent: None, written: false, sink: None };
         s.push_entry(Entry { id, parent: None, ts: now(), kind: Kind::Session { cwd: cwd.display().to_string() } });
         s.leaf = None;
         s
@@ -191,7 +195,7 @@ impl Session {
     }
 
     fn blank(path: &Path) -> Session {
-        Session { id: String::new(), path: path.to_path_buf(), cwd: PathBuf::new(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), written: true, sink: None }
+        Session { id: String::new(), path: path.to_path_buf(), cwd: PathBuf::new(), title: None, entries: vec![], index: HashMap::new(), leaf: None, models: BTreeMap::new(), agent: None, written: true, sink: None }
     }
 
     /// Replay one stored entry into the in-memory state. Idempotent per entry id.
@@ -207,6 +211,7 @@ impl Session {
             Kind::Title { title } => self.title = Some(title.clone()),
             Kind::Leaf { target } => self.leaf = (!target.is_empty()).then(|| target.clone()),
             Kind::Model { agent, model } => self.remember_model(agent, model),
+            Kind::Agent { agent } => self.agent = Some(agent.clone()),
             _ => self.leaf = Some(e.id.clone()),
         }
         self.push_entry(e);
@@ -280,6 +285,18 @@ impl Session {
         } else {
             self.models.insert(key, model.to_string());
         }
+    }
+
+    /// Remember `agent` as the conversation's current mode.
+    pub fn set_agent(&mut self, agent: &str) -> Result<()> {
+        if self.agent.as_deref() == Some(agent) {
+            return Ok(());
+        }
+        self.agent = Some(agent.to_string());
+        let leaf = self.leaf.clone();
+        self.append(Kind::Agent { agent: agent.to_string() }, false)?;
+        self.leaf = leaf;
+        Ok(())
     }
 
     /// Model picked by hand for `agent` in this conversation; it beats the agent's own settings.
