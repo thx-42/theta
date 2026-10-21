@@ -687,6 +687,8 @@ struct Ui {
     opened_tx: UnboundedSender<Opened>,
     /// Output of `!cmd` shell lines, already formatted for display.
     shell_tx: UnboundedSender<String>,
+    /// Working-tree snapshots taken off the UI loop: (session id, tree).
+    base_tx: UnboundedSender<(String, String)>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
     /// Tab under the mouse, and the marquee offset of its title.
@@ -983,9 +985,18 @@ impl Ui {
     }
 
     /// Remember the tree as it is when a run starts: `turn` diffs against it, `session` against the first one.
+    /// `git add -A` can take minutes on a big tree: it runs off the UI loop and lands in `set_diff_base`.
     fn take_diff_base(&mut self) {
-        let Ok(tree) = crate::diff::snapshot(&self.app.rt.cwd) else { return };
+        let (tx, cwd) = (self.base_tx.clone(), self.app.rt.cwd.clone());
         let id = self.app.session.lock().unwrap().id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(tree) = crate::diff::snapshot(&cwd) {
+                let _ = tx.send((id, tree));
+            }
+        });
+    }
+
+    fn set_diff_base(&mut self, id: String, tree: String) {
         let e = self.diff_base.entry(id).or_default();
         e.0.get_or_insert_with(|| tree.clone());
         e.1 = Some(tree);
@@ -4051,6 +4062,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     let (tab_tx, mut tab_rx) = unbounded_channel();
     let (opened_tx, mut opened_rx) = unbounded_channel();
     let (shell_tx, mut shell_rx) = unbounded_channel::<String>();
+    let (base_tx, mut base_rx) = unbounded_channel::<(String, String)>();
     theme::set(&rt.settings.theme);
     theme::set_bg(rt.settings.theme_bg);
     let turn = crate::make_turn(&rt, Some(&snap.agent), Some(&snap.model))?;
@@ -4108,6 +4120,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         tab_tx,
         opened_tx,
         shell_tx,
+        base_tx,
         strip: tabs::Strip::default(),
         hover: None,
         marquee: 0,
@@ -4217,6 +4230,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
             Some(o) = opened_rx.recv() => ui.tab_opened(o),
             Some(text) = shell_rx.recv() => ui.push(Item::Assistant { text, thinking: String::new(), done: true, agent: ui.app.turn.agent.name.clone() }),
             Some(m) = login_rx.recv() => ui.on_login(m),
+            Some((id, tree)) = base_rx.recv() => ui.set_diff_base(id, tree),
             _ = tick.tick() => {
                 arm = "tick";
                 t_arm = Instant::now();

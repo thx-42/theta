@@ -24,7 +24,9 @@ pub fn snapshot(cwd: &Path) -> Result<String, String> {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let idx = std::env::temp_dir().join(format!("theta-diff-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let i = Some(idx.as_path());
-    let r = git(cwd, &["read-tree", "HEAD"], i).and_then(|_| git(cwd, &["add", "-A"], i)).and_then(|_| git(cwd, &["write-tree"], i));
+    // Seeded from the real index, `add -A` reuses its stat cache instead of hashing every file.
+    let seeded = git(cwd, &["rev-parse", "--git-path", "index"], None).is_ok_and(|p| std::fs::copy(cwd.join(p), &idx).is_ok());
+    let r = if seeded { Ok(String::new()) } else { git(cwd, &["read-tree", "HEAD"], i) }.and_then(|_| git(cwd, &["add", "-A"], i)).and_then(|_| git(cwd, &["write-tree"], i));
     let _ = std::fs::remove_file(&idx);
     r
 }
@@ -61,6 +63,9 @@ mod tests {
         }
         std::fs::write(d.join("a.txt"), "one\n").unwrap();
         let base = snapshot(&d).unwrap();
+        // seeded from a real index (a.txt staged), the tree is still the working tree's
+        git(&d, &["add", "a.txt"], None).unwrap();
+        assert_eq!(snapshot(&d).unwrap(), base);
         std::fs::write(d.join("b.txt"), "two\n").unwrap();
         let t = diff(&d, "turn", None, Some(&base)).unwrap();
         assert!(t.contains("b.txt") && !t.contains("a.txt"));
