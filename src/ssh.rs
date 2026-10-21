@@ -47,6 +47,9 @@ struct Resp {
     /// hello and cd: the directory the host is now in.
     #[serde(default)]
     cwd: String,
+    /// hello: the host user's home, what `~/` means there.
+    #[serde(default)]
+    home: String,
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Resp>>>>;
@@ -76,6 +79,7 @@ pub struct Host {
     /// Version and platform of the helper.
     pub info: String,
     cwd: Mutex<String>,
+    home: String,
     prev: Mutex<String>,
     stdin: tokio::sync::Mutex<ChildStdin>,
     pending: Pending,
@@ -166,6 +170,7 @@ pub async fn connect(args: &[String], on_close: impl FnOnce() + Send + 'static) 
         name: args.join(" "),
         info: String::new(),
         cwd: Mutex::new(String::new()),
+        home: String::new(),
         prev: Mutex::new(String::new()),
         stdin: tokio::sync::Mutex::new(stdin),
         pending,
@@ -178,6 +183,7 @@ pub async fn connect(args: &[String], on_close: impl FnOnce() + Send + 'static) 
         Ok(Ok(r)) => {
             armed.store(true, Ordering::Relaxed);
             host.info = r.content;
+            host.home = r.home;
             *host.cwd.lock().unwrap() = r.cwd;
             Ok(host)
         }
@@ -248,10 +254,11 @@ pub fn closed(slot: &Slot) -> bool {
 /// Environment note for the system prompt.
 pub fn prompt_note(h: &Host) -> String {
     format!(
-        "# Remote host\nYour read, write, edit, ls, find, grep and bash tools run over SSH on `{}` ({}), not on the machine theta started on. Relative paths and the shell start in `{}`. Use read, grep, find and ls to look at files and edit to change them; bash is for running commands. Project instructions above come from the local machine; todo, web and plan tools stay local.",
+        "# Remote host\nYour read, write, edit, ls, find, grep and bash tools run over SSH on `{}` ({}), not on the machine theta started on. Relative paths and the shell start in `{}`. Home is `{}`, written `~/`: prefer relative paths or `~/` over the full path. Use read, grep, find and ls to look at files and edit to change them; bash is for running commands. Project instructions above come from the local machine; todo, web and plan tools stay local.",
         h.name,
         h.info.replace('\n', " "),
-        h.cwd()
+        h.cwd(),
+        h.home
     )
 }
 
@@ -308,6 +315,7 @@ async fn serve(req: Req, mut ctx: ToolCtx) -> Resp {
             id,
             content: format!("theta {} on {} {}", crate::update::VERSION, std::env::consts::OS, std::env::consts::ARCH),
             cwd: ctx.cwd.display().to_string(),
+            home: dirs::home_dir().unwrap_or_default().display().to_string(),
             ..Default::default()
         },
         "cd" => {
