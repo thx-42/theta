@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Todo {
+    /// Stable handle for `merge` updates; assigned when absent.
+    #[serde(default)]
+    pub id: String,
     pub content: String,
     /// pending | in_progress | done
     pub status: String,
@@ -83,8 +86,8 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old":{"type":"string"},"new":{"type":"string"}},"required":["old","new"]}}},"required":["path","edits"]})),
         def("bash", "Run a shell command in the project directory. Long output is truncated; the full log is saved to a file.",
             json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"seconds"},"background":{"type":"boolean","description":"Return a job id at once and keep running (servers, watchers, long builds); its end is reported later"}},"required":["command"]})),
-        def("job", "Manage background jobs (shell, lint, subagent). `action`: list; output (+ `id`, optional `tail` lines); kill (+ `id`); wait for subagent reports (`mode`: any = first end, default; all = none left).",
-            json!({"type":"object","properties":{"action":{"type":"string","enum":["list","output","kill","wait"]},"id":{"type":"string"},"tail":{"type":"integer"},"mode":{"type":"string","enum":["any","all"]},"timeout":{"type":"integer","description":"wait, seconds"}},"required":["action"]})),
+        def("job", "Manage background jobs (shell, lint, subagent). `action`: list; output (+ `id`, optional `tail` lines); kill (+ `id`); todos (+ `id`: a subagent's task list and progress); wait for subagent reports (`mode`: any = first end, default; all = none left).",
+            json!({"type":"object","properties":{"action":{"type":"string","enum":["list","output","kill","wait","todos"]},"id":{"type":"string"},"tail":{"type":"integer"},"mode":{"type":"string","enum":["any","all"]},"timeout":{"type":"integer","description":"wait, seconds"}},"required":["action"]})),
         def("grep", "Search file contents with a regex (respects .gitignore). Results grouped by file.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern"]})),
         def("find", "Find files by glob pattern (respects .gitignore), e.g. `**/*.rs`.",
@@ -93,8 +96,8 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"path":{"type":"string"}}})),
         def("write_plan", "Save this session's plan as markdown (one file per session, rewritten on each call).",
             json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]})),
-        def("todo", "Replace the task list for multi-step work: one item in_progress, mark items done as they finish.",
-            json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["todos"]})),
+        def("todo", "Living task list for multi-step work. Refine it as you learn: split vague items, add the edge cases and steps you discover, mark items done as they finish (one in_progress). Default replaces the whole list; `merge: true` updates items by `id` (content and status optional) and appends unknown ids, so one status flip needs one small item.",
+            json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}}}},"merge":{"type":"boolean"}},"required":["todos"]})),
         def("ask", "Ask the user a question and wait. Only when blocked on a decision that is the user's. `type`: choice (2-6 `options`), yes_no, or text.",
             json!({"type":"object","properties":{"question":{"type":"string"},"type":{"type":"string","enum":["choice","yes_no","text"]},"options":{"type":"array","items":{"type":"string"}}},"required":["question","type"]})),
         def("list_agents", "List the available agents with what each can and cannot do. Call before `handoff`.",
@@ -200,8 +203,9 @@ async fn job(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
         Some("list") => Ok(jobs_list(ctx)),
         Some("output") => job_output(args, ctx),
         Some("kill") => job_kill(args, ctx),
+        Some("todos") => job_todos(args, ctx),
         Some("wait") => wait(args, ctx, &|| false).await,
-        _ => anyhow::bail!("action must be list, output, kill or wait"),
+        _ => anyhow::bail!("action must be list, output, kill, todos or wait"),
     }
 }
 
@@ -227,7 +231,7 @@ fn jobs_list(ctx: &ToolCtx) -> ToolOut {
     if l.is_empty() {
         return ToolOut::ok("no jobs");
     }
-    ToolOut::ok(l.iter().map(|j| format!("{} {:?} [{}] {}s {}", j.id, j.kind, state_of(j.status), j.ended.unwrap_or(now).saturating_sub(j.started), j.label)).collect::<Vec<_>>().join("\n"))
+    ToolOut::ok(l.iter().map(|j| format!("{} {:?} [{}] {}s {}{}", j.id, j.kind, state_of(j.status), j.ended.unwrap_or(now).saturating_sub(j.started), j.label, progress(ctx, &j.id))).collect::<Vec<_>>().join("\n"))
 }
 
 /// `wait`: block on subagent jobs, then hand over the reports of the ones that ended.
@@ -263,16 +267,60 @@ pub async fn wait(args: &Value, ctx: &ToolCtx, interrupt: &(dyn Fn() -> bool + S
     Ok(ToolOut::ok(out))
 }
 
+fn job_todos(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
+    let id = s(args, "id").ok_or_else(|| anyhow::anyhow!("id required"))?;
+    let t = ctx.jobs.todos(id).ok_or_else(|| anyhow::anyhow!("no job `{id}`"))?;
+    Ok(ToolOut::ok(if t.is_empty() { "(no todo list yet)".into() } else { render_todos(&t) }))
+}
+
+/// "3/5 · now: step" for a job that keeps a todo list.
+fn progress(ctx: &ToolCtx, id: &str) -> String {
+    let t = ctx.jobs.todos(id).unwrap_or_default();
+    if t.is_empty() {
+        return String::new();
+    }
+    let now = t.iter().find(|x| x.status == "in_progress").map_or(String::new(), |x| format!(" · now: {}", x.content));
+    format!("  {}/{}{now}", t.iter().filter(|x| x.status == "done").count(), t.len())
+}
+
 fn job_kill(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
     let id = s(args, "id").ok_or_else(|| anyhow::anyhow!("id required"))?;
     Ok(if ctx.jobs.kill(id) { ToolOut::ok(format!("stopped job {id}")) } else { ToolOut::err(format!("no running job `{id}`")) })
 }
 
+#[derive(Deserialize)]
+struct TodoIn {
+    id: Option<String>,
+    content: Option<String>,
+    status: Option<String>,
+}
+
 fn todo(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
-    let todos: Vec<Todo> = serde_json::from_value(args.get("todos").cloned().unwrap_or(json!([])))?;
-    let rendered = render_todos(&todos);
-    *ctx.todos.lock().unwrap() = todos;
-    Ok(ToolOut::ok(rendered))
+    let items: Vec<TodoIn> = serde_json::from_value(args.get("todos").cloned().unwrap_or(json!([])))?;
+    let merge = args.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut list = ctx.todos.lock().unwrap();
+    let next = apply_todos(&list, items, merge)?;
+    *list = next;
+    Ok(ToolOut::ok(render_todos(&list)))
+}
+
+fn apply_todos(cur: &[Todo], items: Vec<TodoIn>, merge: bool) -> anyhow::Result<Vec<Todo>> {
+    let mut list = if merge { cur.to_vec() } else { Vec::new() };
+    for it in items {
+        let id = it.id.filter(|i| !i.is_empty());
+        match id.as_ref().and_then(|id| list.iter().position(|t| &t.id == id)).filter(|_| merge) {
+            Some(i) => {
+                if let Some(c) = it.content { list[i].content = c; }
+                if let Some(s) = it.status { list[i].status = s; }
+            }
+            None => {
+                let content = it.content.ok_or_else(|| anyhow::anyhow!("item {} needs `content`", id.as_deref().unwrap_or("?")))?;
+                let id = id.unwrap_or_else(|| (1..).map(|n| n.to_string()).find(|n| !list.iter().any(|t| &t.id == n)).unwrap());
+                list.push(Todo { id, content, status: it.status.unwrap_or_else(|| "pending".into()) });
+            }
+        }
+    }
+    Ok(list)
 }
 
 pub fn render_todos(todos: &[Todo]) -> String {
@@ -280,7 +328,7 @@ pub fn render_todos(todos: &[Todo]) -> String {
         .iter()
         .map(|t| {
             let mark = match t.status.as_str() { "done" => "[x]", "in_progress" => "[>]", _ => "[ ]" };
-            format!("{mark} {}", t.content)
+            format!("{mark} {} {}", t.id, t.content)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -289,6 +337,21 @@ pub fn render_todos(todos: &[Todo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ti(id: Option<&str>, content: Option<&str>, status: Option<&str>) -> TodoIn {
+        TodoIn { id: id.map(Into::into), content: content.map(Into::into), status: status.map(Into::into) }
+    }
+
+    #[test]
+    fn todo_replace_then_merge() {
+        let a = apply_todos(&[], vec![ti(None, Some("a"), Some("in_progress")), ti(None, Some("b"), Some("pending"))], false).unwrap();
+        assert_eq!((a[0].id.as_str(), a[1].id.as_str()), ("1", "2"));
+        let b = apply_todos(&a, vec![ti(Some("1"), None, Some("done")), ti(None, Some("edge case"), None)], true).unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!((b[0].status.as_str(), b[0].content.as_str()), ("done", "a"));
+        assert_eq!((b[2].id.as_str(), b[2].status.as_str()), ("3", "pending"));
+        assert!(apply_todos(&b, vec![ti(Some("9"), None, Some("done"))], true).is_err());
+    }
 
     #[test]
     fn truncates_middle() {

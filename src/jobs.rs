@@ -18,7 +18,7 @@ type OnChange = Arc<dyn Fn(Vec<JobInfo>) + Send + Sync>;
 
 /// Output buffer a job writes to while it runs.
 #[derive(Clone, Default)]
-pub struct Out(Arc<Mutex<String>>);
+pub struct Out(Arc<Mutex<String>>, pub Arc<Mutex<Vec<crate::tools::Todo>>>);
 
 impl Out {
     pub fn push(&self, s: &str) {
@@ -202,6 +202,12 @@ impl Jobs {
             self.agent_ended(agent);
         }
         found.is_some()
+    }
+
+    /// Todo list of subagent job `id` (empty for other jobs).
+    pub fn todos(&self, id: &str) -> Option<Vec<crate::tools::Todo>> {
+        let jobs = self.0.jobs.lock().unwrap();
+        Some(jobs.iter().find(|j| j.info.id == id)?.out.1.lock().unwrap().clone())
     }
 
     /// Output of job `id` (last `tail` lines when given) and whether it still runs.

@@ -132,7 +132,7 @@ impl Runtime {
             None => defs.retain(|d| !tools::OPT_IN.contains(&d.name.as_str()) && !(depth > 0 && d.name.starts_with("mcp__"))),
         }
         if depth > 0 {
-            defs.retain(|d| !matches!(d.name.as_str(), "todo" | "ask" | "handoff" | "list_agents")); // the todo panel and the user belong to the main agent
+            defs.retain(|d| !matches!(d.name.as_str(), "ask" | "handoff" | "list_agents")); // the user belongs to the main agent; a subagent keeps its own todo list, which the orchestrator reads with `job`
         }
         defs
     }
@@ -217,7 +217,7 @@ const REPORT_CAP: usize = 6000;
 /// Subagents (often a cheaper model) drift into workarounds when blocked; the orchestrator can unblock them, they cannot.
 const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing around it. Every tool call must move that step forward: no docs, refactors, cleanup, reviews of unrelated files or git unless the brief asks.\nWhen something stands in the way (a refused command, a missing tool or binary, missing access, credentials or a service, a check you cannot fix in two tries), do not work around it:\n- never build a replacement for a missing tool (your own parser, linter, interpreter binding, test harness, mock runtime);\n- never redo a refused command another way (python, awk, another shell command): use the tool the refusal names;\n- never search for passwords, keys or connection strings, and never change a live database or service the brief did not name (read-only MCP probes are fine);\n- never install packages unless the brief says so.\nInstead: finish what you can, mark the blocked check `not verified` with the reason, and report it as a blocker, or stop and ask (`questions:`). A blocker reported in one line is worth more to the orchestrator than an hour of workaround.";
 
-const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
+const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
 
 const CHECKPOINT_MSG: &str = "Checkpoint: stop calling tools now. Your next message is a handoff report for the orchestrator (up to 3000 characters): what is done, what is not done, files touched (path:line), what was verified and how, blockers, and the exact next step. Do not continue the work in this message.";
 
@@ -517,6 +517,10 @@ pub fn sub_transcript(id: &str) -> PathBuf {
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).context("prompt required")?;
     anyhow::ensure!(parent.depth == 0, "subagents cannot spawn subagents");
+    // Own todo list: the main one belongs to the orchestrator. Background jobs expose theirs through `job todos`.
+    let mut rt = rt.clone();
+    rt.todos = log.map(|l| l.1.clone()).unwrap_or_default();
+    let rt = &rt;
     let named = args.get("agent").is_some();
     let agent = match args.get("agent").and_then(|v| v.as_str()) {
         Some(name) => {
@@ -594,6 +598,10 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         None => answer,
     };
     let mut checks = String::new();
+    let open: Vec<String> = rt.todos.lock().unwrap().iter().filter(|t| t.status != "done").map(|t| t.content.clone()).collect();
+    if !open.is_empty() {
+        checks.push_str(&format!("\n[unfinished in its todo: {}]", open.join("; ")));
+    }
     if let Some(before) = before
         && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
             if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
