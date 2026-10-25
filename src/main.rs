@@ -24,6 +24,7 @@ mod ssh;
 mod tools;
 mod tui;
 mod types;
+mod info;
 mod update;
 mod usage;
 
@@ -33,8 +34,11 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "theta", version = update::VERSION, about = "θ — lightweight coding agent")]
+#[command(name = "theta", disable_version_flag = true, about = "θ — lightweight coding agent")]
 struct Cli {
+    /// Print version, channel (stable/nightly), build date and debugging details.
+    #[arg(short = 'V', long, alias = "info")]
+    version: bool,
     /// Prompt; with -p runs non-interactively and prints the answer.
     prompt: Vec<String>,
     /// Print mode: run once, print the final answer, exit.
@@ -197,6 +201,10 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.version {
+        info::print();
+        return Ok(());
+    }
     if cli.auto {
         cli.agent = Some("Auto".into());
     }
