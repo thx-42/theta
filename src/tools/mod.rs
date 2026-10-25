@@ -116,6 +116,18 @@ pub fn task_def(agents: &[String]) -> ToolDef {
         json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 words"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return a job id at once; the report arrives later"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent"}},"required":["description","prompt"]}))
 }
 
+/// Subagents only: the one way to hand back a report. The agent loop validates it and ends the run.
+pub fn report_def() -> ToolDef {
+    def("report", "Hand your final report to the orchestrator and end your run. Call it once the work is done, alone in its reply after your last tool results; nothing else you write reaches the orchestrator.",
+        json!({"type":"object","properties":{
+            "status":{"type":"string","enum":["done","partial","blocked"]},
+            "changes":{"type":"array","description":"Files you changed (empty if none). For a deleted file, say `deleted` in `what`.","items":{"type":"object","properties":{"path":{"type":"string"},"what":{"type":"string"}},"required":["path","what"]}},
+            "verification":{"type":"string","description":"Command run and its result"},
+            "findings":{"type":"array","description":"What you found; a reviewer writes one `path:line problem` per defect","items":{"type":"string"}},
+            "open_issues":{"type":"array","description":"What is left or blocking","items":{"type":"string"}}
+        },"required":["status"]}))
+}
+
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
     let p = if let Some(rest) = p.strip_prefix("~/") { dirs::home_dir().unwrap_or_default().join(rest) } else { PathBuf::from(p) };
     if p.is_absolute() { p } else { cwd.join(p) }

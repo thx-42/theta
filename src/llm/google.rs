@@ -62,6 +62,9 @@ pub async fn stream(
             .collect();
         body["tools"] = json!([{"functionDeclarations": decls}]);
     }
+    if let Some(name) = req.force_tool {
+        body["toolConfig"] = json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":[name]}});
+    }
     if req.model.reasoning {
         body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
     }

@@ -129,6 +129,7 @@ impl Runtime {
         }
         if depth > 0 {
             defs.retain(|d| !matches!(d.name.as_str(), "todo" | "ask" | "handoff" | "list_agents")); // the todo panel and the user belong to the main agent
+            defs.push(tools::report_def()); // whatever the `tools:` list: it is how a subagent ends
         }
         defs
     }
@@ -137,7 +138,7 @@ impl Runtime {
     pub async fn oneshot(&self, model_key: &str, system: &str, prompt: &str) -> Result<String> {
         let (p, m) = self.resolve(model_key)?;
         let msgs = [Msg::user(prompt)];
-        let req = Request { model: &m, system, messages: &msgs, tools: &[], effort: "low", session_id: "oneshot" };
+        let req = Request { model: &m, system, messages: &msgs, tools: &[], effort: "low", session_id: "oneshot", force_tool: None };
         let r = llm::complete(&self.http, &self.auth, &p, req, &mut |_| {}).await?;
         Ok(r.msg.text().trim().to_string())
     }
@@ -204,14 +205,81 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
     !texts.is_empty()
 }
 
-/// Appended to every subagent's system prompt: the orchestrator reads nothing but the last message.
 /// Hard cap (chars) on a subagent report; reviewers get room for a defect list.
-const REPORT_CAP: usize = 2000;
+const REPORT_CAP: usize = 3000;
 
-const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters, terse: what you did, files touched (path:line), verification (command and result), open issues. Never paste code or logs. A reviewer lists each defect on one line as `path:line problem`.";
+/// Appended to every subagent's system prompt: the orchestrator reads nothing but the `report` call.
+const REPORT_RULE: &str = "# Report\nYou are a subagent. End by calling `report`; the orchestrator reads nothing else, not your messages. Call it only when the work is done, with findings, never an announcement of what you will do. Keep it terse and within the size the orchestrator asked for (600 characters if it gave none, 3000 at most). Never paste code or logs.";
 
-/// Run until the model answers without tool calls. Appends everything to `session`.
-pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
+/// Rejected `report` calls after which the next one is taken as it is.
+const REPORT_TRIES: u8 = 3;
+
+/// Validate a `report` call and render it for the orchestrator. `Err` goes back to the subagent to fix.
+/// `remote`: paths live on the ssh host, not checked. `strict: false` (after repeated rejections) only renders.
+fn check_report(args: &Value, cwd: &std::path::Path, remote: bool, strict: bool) -> Result<String, String> {
+    let list = |k: &str| -> Vec<String> {
+        args.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default()
+    };
+    let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let verification = args.get("verification").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let changes: Vec<(String, String)> = args
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|c| (c["path"].as_str().unwrap_or("").trim().to_string(), c["what"].as_str().unwrap_or("").trim().to_string())).collect())
+        .unwrap_or_default();
+    let (findings, open) = (list("findings"), list("open_issues"));
+    if strict {
+        if !matches!(status, "done" | "partial" | "blocked") {
+            return Err("`status` must be done, partial or blocked".into());
+        }
+        if changes.is_empty() && findings.is_empty() && open.is_empty() && verification.is_empty() {
+            return Err("empty report: give your changes, findings, verification or open issues, not an announcement".into());
+        }
+        if status == "done" && !changes.is_empty() && verification.is_empty() {
+            return Err("you changed files: give the `verification` (command and result), or set status partial and say why in `open_issues`".into());
+        }
+        if status != "done" && open.is_empty() {
+            return Err(format!("status {status}: list what is left or blocking in `open_issues`"));
+        }
+        if !remote {
+            let missing: Vec<&str> = changes
+                .iter()
+                .filter(|(p, w)| p.is_empty() || (!tools::resolve(cwd, p).exists() && !w.to_lowercase().contains("delete")))
+                .map(|(p, _)| p.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!("these changed paths do not exist: {} (say `deleted` in `what` for a removed file)", missing.join(", ")));
+            }
+        }
+    }
+    let mut out = format!("status: {status}");
+    if !changes.is_empty() {
+        out.push_str("\nchanges:");
+        for (p, w) in &changes {
+            out.push_str(&format!("\n- {p}: {w}"));
+        }
+    }
+    if !verification.is_empty() {
+        out.push_str(&format!("\nverification: {verification}"));
+    }
+    for (title, items) in [("findings", &findings), ("open issues", &open)] {
+        if !items.is_empty() {
+            out.push_str(&format!("\n{title}:"));
+            for i in items {
+                out.push_str(&format!("\n- {i}"));
+            }
+        }
+    }
+    let n = out.chars().count();
+    if strict && n > REPORT_CAP {
+        return Err(format!("report is {n} chars, max {REPORT_CAP}: shorten it"));
+    }
+    Ok(out)
+}
+
+/// Run until the model answers without tool calls (a subagent: until it calls `report`). Appends everything to `session`.
+/// Returns the subagent's validated report, `None` if it never sent one.
+pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<Option<String>> {
     let (provider, model) = rt.resolve(&turn.model)?;
     let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
     let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra));
@@ -228,6 +296,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let ctx = rt.tool_ctx(&session_id);
     let mut overflow_retry = false;
     let mut nudges = 0u8;
+    let mut report_nudges = 0u8;
+    let mut report_rejects = 0u8;
+    let mut force_tool = None;
     let mut compact_failed = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
@@ -245,7 +316,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         }
         let mut msgs = session.lock().unwrap().context();
         repair(&mut msgs);
-        let req = Request { model: &model, system: &system, messages: &msgs, tools: &tools, effort: &turn.effort, session_id: &session_id };
+        let req = Request { model: &model, system: &system, messages: &msgs, tools: &tools, effort: &turn.effort, session_id: &session_id, force_tool: force_tool.take() };
         let txd = tx.clone();
         let mut on = move |d: Delta| {
             let _ = txd.send(match d {
@@ -291,6 +362,15 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                     continue;
                 }
             }
+            // A subagent that stops without `report` ("je génère la synthèse") is sent back twice, the second time forced to call it.
+            if turn.depth > 0 && report_nudges < 2 {
+                report_nudges += 1;
+                if report_nudges == 2 {
+                    force_tool = Some("report");
+                }
+                session.lock().unwrap().add_msg(Msg::user("You stopped without calling `report`. If the work is done, call `report` now with your findings; otherwise continue the work."), None)?;
+                continue;
+            }
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
             if turn.depth == 0 && turn.agent.delegate_all && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
                 nudges += 1;
@@ -305,11 +385,41 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
             break;
         }
+        let mut report = None;
+        let mut checked = std::collections::HashMap::new();
+        // Checked before the other calls run: a `report` next to them would claim results it has not seen yet.
+        let alone = calls.len() == 1;
+        for (id, name, args) in &calls {
+            if turn.depth > 0 && name == "report" && report.is_none() {
+                let strict = report_rejects < REPORT_TRIES;
+                let checked_report = if strict && !alone {
+                    Err("call `report` alone in its reply, once you have the results of your other tools".into())
+                } else {
+                    check_report(args, &ctx.cwd, ctx.ssh.get().is_some(), strict)
+                };
+                let out = match checked_report {
+                    Ok(r) => {
+                        report = Some(r);
+                        tools::ToolOut::ok("Report received.")
+                    }
+                    Err(e) => {
+                        report_rejects += 1;
+                        tools::ToolOut::err(format!("report rejected: {e}"))
+                    }
+                };
+                checked.insert(id.clone(), out);
+            }
+        }
         let futs = calls.into_iter().map(|(id, name, args)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
+            let checked = checked.remove(&id);
             async move {
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
+                let out = if let Some(out) = checked {
+                    out
+                } else if name == "report" {
+                    tools::ToolOut::err(if turn.depth > 0 { "one `report` per reply" } else { "`report` is for subagents" })
+                } else if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -336,8 +446,11 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         });
         let results = futures::future::join_all(futs).await;
         session.lock().unwrap().add_msg(Msg { role: Role::User, content: results, model: None }, None)?;
+        if report.is_some() {
+            return Ok(report);
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// `ask` tool: show the question to the user and wait. A free-text answer is always allowed.
@@ -456,13 +569,17 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     });
     let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
     let _ = forward.await;
-    res?;
-    let answer = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
-    // The 600-char rule is only a prompt: cap what actually enters the orchestrator's context.
-    let answer = match answer.char_indices().nth(REPORT_CAP) {
-        _ if answer.is_empty() => "(subagent returned no text)".into(),
-        Some((i, _)) => format!("{}… [report cut, see transcript]", &answer[..i]),
-        None => answer,
+    let answer = match res? {
+        Some(report) => report,
+        // Never called `report`: fall back to its last words, capped (the report rule is only a prompt here).
+        None => {
+            let text = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
+            match text.char_indices().nth(REPORT_CAP) {
+                _ if text.trim().is_empty() => "[no report: the subagent returned no text]".into(),
+                Some((i, _)) => format!("[no report tool call]\n{}… [cut, see transcript]", &text[..i]),
+                None => format!("[no report tool call]\n{text}"),
+            }
+        }
     };
     Ok(tools::ToolOut::ok(format!("{answer}\n[transcript: {transcript}]")))
 }
@@ -499,6 +616,24 @@ mod tests {
         let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
         assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
         assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
+    }
+
+    #[test]
+    fn reports_are_validated() {
+        let cwd = std::env::current_dir().unwrap();
+        let check = |v: Value| check_report(&v, &cwd, false, true);
+        // an announcement is not a report
+        assert!(check(json!({"status":"done"})).is_err());
+        assert!(check(json!({"status":"maybe","findings":["x"]})).is_err());
+        // changes need a verification, an unfinished status needs open issues
+        assert!(check(json!({"status":"done","changes":[{"path":"src/agent.rs","what":"x"}]})).is_err());
+        assert!(check(json!({"status":"partial","findings":["x"]})).is_err());
+        assert!(check(json!({"status":"done","changes":[{"path":"src/nope.rs","what":"x"}],"verification":"ok"})).is_err());
+        assert!(check(json!({"status":"done","findings":["x".repeat(REPORT_CAP)]})).is_err());
+        let ok = check(json!({"status":"done","changes":[{"path":"src/agent.rs","what":"fix"},{"path":"src/gone.rs","what":"deleted"}],"verification":"cargo test: ok"})).unwrap();
+        assert_eq!(ok, "status: done\nchanges:\n- src/agent.rs: fix\n- src/gone.rs: deleted\nverification: cargo test: ok");
+        // after repeated rejections the report is taken as it is
+        assert_eq!(check_report(&json!({"status":"done"}), &cwd, false, false).unwrap(), "status: done");
     }
 
     #[test]
