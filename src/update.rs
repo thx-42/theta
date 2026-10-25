@@ -22,6 +22,11 @@ pub fn is_dev() -> bool {
     CHANNEL == "dev"
 }
 
+/// True for CI/installer builds (tag baked in), false for local builds.
+pub fn is_release() -> bool {
+    TAG.is_some()
+}
+
 pub const VERSION: &str = match TAG {
     Some(t) => t,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -51,7 +56,7 @@ impl Ink {
     }
 }
 
-fn repo() -> String {
+pub fn repo() -> String {
     std::env::var("THETA_REPO").unwrap_or_else(|_| "thx-42/theta".into())
 }
 
