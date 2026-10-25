@@ -123,7 +123,11 @@ pub async fn stream(
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if req.model.reasoning {
+    // A forced tool call is refused with thinking on: that one turn runs without it.
+    if let Some(name) = req.force_tool {
+        let name = if oauth { cc_name(name) } else { name.to_string() };
+        body["tool_choice"] = json!({"type":"tool","name":name});
+    } else if req.model.reasoning {
         let (major, minor) = version(&req.model.id);
         if (major, minor) >= (4, 6) {
             let effort = if (major, minor) < (4, 7) && req.effort == "xhigh" { "high" } else { req.effort };

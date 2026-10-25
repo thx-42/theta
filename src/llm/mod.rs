@@ -19,6 +19,8 @@ pub struct Request<'a> {
     pub tools: &'a [ToolDef],
     pub effort: &'a str,
     pub session_id: &'a str,
+    /// Make the model answer with this tool call (a subagent that would not `report`).
+    pub force_tool: Option<&'a str>,
 }
 
 pub struct Response {

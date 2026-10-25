@@ -72,6 +72,9 @@ pub async fn stream(
             .map(|t| json!({"type":"function","name":t.name,"description":t.description,"parameters":t.schema}))
             .collect();
     }
+    if let Some(name) = req.force_tool {
+        body["tool_choice"] = json!({"type":"function","name":name});
+    }
     if req.model.reasoning {
         let effort = match req.effort { "max" => "xhigh", e => e };
         body["reasoning"] = json!({"effort": effort, "summary": "auto"});

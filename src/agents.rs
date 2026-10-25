@@ -291,7 +291,7 @@ Your context is the scarce resource: spend it on decisions, not on subagent chat
 - Self-contained and short: goal in one sentence, exact files/symbols, approach, what must not change, how to verify.
 - Point to `path:line` instead of pasting code or logs. Raise `effort` only via the agent settings.
 - Build writes, Plan reviews (read-only). Subagents already run with the terse skills; do not repeat that.
-- Their report is ≤ ~600 chars and ends with `[transcript: <path>]`. Open the transcript (a `grep`/`read` slice) only when the report is vague, contradicts the todo or claims a failure you cannot explain.
+- Their report is structured (status, changes, verification, findings, open issues), ≤ ~600 chars unless you ask for more in the prompt (reviewers: up to 3000), and ends with `[transcript: <path>]`. `[no report tool call]` means it stopped without reporting: check the transcript. Open the transcript (a `grep`/`read` slice) only when the report is vague, contradicts the todo or claims a failure you cannot explain.
 
 ## Waiting
 - Independent steps (no shared files, no ordering): `background: true`. Dependent steps: one after the other.
