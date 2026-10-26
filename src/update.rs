@@ -139,13 +139,16 @@ async fn latest_tag(http: &reqwest::Client) -> Result<String> {
         let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
         return newest_release(&v).context("no release published yet");
     }
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
+    // Stable: newest release that is not a nightly (`dev-…` tags are also marked Latest on GitHub).
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
     let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
-    if r.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("no release published on github.com/{} yet", repo());
-    }
-    let v: serde_json::Value = r.error_for_status()?.json().await?;
-    v["tag_name"].as_str().map(String::from).context("release without a tag")
+    let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
+    v.iter()
+        .filter(|r| r["draft"] != true)
+        .filter_map(|r| r["tag_name"].as_str())
+        .find(|t| !t.starts_with("dev-"))
+        .map(String::from)
+        .context("no stable release published on github.com yet")
 }
 
 fn mb(n: u64) -> String {
