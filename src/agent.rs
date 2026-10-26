@@ -391,6 +391,10 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                         out.content = format!("{t}\n[cut to {cap} lines: you are the orchestrator — have a subagent read or run larger things and report conclusions]");
                     }
                 }
+                // Auto's plan is a working document: tell it what the plan's state calls for next, never to stop.
+                if name == "write_plan" && !out.is_error && turn.depth == 0 && turn.agent.delegate_all {
+                    out.content = format!("{}. {}", out.content, plan_next_step(&tools::fs::open_questions(&ctx.session_id)));
+                }
                 if name == "todo" {
                     let _ = tx.send(Event::Todos(ctx.todos.lock().unwrap().clone()));
                 }
@@ -448,6 +452,17 @@ fn writes_files(rt: &Runtime, parent: &Turn, args: &Value) -> bool {
         None => Some(&parent.agent),
     };
     agent.is_some_and(|a| !agents::is_readonly(a))
+}
+
+/// What Auto does after `write_plan`: settle what is still open, or build, check and review. Never end the turn.
+fn plan_next_step(open: &[String]) -> String {
+    if open.is_empty() {
+        return "The plan is ready, not delivered: start the Builds now, in this turn, follow their reports, then run the Review and Deliver phases.".into();
+    }
+    format!(
+        "The plan is not ready yet. Still open:\n{}\nSettle each one now, in this turn: an Explore or an MCP test for facts, `ask` for what only the user can decide. Then rewrite the plan with the answers.",
+        open.join("\n")
+    )
 }
 
 /// `task` with `background`: run the subagent as a job and return its id at once; the report comes back as a message.
@@ -639,6 +654,14 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn plan_next_step_follows_open_questions() {
+        let open = plan_next_step(&["Q1 does RegisterNpc return a key? → MCP test".into()]);
+        assert!(open.contains("not ready") && open.contains("Q1 does RegisterNpc") && open.contains("`ask`"));
+        let ready = plan_next_step(&[]);
+        assert!(ready.contains("start the Builds") && ready.contains("Review"));
+    }
 
     #[test]
     fn old_job_tool_names_allow_job() {
