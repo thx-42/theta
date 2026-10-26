@@ -4333,6 +4333,26 @@ mod tests {
     }
 
     #[test]
+    fn move_row_follows_wrapped_rows() {
+        let mut e = super::Editor { text: "abcdefghij".into(), cur: 6 };
+        assert!(e.move_row(-1, 4));
+        assert_eq!(e.cur, 2);
+        assert!(!e.move_row(-1, 4));
+        let mut e = super::Editor { text: "abcdefghij".into(), cur: 1 };
+        assert!(e.move_row(1, 4));
+        assert_eq!(e.cur, 5);
+        assert!(e.move_row(1, 4));
+        assert_eq!(e.cur, 9);
+        assert!(!e.move_row(1, 4));
+        let mut e = super::Editor { text: "ab\ncdef\ng".into(), cur: 5 };
+        assert!(e.move_row(-1, 40));
+        assert_eq!(e.cur, 2);
+        assert!(e.move_row(1, 40));
+        assert!(e.move_row(1, 40));
+        assert_eq!(e.cur, 9);
+    }
+
+    #[test]
     fn agent_colors_are_stable_and_distinct() {
         use super::theme::color_for;
         assert_eq!(color_for("Build"), color_for("build"));
