@@ -89,8 +89,9 @@ latest_release() {
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
       sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | awk -F- '{print $NF, $0}' | sort -rn | head -n1 | cut -d' ' -f2
   else
-    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
+    # stable: newest release that is not a nightly (dev- tags are now also marked Latest)
+    curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
+      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | grep -v '^dev-' | head -n1
   fi
 }
 

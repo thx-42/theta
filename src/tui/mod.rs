@@ -3464,6 +3464,20 @@ pub(crate) fn set_window_title(title: &str) {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
 }
 
+/// "θ", then how many sessions work and how many finished (or wait for an answer) in the background.
+fn title_for(running: bool, background: &[TabStatus]) -> String {
+    let working = usize::from(running) + background.iter().filter(|s| **s == TabStatus::Working).count();
+    let finished = background.iter().filter(|s| matches!(s, TabStatus::Done | TabStatus::Error)).count();
+    let mut parts = vec!["θ".to_string()];
+    if working > 0 {
+        parts.push(format!("{working} working"));
+    }
+    if finished > 0 {
+        parts.push(format!("{finished} finished"));
+    }
+    parts.join(" · ")
+}
+
 /// Copy via OSC 52: the local terminal's clipboard, also over SSH.
 pub(crate) fn copy_osc52(text: &str) {
     let b64 = base64::engine::general_purpose::STANDARD.encode(text);
@@ -3509,20 +3523,10 @@ fn teardown() {
 }
 
 impl Ui {
-    /// Window title: sessions working in the background and the ones finished (or asking) waiting for a look.
-    /// The active tab is left out: its state is live in `Ui`, and reading it is `running` only.
+    /// Window title: the active tab's run is live in `Ui`, the other tabs carry their status.
     fn window_title(&self) -> String {
-        let background = self.tabs.iter().enumerate().filter(|(i, _)| *i != self.cur).map(|(_, t)| t.status);
-        let working = usize::from(self.running) + background.clone().filter(|s| *s == TabStatus::Working).count();
-        let finished = background.filter(|s| matches!(s, TabStatus::Done | TabStatus::Error)).count();
-        let mut parts = vec!["θ".to_string()];
-        if working > 0 {
-            parts.push(format!("{working} working"));
-        }
-        if finished > 0 {
-            parts.push(format!("{finished} finished"));
-        }
-        parts.join(" · ")
+        let background: Vec<TabStatus> = self.tabs.iter().enumerate().filter(|(i, _)| *i != self.cur).map(|(_, t)| t.status).collect();
+        title_for(self.running, &background)
     }
 
     fn title_now(&self) -> String {
@@ -4409,5 +4413,14 @@ mod tests {
     fn paste_keeps_newlines_drops_control_chars() {
         use super::normalize_paste;
         assert_eq!(normalize_paste("a\r\nb\rc\td\x1b[0m"), "a\nb\nc    d[0m");
+    }
+
+    #[test]
+    fn window_title_counts_working_and_finished_sessions() {
+        use super::{TabStatus::*, title_for};
+        assert_eq!(title_for(false, &[Idle, Idle]), "θ");
+        assert_eq!(title_for(true, &[]), "θ · 1 working");
+        assert_eq!(title_for(true, &[Working, Done, Error, Idle]), "θ · 2 working · 2 finished");
+        assert_eq!(title_for(false, &[Working, Done]), "θ · 1 working · 1 finished");
     }
 }
