@@ -112,7 +112,7 @@ pub fn write_plan(args: &Value, session_id: &str) -> Result<ToolOut> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{session_id}.md"));
     std::fs::write(&path, content)?;
-    let mut out = ToolOut::ok(format!("wrote plan {}. The plan is not the deliverable: continue with the next phase now, in this turn.", path.display()));
+    let mut out = ToolOut::ok(format!("wrote plan {}", path.display()));
     out.display = Some(content.to_string());
     Ok(out)
 }
