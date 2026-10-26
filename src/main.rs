@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Parser)]
 #[command(name = "theta", disable_version_flag = true, about = "θ — lightweight coding agent")]
 struct Cli {
-    /// Print version, channel (stable/nightly), build date and debugging details.
+    /// Print version, mode (stable/dev), build date and debugging details.
     #[arg(short = 'V', long, alias = "info")]
     version: bool,
     /// Prompt; with -p runs non-interactively and prints the answer.
@@ -80,6 +80,8 @@ enum Cmd {
     /// Serve tool calls over stdin/stdout for `/ssh` (started on the server by theta itself).
     #[command(hide = true)]
     SshAgent,
+    /// Show or switch the mode: `theta channel dev` adds nightly releases to the updates.
+    Channel { name: Option<String> },
     /// Check for a newer release and install it.
     Update {
         /// Only report whether a newer version exists.
@@ -202,6 +204,9 @@ async fn main() -> Result<()> {
     if let Some(Cmd::SshAgent) = &cli.cmd {
         return ssh::agent().await;
     }
+    if let Some(Cmd::Channel { name }) = &cli.cmd {
+        return update::channel(name.as_deref());
+    }
     if let Some(Cmd::Update { check, force }) = &cli.cmd {
         return update::run(*check, *force).await;
     }
@@ -286,7 +291,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::Refresh) => return catalog::refresh().await,
-        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::SshAgent) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::Channel { .. } | Cmd::SshAgent) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");
