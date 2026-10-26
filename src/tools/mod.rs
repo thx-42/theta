@@ -120,7 +120,7 @@ pub fn task_def(agents: &[String]) -> ToolDef {
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {
-    let p = if let Some(rest) = p.strip_prefix("~/") { dirs::home_dir().unwrap_or_default().join(rest) } else { PathBuf::from(p) };
+    let p = if p == "~" { dirs::home_dir().unwrap_or_default() } else if let Some(rest) = p.strip_prefix("~/") { dirs::home_dir().unwrap_or_default().join(rest) } else { PathBuf::from(p) };
     if p.is_absolute() { p } else { cwd.join(p) }
 }
 

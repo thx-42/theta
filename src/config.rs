@@ -17,6 +17,28 @@ pub fn home() -> PathBuf {
 }
 
 /// Project root: nearest ancestor holding `.theta` or `.git`, else cwd.
+/// The directory theta was started from, as the shell shows it: `$PWD` when it names the
+/// same directory as the process cwd (symlinks and bind mounts kept), else the resolved path.
+pub fn logical_cwd() -> std::io::Result<PathBuf> {
+    let real = std::env::current_dir()?;
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
+        && pwd.is_absolute()
+        && std::fs::canonicalize(&pwd).ok() == std::fs::canonicalize(&real).ok()
+    {
+        return Ok(pwd);
+    }
+    Ok(real)
+}
+
+/// `path` with the home directory written `~`.
+pub fn tilde(path: &Path) -> String {
+    match dirs::home_dir().and_then(|h| path.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(r) if r.as_os_str().is_empty() => "~".into(),
+        Some(r) => format!("~/{}", r.display()),
+        None => path.display().to_string(),
+    }
+}
+
 pub fn project_root(cwd: &Path) -> PathBuf {
     let home_dir = dirs::home_dir();
     for dir in cwd.ancestors() {
@@ -581,5 +603,18 @@ mod sync_tests {
         assert_eq!(std::fs::read_to_string(dir.join("Plan.md.bak")).unwrap(), "mine");
         assert!(!dir.join("Plan.md.new").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod logical_tests {
+    use super::*;
+
+    #[test]
+    fn tilde_abbreviates_home() {
+        let h = dirs::home_dir().unwrap();
+        assert_eq!(tilde(&h), "~");
+        assert_eq!(tilde(&h.join("resources")), "~/resources");
+        assert_eq!(tilde(Path::new("/elsewhere")), "/elsewhere");
     }
 }

@@ -3052,7 +3052,7 @@ impl Ui {
         out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
         out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));
         out.push(Line::from(vec![Span::styled("  model  ", theme::dim()), Span::raw(self.app.turn.model.clone())]));
-        out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(self.app.rt.cwd.display().to_string())]));
+        out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(crate::config::tilde(&self.app.rt.cwd))]));
         if let Some(s) = &self.ssh {
             out.push(Line::from(vec![Span::styled("  ssh    ", theme::dim()), Span::raw(format!("{}:{}", s.host, s.cwd))]));
         }
@@ -3459,6 +3459,11 @@ fn normalize_paste(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ").chars().filter(|c| *c == '\n' || !c.is_control()).collect()
 }
 
+/// Terminal window title (OSC 2): the state of the sessions, read from the tab or window bar.
+pub(crate) fn set_window_title(title: &str) {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
+}
+
 /// Copy via OSC 52: the local terminal's clipboard, also over SSH.
 pub(crate) fn copy_osc52(text: &str) {
     let b64 = base64::engine::general_purpose::STANDARD.encode(text);
@@ -3493,16 +3498,33 @@ fn ago(secs: u64) -> String {
 
 fn setup() -> ratatui::DefaultTerminal {
     let t = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
+    // Save the window title (xterm title stack) so the shell gets its own back on exit.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x1b[22;2t"), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
     t
 }
 
 fn teardown() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x1b[23;2t"), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 }
 
 impl Ui {
+    /// Window title: sessions working in the background and the ones finished (or asking) waiting for a look.
+    /// The active tab is left out: its state is live in `Ui`, and reading it is `running` only.
+    fn window_title(&self) -> String {
+        let background = self.tabs.iter().enumerate().filter(|(i, _)| *i != self.cur).map(|(_, t)| t.status);
+        let working = usize::from(self.running) + background.clone().filter(|s| *s == TabStatus::Working).count();
+        let finished = background.filter(|s| matches!(s, TabStatus::Done | TabStatus::Error)).count();
+        let mut parts = vec!["θ".to_string()];
+        if working > 0 {
+            parts.push(format!("{working} working"));
+        }
+        if finished > 0 {
+            parts.push(format!("{finished} finished"));
+        }
+        parts.join(" · ")
+    }
+
     fn title_now(&self) -> String {
         let t = self.app.session.lock().unwrap().title.clone();
         t.or_else(|| self.items.iter().find_map(|i| if let Item::User(t) = i { Some(t.clone()) } else { None })).unwrap_or_default()
@@ -4154,6 +4176,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
     if let Some(p) = initial {
         ui.send(p, vec![]);
     }
+    let mut shown_title = String::new();
     loop {
         let t_draw = Instant::now();
         let done = term.draw(|f| {
@@ -4161,6 +4184,11 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
             ui.sel_highlight(f.buffer_mut());
         })?;
         ui.frame = done.buffer.clone();
+        let title = ui.window_title();
+        if title != shown_title {
+            set_window_title(&title);
+            shown_title = title;
+        }
         stall_log("draw", t_draw);
         let mut arm = "input";
         let mut t_arm = Instant::now();

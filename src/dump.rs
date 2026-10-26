@@ -12,7 +12,7 @@ pub fn run(target: Option<&str>) -> Result<()> {
     if !crate::update::is_dev() {
         bail!("`theta dump` is only available on the nightly (dev) channel");
     }
-    let cwd = std::env::current_dir()?;
+    let cwd = crate::config::logical_cwd()?;
     let path = match target {
         Some(t) if PathBuf::from(t).exists() => PathBuf::from(t),
         Some(t) => session::dir_for(&cwd).join(format!("{t}.jsonl")),

@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     if let Some(Cmd::Dump { session }) = &cli.cmd {
         return dump::run(session.as_deref());
     }
-    let cwd = std::env::current_dir()?;
+    let cwd = config::logical_cwd()?;
     let rt = build_runtime(cwd.clone()).await?;
     match cli.cmd {
         Some(Cmd::Login { provider }) => {

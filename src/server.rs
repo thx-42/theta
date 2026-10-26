@@ -72,7 +72,7 @@ pub async fn serve() -> Result<()> {
     if let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         tokio::spawn(async move { while hup.recv().await.is_some() {} });
     }
-    let base = crate::build_runtime(std::env::current_dir()?).await?;
+    let base = crate::build_runtime(crate::config::logical_cwd()?).await?;
     let mcp = base.mcp.clone();
     tokio::spawn(async move { mcp.connect_all().await });
     let srv = Arc::new(Server {

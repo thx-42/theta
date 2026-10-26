@@ -309,7 +309,7 @@ pub async fn agent() -> Result<()> {
 async fn serve(req: Req, mut ctx: ToolCtx) -> Resp {
     let id = req.id;
     let fail = |m: String| Resp { id, content: m, is_error: true, ..Default::default() };
-    ctx.cwd = if req.cwd.is_empty() { std::env::current_dir().unwrap_or_default() } else { PathBuf::from(&req.cwd) };
+    ctx.cwd = if req.cwd.is_empty() { crate::config::logical_cwd().unwrap_or_default() } else { PathBuf::from(&req.cwd) };
     match req.op.as_str() {
         "hello" => Resp {
             id,
