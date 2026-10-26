@@ -85,9 +85,9 @@ detect_target() {
 
 latest_release() {
   if [[ "$CHANNEL" == dev ]]; then
-    # dev sees stable and nightly alike: highest run number (suffix after the last dash) wins
+    # newest nightly (dev- tag, built from the dev branch): releases are listed newest first
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
-      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | awk -F- '{print $NF, $0}' | sort -rn | head -n1 | cut -d' ' -f2
+      sed -n 's/.*"tag_name": *"\(dev-[^"]*\)".*/\1/p' | head -n1
   else
     # stable: newest release that is not a nightly (dev- tags are now also marked Latest)
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
