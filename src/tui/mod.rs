@@ -614,6 +614,19 @@ impl Editor {
         let lines = rows.iter().map(|&(s, e)| self.text[s..e].to_string()).collect();
         (lines, (row, col))
     }
+    /// Move the cursor one wrapped row up/down, keeping its column. False when already on the first/last row.
+    fn move_row(&mut self, dir: i32, width: usize) -> bool {
+        let (lines, (row, col)) = self.layout(width);
+        let Some(target) = row.checked_add_signed(dir as isize).filter(|&r| r < lines.len()) else { return false };
+        let mut cur = self.at(width, target, col);
+        // A wrapped row ends where the next one starts: stay on this row.
+        let wrapped = self.rows(width.max(4)).get(target + 1).is_some_and(|&(s, _)| s == cur) && !self.text[..cur].ends_with('\n');
+        if wrapped {
+            cur = self.text[..cur].char_indices().next_back().map_or(0, |(i, _)| i);
+        }
+        self.cur = cur;
+        true
+    }
 }
 
 struct Ui {
@@ -631,6 +644,7 @@ struct Ui {
     scroll_top: Option<usize>,
     last_total: usize,
     last_view: usize,
+    input_w: usize,
     remote: Remote,
     /// A run (turn, compaction or side question) is active in the daemon.
     running: bool,
@@ -2016,8 +2030,8 @@ impl Ui {
             KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => self.scroll(-3),
             KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => self.scroll(3),
             KeyCode::Up => {
-                if self.input.text.contains('\n') {
-                    return self.move_line(-1);
+                if self.input.move_row(-1, self.input_w) || self.input.text.contains('\n') {
+                    return;
                 }
                 if self.history.is_empty() {
                     return;
@@ -2030,8 +2044,8 @@ impl Ui {
                 self.input.set(self.history[i].clone());
             }
             KeyCode::Down => {
-                if self.input.text.contains('\n') {
-                    return self.move_line(1);
+                if self.input.move_row(1, self.input_w) || self.input.text.contains('\n') {
+                    return;
                 }
                 match self.hist {
                     Some(i) if i + 1 < self.history.len() => {
@@ -2112,21 +2126,6 @@ impl Ui {
             return vec![];
         }
         COMMANDS.iter().filter(|(c, _)| c.starts_with(t) && (*c != "/dump" || crate::update::is_dev())).collect()
-    }
-
-    fn move_line(&mut self, dir: i32) {
-        let before = &self.input.text[..self.input.cur];
-        let col = before.len() - before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        if dir < 0 {
-            let Some(prev_end) = before.rfind('\n') else { return };
-            let prev_start = self.input.text[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            self.input.cur = self.input.text.floor_char_boundary((prev_start + col).min(prev_end));
-        } else {
-            let Some(off) = self.input.text[self.input.cur..].find('\n') else { return };
-            let next_start = self.input.cur + off + 1;
-            let next_end = self.input.text[next_start..].find('\n').map(|i| next_start + i).unwrap_or(self.input.text.len());
-            self.input.cur = self.input.text.floor_char_boundary((next_start + col).min(next_end));
-        }
     }
 
     fn scroll(&mut self, delta: i64) {
@@ -2822,7 +2821,8 @@ impl Ui {
         let margin = if area.width >= 60 { 2 } else { 1 };
         let main = Rect { x: area.x + margin, width: area.width.saturating_sub(2 * margin), ..area };
         let width = main.width as usize;
-        let (input_lines, cursor) = self.input.layout(width.saturating_sub(2));
+        self.input_w = width.saturating_sub(2);
+        let (input_lines, cursor) = self.input.layout(self.input_w);
         let chips = u16::from(!self.images.is_empty());
         let input_h = input_lines.len().min(8) as u16 + chips + 2;
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
@@ -4080,6 +4080,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         scroll_top: None,
         last_total: 0,
         last_view: 0,
+        input_w: 0,
         remote,
         running: false,
         queued: vec![],

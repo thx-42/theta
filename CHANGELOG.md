@@ -26,7 +26,7 @@
 ## 0.2.0
 
 ### Nouveautés
-- **Canaux stable et nightly.** `install.sh` demande le canal (`--stable` ou `--dev`). Stable suit la branche `main`, nightly suit `dev` et publie des prereleases `dev-v…` à chaque push. `theta update` et `install.sh update` suivent le canal installé. Un binaire nightly affiche `(dev)` à côté du logo.
+- **Canaux stable et nightly.** `install.sh` demande le canal (`--stable` ou `--dev`). Stable suit la branche `main`, nightly suit `dev` et publie des prereleases `dev-v…` à chaque push. `theta update` et `install.sh update` suivent le canal installé. Le binaire est identique sur les deux canaux : le mode dev est un drapeau d'exécution (`~/.theta/dev`, `THETA_DEV=1` ou `theta channel dev`) qui affiche `(dev)` à côté du logo et active les détails de debug. En mode dev, `theta update` suit les releases stable et nightly (le plus grand numéro de build gagne).
 - **Steering.** Pendant qu'un agent travaille, `Entrée` met le message en file d'attente (envoyé à la fin du run). `Ctrl+Entrée` injecte le message dans la conversation : l'agent le voit à son prochain step.
 - **Arrêt en double Échap.** Deux `Échap` dans les 2 s arrêtent l'agent. Un run arrêté affiche `■ interrupted` au lieu de `✓ done`.
 - **Plan par session.** L'outil `write_plan` écrit le plan dans `~/.theta/plan/<session>.md`. Chaque session a son fichier, les agents ne se marchent pas dessus.

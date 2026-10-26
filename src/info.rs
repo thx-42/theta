@@ -12,7 +12,7 @@ pub fn print() {
         Err(_) => "not running",
     };
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "unknown".into());
-    let channel = if update::is_dev() { "nightly (dev branch)" } else { "stable (main branch)" };
+    let channel = if update::is_dev() { "dev mode (stable + nightly updates)" } else { "stable" };
     let release = if update::is_release() { "release build" } else { "local build" };
     let rows = [
         ("version", update::VERSION.to_string()),

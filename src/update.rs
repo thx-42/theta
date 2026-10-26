@@ -12,14 +12,48 @@ use tokio::net::UnixStream;
 /// Release tag baked in by CI (`v<version>-<run number>`); absent in local builds.
 const TAG: Option<&str> = option_env!("THETA_TAG");
 
-/// `stable` (main branch releases) or `dev` (nightly releases from the dev branch); set by CI and install.sh.
-pub const CHANNEL: &str = match option_env!("THETA_CHANNEL") {
-    Some(c) => c,
-    None => "stable",
-};
-
+/// Dev mode is a runtime flag, not a build: the same binary runs either way. It is on when `THETA_DEV` is
+/// set or the flag file `~/.theta/dev` exists. Dev mode unlocks debug details and lets `theta update`
+/// also pick nightly releases.
 pub fn is_dev() -> bool {
-    CHANNEL == "dev"
+    static DEV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEV.get_or_init(|| std::env::var("THETA_DEV").is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false")) || dev_flag().exists())
+}
+
+fn dev_flag() -> std::path::PathBuf {
+    crate::config::home().join("dev")
+}
+
+/// `theta channel [stable|dev]`: show or switch the mode.
+pub fn channel(name: Option<&str>) -> Result<()> {
+    let Some(name) = name else {
+        println!("{}", if is_dev() { "dev (updates follow stable and nightly releases)" } else { "stable" });
+        return Ok(());
+    };
+    let dev = match name {
+        "dev" | "nightly" => true,
+        "stable" => false,
+        other => bail!("unknown channel `{other}`: use stable or dev"),
+    };
+    let flag = dev_flag();
+    if dev {
+        std::fs::create_dir_all(crate::config::home())?;
+        std::fs::write(&flag, "")?;
+    } else if flag.exists() {
+        std::fs::remove_file(&flag)?;
+    }
+    set_state_channel(if dev { "dev" } else { "stable" });
+    println!("channel: {}", if dev { "dev" } else { "stable" });
+    Ok(())
+}
+
+/// Keep `install.sh`'s bookkeeping (`~/.theta/install`) in step with the mode.
+fn set_state_channel(channel: &str) {
+    let state = crate::config::home().join("install");
+    let Ok(old) = std::fs::read_to_string(&state) else { return };
+    let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with("channel=")).map(String::from).collect();
+    lines.push(format!("channel={channel}"));
+    let _ = std::fs::write(&state, lines.join("\n") + "\n");
 }
 
 /// True for CI/installer builds (tag baked in), false for local builds.
@@ -84,16 +118,17 @@ fn is_newer(latest: &str, current: &str) -> bool {
 
 async fn latest_tag(http: &reqwest::Client) -> Result<String> {
     if is_dev() {
-        // Nightly releases are prereleases tagged `dev-v…`; the newest one comes first in the list.
+        // Dev mode sees stable and nightly (`dev-v…` prereleases) alike: the highest run number wins.
         let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
         let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
         let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
         return v
             .iter()
+            .filter(|r| r["draft"] != true)
             .filter_map(|r| r["tag_name"].as_str())
-            .find(|t| t.starts_with("dev-"))
+            .max_by_key(|t| build_of(t).unwrap_or(0))
             .map(String::from)
-            .context("no nightly release published yet");
+            .context("no release published yet");
     }
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
     let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
@@ -210,7 +245,7 @@ pub async fn run(check_only: bool, force: bool, rewrite: bool) -> Result<()> {
     let dev = TAG.is_none();
     println!("        {} {}", ink.paint("2", "current"), if dev { format!("{VERSION} (local build)") } else { VERSION.to_string() });
     if is_dev() {
-        println!("        {} nightly (dev)", ink.paint("2", "channel"));
+        println!("        {} dev (stable + nightly)", ink.paint("2", "channel"));
     }
     println!("        {} {latest}", ink.paint("2", "latest "));
 
@@ -245,7 +280,7 @@ pub async fn run(check_only: bool, force: bool, rewrite: bool) -> Result<()> {
     // Keep install.sh's bookkeeping in step when it manages this install.
     let state = crate::config::home().join("install");
     if state.exists() {
-        let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
+        let _ = std::fs::write(&state, format!("method=release\nref={latest}\nchannel={}\n", if is_dev() { "dev" } else { "stable" }));
     }
     // This process still holds the old guides: the new binary writes its own.
     let mut docs = std::process::Command::new(&exe);

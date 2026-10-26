@@ -56,6 +56,8 @@ state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1=//p" "$STATE" | head -n1 || tru
 state_set() {
   mkdir -p "$(dirname "$STATE")"
   printf 'method=%s\nref=%s\nchannel=%s\n' "$1" "$2" "$CHANNEL" > "$STATE"
+  # same binary on both channels: dev mode is the flag file ~/.theta/dev
+  if [[ "$CHANNEL" == dev ]]; then : > "$(dirname "$STATE")/dev"; else rm -f "$(dirname "$STATE")/dev"; fi
 }
 # installs made before channels existed are stable
 load_channel() { CHANNEL="$(state_get channel)"; CHANNEL="${CHANNEL:-stable}"; }
@@ -83,9 +85,9 @@ detect_target() {
 
 latest_release() {
   if [[ "$CHANNEL" == dev ]]; then
-    # newest nightly: releases are listed newest first
+    # dev sees stable and nightly alike: highest run number (suffix after the last dash) wins
     curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=30" |
-      sed -n 's/.*"tag_name": *"\(dev-[^"]*\)".*/\1/p' | head -n1
+      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | awk -F- '{print $NF, $0}' | sort -rn | head -n1 | cut -d' ' -f2
   else
     curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
       sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
@@ -120,12 +122,12 @@ install_source() {
   local ref
   if [[ -n "$SRC" ]]; then
     step "compilation depuis $SRC"
-    THETA_CHANNEL="$CHANNEL" cargo install --path "$SRC" --locked --force --root "$PREFIX"
+    cargo install --path "$SRC" --locked --force --root "$PREFIX"
     ref="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo local)"
   else
     command -v git >/dev/null || die "git requis"
     step "compilation depuis github.com/$REPO ($(branch))"
-    THETA_CHANNEL="$CHANNEL" cargo install --git "https://github.com/$REPO" --branch "$(branch)" --locked --force --root "$PREFIX"
+    cargo install --git "https://github.com/$REPO" --branch "$(branch)" --locked --force --root "$PREFIX"
     ref="$(remote_head)"
   fi
   state_set source "$ref"
