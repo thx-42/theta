@@ -12,14 +12,58 @@ use tokio::net::UnixStream;
 /// Release tag baked in by CI (`v<version>-<run number>`); absent in local builds.
 const TAG: Option<&str> = option_env!("THETA_TAG");
 
-/// `stable` (main branch releases) or `dev` (nightly releases from the dev branch); set by CI and install.sh.
-pub const CHANNEL: &str = match option_env!("THETA_CHANNEL") {
-    Some(c) => c,
-    None => "stable",
-};
-
+/// Dev mode is a runtime flag, not a build: the same binary runs either way. It is on when `THETA_DEV` is
+/// set or the flag file `~/.theta/dev` exists. Dev mode unlocks debug details and lets `theta update`
+/// also pick nightly releases.
 pub fn is_dev() -> bool {
-    CHANNEL == "dev"
+    static DEV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEV.get_or_init(|| std::env::var("THETA_DEV").is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false")) || dev_flag().exists())
+}
+
+fn dev_flag() -> std::path::PathBuf {
+    crate::config::home().join("dev")
+}
+
+/// `theta channel [stable|dev]`: show or switch the mode.
+pub fn channel(name: Option<&str>) -> Result<()> {
+    let Some(name) = name else {
+        println!("{}", if is_dev() { "dev (updates follow stable and nightly releases)" } else { "stable" });
+        return Ok(());
+    };
+    let dev = match name {
+        "dev" | "nightly" => true,
+        "stable" => false,
+        other => bail!("unknown channel `{other}`: use stable or dev"),
+    };
+    write_channel(&crate::config::home(), dev)?;
+    println!("channel: {}", if dev { "dev" } else { "stable" });
+    Ok(())
+}
+
+fn write_channel(home: &std::path::Path, dev: bool) -> Result<()> {
+    let flag = home.join("dev");
+    if dev {
+        std::fs::create_dir_all(home)?;
+        std::fs::write(&flag, "")?;
+    } else if flag.exists() {
+        std::fs::remove_file(&flag)?;
+    }
+    set_state_channel(home, if dev { "dev" } else { "stable" });
+    Ok(())
+}
+
+/// Keep `install.sh`'s bookkeeping (`~/.theta/install`) in step with the mode.
+fn set_state_channel(home: &std::path::Path, channel: &str) {
+    let state = home.join("install");
+    let Ok(old) = std::fs::read_to_string(&state) else { return };
+    let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with("channel=")).map(String::from).collect();
+    lines.push(format!("channel={channel}"));
+    let _ = std::fs::write(&state, lines.join("\n") + "\n");
+}
+
+/// True for CI/installer builds (tag baked in), false for local builds.
+pub fn is_release() -> bool {
+    TAG.is_some()
 }
 
 pub const VERSION: &str = match TAG {
@@ -51,7 +95,7 @@ impl Ink {
     }
 }
 
-fn repo() -> String {
+pub fn repo() -> String {
     std::env::var("THETA_REPO").unwrap_or_else(|_| "thx-42/theta".into())
 }
 
@@ -77,18 +121,23 @@ fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// The release with the highest run number, stable or nightly; drafts are skipped.
+fn newest_release(releases: &[serde_json::Value]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|r| r["draft"] != true)
+        .filter_map(|r| r["tag_name"].as_str())
+        .max_by_key(|t| build_of(t).unwrap_or(0))
+        .map(String::from)
+}
+
 async fn latest_tag(http: &reqwest::Client) -> Result<String> {
     if is_dev() {
-        // Nightly releases are prereleases tagged `dev-v…`; the newest one comes first in the list.
+        // Dev mode sees stable and nightly (`dev-v…` prereleases) alike: the highest run number wins.
         let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
         let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
         let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
-        return v
-            .iter()
-            .filter_map(|r| r["tag_name"].as_str())
-            .find(|t| t.starts_with("dev-"))
-            .map(String::from)
-            .context("no nightly release published yet");
+        return newest_release(&v).context("no release published yet");
     }
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
     let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
@@ -205,7 +254,7 @@ pub async fn run(check_only: bool, force: bool, rewrite: bool) -> Result<()> {
     let dev = TAG.is_none();
     println!("        {} {}", ink.paint("2", "current"), if dev { format!("{VERSION} (local build)") } else { VERSION.to_string() });
     if is_dev() {
-        println!("        {} nightly (dev)", ink.paint("2", "channel"));
+        println!("        {} dev (stable + nightly)", ink.paint("2", "channel"));
     }
     println!("        {} {latest}", ink.paint("2", "latest "));
 
@@ -240,7 +289,7 @@ pub async fn run(check_only: bool, force: bool, rewrite: bool) -> Result<()> {
     // Keep install.sh's bookkeeping in step when it manages this install.
     let state = crate::config::home().join("install");
     if state.exists() {
-        let _ = std::fs::write(&state, format!("method=release\nref={latest}\n"));
+        let _ = std::fs::write(&state, format!("method=release\nref={latest}\nchannel={}\n", if is_dev() { "dev" } else { "stable" }));
     }
     // This process still holds the old guides: the new binary writes its own.
     let mut docs = std::process::Command::new(&exe);
@@ -269,5 +318,42 @@ mod tests {
     #[test]
     fn sha256_matches_known_digest() {
         assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    fn releases(tags: &[(&str, bool)]) -> Vec<serde_json::Value> {
+        tags.iter().map(|(t, draft)| serde_json::json!({ "tag_name": t, "draft": draft })).collect()
+    }
+
+    #[test]
+    fn dev_mode_moves_from_a_nightly_to_a_newer_stable() {
+        let v = releases(&[("v0.3.1-84", false), ("v0.3.1-83", false), ("dev-v0.3.1-81", false)]);
+        let latest = newest_release(&v).unwrap();
+        assert_eq!(latest, "v0.3.1-84");
+        assert!(is_newer(&latest, "dev-v0.3.1-81"));
+    }
+
+    #[test]
+    fn dev_mode_prefers_a_newer_nightly_and_skips_drafts() {
+        let v = releases(&[("v0.3.1-84", false), ("dev-v0.3.1-86", true), ("dev-v0.3.1-85", false)]);
+        assert_eq!(newest_release(&v).unwrap(), "dev-v0.3.1-85");
+        assert_eq!(newest_release(&[]), None);
+    }
+
+    #[test]
+    fn channel_switch_writes_the_flag_and_keeps_the_install_state() {
+        let home = std::env::temp_dir().join(format!("theta-channel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("install"), "method=release\nref=v0.3.1-84\nchannel=stable\n").unwrap();
+        write_channel(&home, true).unwrap();
+        assert!(home.join("dev").exists());
+        assert_eq!(std::fs::read_to_string(home.join("install")).unwrap(), "method=release\nref=v0.3.1-84\nchannel=dev\n");
+        write_channel(&home, false).unwrap();
+        assert!(!home.join("dev").exists());
+        assert_eq!(std::fs::read_to_string(home.join("install")).unwrap(), "method=release\nref=v0.3.1-84\nchannel=stable\n");
+        // no install state (cargo/local build): only the flag changes
+        std::fs::remove_file(home.join("install")).unwrap();
+        write_channel(&home, true).unwrap();
+        assert!(home.join("dev").exists() && !home.join("install").exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

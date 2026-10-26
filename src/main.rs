@@ -24,6 +24,7 @@ mod ssh;
 mod tools;
 mod tui;
 mod types;
+mod info;
 mod update;
 mod usage;
 
@@ -33,8 +34,11 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "theta", version = update::VERSION, about = "θ — lightweight coding agent")]
+#[command(name = "theta", disable_version_flag = true, about = "θ — lightweight coding agent")]
 struct Cli {
+    /// Print version, mode (stable/dev), build date and debugging details.
+    #[arg(short = 'V', long, alias = "info")]
+    version: bool,
     /// Prompt; with -p runs non-interactively and prints the answer.
     prompt: Vec<String>,
     /// Print mode: run once, print the final answer, exit.
@@ -96,6 +100,8 @@ enum Cmd {
     /// Serve tool calls over stdin/stdout for `/ssh` (started on the server by theta itself).
     #[command(hide = true)]
     SshAgent,
+    /// Show or switch the mode: `theta channel dev` enables debug details and nightly updates.
+    Channel { name: Option<String> },
     /// Check for a newer release and install it.
     Update {
         /// Only report whether a newer version exists.
@@ -197,6 +203,10 @@ async fn print_mode(app: App, prompt: String) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.version {
+        info::print();
+        return Ok(());
+    }
     if cli.auto {
         cli.agent = Some("Auto".into());
     }
@@ -227,6 +237,9 @@ async fn main() -> Result<()> {
     }
     if let Some(Cmd::SshAgent) = &cli.cmd {
         return ssh::agent().await;
+    }
+    if let Some(Cmd::Channel { name }) = &cli.cmd {
+        return update::channel(name.as_deref());
     }
     if let Some(Cmd::Update { check, force }) = &cli.cmd {
         return update::run(*check, *force, false).await;
@@ -334,7 +347,7 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::ForceUpdate | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
+        Some(Cmd::Daemon { .. } | Cmd::Update { .. } | Cmd::Channel { .. } | Cmd::ForceUpdate | Cmd::SshAgent | Cmd::Dump { .. }) => unreachable!(),
         None => {}
     }
     let prompt = cli.prompt.join(" ");
