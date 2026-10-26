@@ -4353,6 +4353,19 @@ mod tests {
     }
 
     #[test]
+    fn move_row_keeps_the_display_column_on_wide_chars() {
+        // "日本語" is 6 columns wide: at width 4 it wraps after two chars
+        let mut e = super::Editor { text: "日本語abc".into(), cur: 0 };
+        assert!(e.move_row(1, 4));
+        assert_eq!(e.cur, "日本".len());
+        assert!(e.move_row(-1, 4));
+        assert_eq!(e.cur, 0);
+        // empty input has a single row: nothing to move through
+        let mut e = super::Editor::default();
+        assert!(!e.move_row(1, 10) && !e.move_row(-1, 10));
+    }
+
+    #[test]
     fn agent_colors_are_stable_and_distinct() {
         use super::theme::color_for;
         assert_eq!(color_for("Build"), color_for("build"));

@@ -35,21 +35,26 @@ pub fn channel(name: Option<&str>) -> Result<()> {
         "stable" => false,
         other => bail!("unknown channel `{other}`: use stable or dev"),
     };
-    let flag = dev_flag();
-    if dev {
-        std::fs::create_dir_all(crate::config::home())?;
-        std::fs::write(&flag, "")?;
-    } else if flag.exists() {
-        std::fs::remove_file(&flag)?;
-    }
-    set_state_channel(if dev { "dev" } else { "stable" });
+    write_channel(&crate::config::home(), dev)?;
     println!("channel: {}", if dev { "dev" } else { "stable" });
     Ok(())
 }
 
+fn write_channel(home: &std::path::Path, dev: bool) -> Result<()> {
+    let flag = home.join("dev");
+    if dev {
+        std::fs::create_dir_all(home)?;
+        std::fs::write(&flag, "")?;
+    } else if flag.exists() {
+        std::fs::remove_file(&flag)?;
+    }
+    set_state_channel(home, if dev { "dev" } else { "stable" });
+    Ok(())
+}
+
 /// Keep `install.sh`'s bookkeeping (`~/.theta/install`) in step with the mode.
-fn set_state_channel(channel: &str) {
-    let state = crate::config::home().join("install");
+fn set_state_channel(home: &std::path::Path, channel: &str) {
+    let state = home.join("install");
     let Ok(old) = std::fs::read_to_string(&state) else { return };
     let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with("channel=")).map(String::from).collect();
     lines.push(format!("channel={channel}"));
@@ -116,19 +121,23 @@ fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// The release with the highest run number, stable or nightly; drafts are skipped.
+fn newest_release(releases: &[serde_json::Value]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|r| r["draft"] != true)
+        .filter_map(|r| r["tag_name"].as_str())
+        .max_by_key(|t| build_of(t).unwrap_or(0))
+        .map(String::from)
+}
+
 async fn latest_tag(http: &reqwest::Client) -> Result<String> {
     if is_dev() {
         // Dev mode sees stable and nightly (`dev-v…` prereleases) alike: the highest run number wins.
         let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo());
         let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
         let v: Vec<serde_json::Value> = r.error_for_status()?.json().await?;
-        return v
-            .iter()
-            .filter(|r| r["draft"] != true)
-            .filter_map(|r| r["tag_name"].as_str())
-            .max_by_key(|t| build_of(t).unwrap_or(0))
-            .map(String::from)
-            .context("no release published yet");
+        return newest_release(&v).context("no release published yet");
     }
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo());
     let r = http.get(&url).header("accept", "application/vnd.github+json").send().await.context("cannot reach github.com")?;
@@ -309,5 +318,42 @@ mod tests {
     #[test]
     fn sha256_matches_known_digest() {
         assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    fn releases(tags: &[(&str, bool)]) -> Vec<serde_json::Value> {
+        tags.iter().map(|(t, draft)| serde_json::json!({ "tag_name": t, "draft": draft })).collect()
+    }
+
+    #[test]
+    fn dev_mode_moves_from_a_nightly_to_a_newer_stable() {
+        let v = releases(&[("v0.3.1-84", false), ("v0.3.1-83", false), ("dev-v0.3.1-81", false)]);
+        let latest = newest_release(&v).unwrap();
+        assert_eq!(latest, "v0.3.1-84");
+        assert!(is_newer(&latest, "dev-v0.3.1-81"));
+    }
+
+    #[test]
+    fn dev_mode_prefers_a_newer_nightly_and_skips_drafts() {
+        let v = releases(&[("v0.3.1-84", false), ("dev-v0.3.1-86", true), ("dev-v0.3.1-85", false)]);
+        assert_eq!(newest_release(&v).unwrap(), "dev-v0.3.1-85");
+        assert_eq!(newest_release(&[]), None);
+    }
+
+    #[test]
+    fn channel_switch_writes_the_flag_and_keeps_the_install_state() {
+        let home = std::env::temp_dir().join(format!("theta-channel-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("install"), "method=release\nref=v0.3.1-84\nchannel=stable\n").unwrap();
+        write_channel(&home, true).unwrap();
+        assert!(home.join("dev").exists());
+        assert_eq!(std::fs::read_to_string(home.join("install")).unwrap(), "method=release\nref=v0.3.1-84\nchannel=dev\n");
+        write_channel(&home, false).unwrap();
+        assert!(!home.join("dev").exists());
+        assert_eq!(std::fs::read_to_string(home.join("install")).unwrap(), "method=release\nref=v0.3.1-84\nchannel=stable\n");
+        // no install state (cargo/local build): only the flag changes
+        std::fs::remove_file(home.join("install")).unwrap();
+        write_channel(&home, true).unwrap();
+        assert!(home.join("dev").exists() && !home.join("install").exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
