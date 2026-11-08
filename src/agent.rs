@@ -38,7 +38,12 @@ pub enum Event {
     /// Question `id` was answered (by any attached client).
     Answered(String),
     /// `handoff` accepted: switch to `agent` and continue once this run ends.
-    Handoff { agent: String },
+    Handoff {
+        agent: String,
+        /// The message the next agent starts with (None: "Plan approved…").
+        #[serde(default)]
+        message: Option<String>,
+    },
     /// Progress from a subagent spawned by tool call `id`.
     Sub { id: String, event: Box<Event> },
     /// Transcript file of the subagent started by tool call `id` (sent inside `Sub`).
@@ -59,6 +64,16 @@ pub type Tx = UnboundedSender<Event>;
 /// Pending `ask` questions by id; the answering side removes the sender and sends the text.
 pub type Asks = Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>>;
 
+/// Plan rounds an agent may start with `enter_plan` per user message.
+pub const PLAN_ROUNDS: u8 = 3;
+
+/// `enter_plan` state of a session: who Plan hands back to, and how many rounds ran since the last user message.
+#[derive(Default, Debug)]
+pub struct PlanState {
+    pub return_to: Option<String>,
+    pub rounds: u8,
+}
+
 /// Everything shared across turns.
 #[derive(Clone)]
 pub struct Runtime {
@@ -76,6 +91,7 @@ pub struct Runtime {
     pub asks: Asks,
     pub jobs: crate::jobs::Jobs,
     pub ssh: crate::ssh::Slot,
+    pub plan: Arc<Mutex<PlanState>>,
 }
 
 /// What one run needs: who answers, with which model, and which tools.
@@ -100,9 +116,14 @@ impl Runtime {
             "title" => &self.settings.models.title,
             _ => &self.settings.models.subagent,
         };
-        match self.catalog.resolve(m) {
-            Some((p, _)) if self.auth.status(&p).await.is_some() || (p.env.is_empty() && p.oauth.is_none()) => m.clone(),
-            _ => main.to_string(),
+        if self.usable(m).await { m.clone() } else { main.to_string() }
+    }
+
+    /// A known model whose provider has credentials (or needs none).
+    pub async fn usable(&self, key: &str) -> bool {
+        match self.catalog.resolve(key) {
+            Some((p, _)) => self.auth.status(&p).await.is_some() || (p.env.is_empty() && p.oauth.is_none()),
+            None => false,
         }
     }
 
@@ -122,7 +143,9 @@ impl Runtime {
     pub fn tools_for(&self, agent: &Agent, depth: u8) -> Vec<ToolDef> {
         let mut defs = tools::all_defs();
         if depth == 0 {
-            defs.push(tools::task_def(&self.agents.iter().filter(|a| agents::can_spawn(agent, a)).map(|a| a.name.clone()).collect::<Vec<_>>()));
+            // Orchestrators (`delegate: all`) are not offered as subagents: they could not delegate from there.
+            let spawnable: Vec<_> = self.agents.iter().filter(|a| agents::can_spawn(agent, a) && !a.delegate_all).map(|a| (a.name.clone(), a.description.clone())).collect();
+            defs.push(tools::task_def(&spawnable));
         }
         defs.extend(self.mcp.defs());
         defs.retain(|d| !self.settings.tools.disabled.contains(&d.name));
@@ -132,7 +155,7 @@ impl Runtime {
             None => defs.retain(|d| !tools::OPT_IN.contains(&d.name.as_str()) && !(depth > 0 && d.name.starts_with("mcp__"))),
         }
         if depth > 0 {
-            defs.retain(|d| !matches!(d.name.as_str(), "ask" | "handoff" | "list_agents")); // the user belongs to the main agent; a subagent keeps its own todo list, which the orchestrator reads with `job`
+            defs.retain(|d| !matches!(d.name.as_str(), "ask" | "handoff" | "list_agents" | "enter_plan")); // the user belongs to the main agent; a subagent keeps its own todo list, which the orchestrator reads with `job`
         }
         defs
     }
@@ -245,6 +268,8 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let mut steps = 0usize;
     let mut checkpoints = 0usize;
     let mut compact_failed = false;
+    // A plan-mode switch is pending: the run must end so Plan takes over.
+    let mut handed_off = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
         // A subagent that runs long hands its state back so the orchestrator can re-steer (resume or re-split).
@@ -322,13 +347,13 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 }
             }
             // A turn that only announced its plan (or said nothing) is not an answer: push the model to act.
-            if (resp.stop == "commentary" || empty) && stalls < 3 {
+            if !handed_off && (resp.stop == "commentary" || empty) && stalls < 3 {
                 stalls += 1;
                 session.lock().unwrap().add_msg(Msg::user("You stopped without calling a tool or giving a final answer. Continue the task now: call the tools you need, then give your final report."), None)?;
                 continue;
             }
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
-            if turn.depth == 0 && turn.agent.delegate_all && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
+            if turn.depth == 0 && turn.agent.delegate_all && !handed_off && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
                 nudges += 1;
                 session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
                 continue;
@@ -355,6 +380,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 again
             })
             .collect();
+        let names: Vec<String> = calls.iter().map(|c| c.1.clone()).collect();
         let futs = calls.into_iter().zip(staggered).map(|((id, name, args), stagger)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
@@ -379,7 +405,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else if name == "list_agents" {
                     tools::ToolOut::ok(agents::catalog(&rt.agents))
                 } else if name == "handoff" {
-                    handoff(&rt, &args, &tx).await
+                    handoff(&rt, &args, &tx, &ctx.session_id).await
+                } else if name == "enter_plan" {
+                    enter_plan(&rt, &turn, &args, &tx)
                 } else {
                     tools::run(&name, &args, &ctx).await
                 };
@@ -403,6 +431,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
         });
         let results = futures::future::join_all(futs).await;
+        handed_off |= results.iter().zip(&names).any(|(r, n)| n == "enter_plan" && matches!(r, Block::ToolResult { is_error: false, .. }));
         session.lock().unwrap().add_msg(Msg { role: Role::User, content: results, model: None }, None)?;
     }
     Ok(())
@@ -432,17 +461,46 @@ async fn ask(rt: &Runtime, args: &Value, tx: &Tx) -> tools::ToolOut {
 }
 
 /// `handoff` tool: ask the user to switch agents. On yes, the UI switches and starts the new agent.
-async fn handoff(rt: &Runtime, args: &Value, tx: &Tx) -> tools::ToolOut {
+/// Plan started by `enter_plan` hands back to its caller at once, without asking.
+async fn handoff(rt: &Runtime, args: &Value, tx: &Tx, session_id: &str) -> tools::ToolOut {
+    let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+    let origin = rt.plan.lock().unwrap().return_to.take();
+    if let Some(origin) = origin {
+        let plan = crate::config::home().join("plan").join(format!("{session_id}.md"));
+        let plan = if plan.exists() { format!("Plan file: {}.", plan.display()) } else { "No plan file was saved.".into() };
+        let message = format!(
+            "Plan mode finished: {summary}\n{plan} The todo list is loaded. Review the plan against the code and the requirements: if it is sound, execute it now; if it has gaps, guesses or mistakes, call `enter_plan` with precise feedback; `ask` the user only for a choice that is theirs."
+        );
+        let _ = tx.send(Event::Handoff { agent: origin.clone(), message: Some(message) });
+        return tools::ToolOut::ok(format!("Handing back to {origin} for review. End your turn now with one short line."));
+    }
     let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("Build");
     let Some(agent) = agents::find(&rt.agents, name) else { return tools::ToolOut::err(format!("unknown agent `{name}`. Available:\n{}", agents::catalog(&rt.agents))) };
-    let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
     let q = json!({"question": format!("Switch to {} and start: {summary}?", agent.name), "type": "choice", "options": [format!("Yes, switch to {}", agent.name), "No, keep planning"]});
     let out = ask(rt, &q, tx).await;
     if out.content.contains("Yes, switch") {
-        let _ = tx.send(Event::Handoff { agent: agent.name.clone() });
+        let _ = tx.send(Event::Handoff { agent: agent.name.clone(), message: None });
         return tools::ToolOut::ok(format!("User accepted. {} takes over after your reply: end your turn now with one short line.", agent.name));
     }
     out
+}
+
+/// `enter_plan` tool: hand the conversation to Plan, which returns it to the caller once the plan is saved.
+fn enter_plan(rt: &Runtime, turn: &Turn, args: &Value, tx: &Tx) -> tools::ToolOut {
+    let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if goal.is_empty() {
+        return tools::ToolOut::err("goal required");
+    }
+    let Some(plan) = agents::find(&rt.agents, "Plan") else { return tools::ToolOut::err("no Plan agent installed: plan with `todo` yourself") };
+    let mut st = rt.plan.lock().unwrap();
+    if st.rounds >= PLAN_ROUNDS {
+        return tools::ToolOut::err(format!("{PLAN_ROUNDS} plan rounds already: decide yourself, or `ask` the user"));
+    }
+    st.rounds += 1;
+    st.return_to = Some(turn.agent.name.clone());
+    let message = format!("{} asked for a plan (round {}):\n{goal}\n\nSave it with `todo` and `write_plan`, then call `handoff`.", turn.agent.name, st.rounds);
+    let _ = tx.send(Event::Handoff { agent: plan.name.clone(), message: Some(message) });
+    tools::ToolOut::ok(format!("{} takes over after your reply and hands back when the plan is saved. End your turn now with one short line.", plan.name))
 }
 
 /// Whether this `task` call would start an agent that can change files (resolved like `subagent` does).
@@ -549,10 +607,17 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let asked = args.get("model").and_then(|v| v.as_str()).and_then(|m| if m == "main" { Some(parent.model.clone()) } else { rt.resolve(m).ok().map(|_| m.to_string()) });
     let model = match asked {
         Some(m) => m,
-        None => agents::model_of(&agent, &rt.settings)
-            .filter(|_| named)
-            .or_else(|| parent.agent.subagent_model.clone())
-            .unwrap_or(rt.task_model("subagent", &parent.model).await),
+        None => {
+            // A frontmatter model whose provider has no credentials (Explore's Haiku without an Anthropic key) falls back.
+            let own = match agents::model_of(&agent, &rt.settings).filter(|_| named) {
+                Some(m) if rt.usable(&m).await => Some(m),
+                _ => None,
+            };
+            match own.or_else(|| parent.agent.subagent_model.clone()) {
+                Some(m) => m,
+                None => rt.task_model("subagent", &parent.model).await,
+            }
+        }
     };
     // `effort` argument > named agent's effort > parent's `subagent_effort` > [models] subagent_effort > parent's effort
     let effort = args.get("effort").and_then(|v| v.as_str()).filter(|e| matches!(*e, "low" | "medium" | "high" | "xhigh" | "max")).map(String::from)
@@ -617,6 +682,14 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     if !open.is_empty() {
         checks.push_str(&format!("\n[unfinished in its todo: {}]", open.join("; ")));
     }
+    // An orchestrator using a writing agent for read-only work: point it at Explore.
+    if let Some(b) = &before
+        && parent.agent.delegate_all
+        && tree_state(&rt.cwd).await.as_ref() == Some(b)
+        && agents::find(&rt.agents, "Explore").is_some()
+    {
+        checks.push_str("\n[note: no files changed — use Explore for read-only work, it is faster and cheaper]");
+    }
     if let Some(before) = before
         && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
             if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
@@ -654,6 +727,47 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn task_lists_spawnable_agents_with_descriptions() {
+        let mut rt = test_rt().await;
+        rt.agents = Arc::new(vec![
+            agents::parse_builtin(agents::DEFAULT_BUILD, "Build"),
+            agents::parse_builtin(agents::DEFAULT_EXPLORE, "Explore"),
+            agents::parse_builtin(agents::DEFAULT_AUTO, "Auto"),
+        ]);
+        let auto = rt.agents[2].clone();
+        let defs = rt.tools_for(&auto, 0);
+        let task = defs.iter().find(|d| d.name == "task").unwrap();
+        assert!(task.description.contains("- Explore: Fast read-only search") && !task.description.contains("- Auto:"), "{}", task.description);
+        assert_eq!(task.schema["properties"]["agent"]["enum"], json!(["Build", "Explore"]));
+        assert!(task.schema["required"].as_array().unwrap().contains(&json!("agent")));
+        assert!(defs.iter().any(|d| d.name == "enter_plan") && defs.iter().any(|d| d.name == "bash"));
+        // subagents never get plan mode
+        assert!(!rt.tools_for(&auto, 1).iter().any(|d| d.name == "enter_plan"));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_round_trip() {
+        let mut rt = test_rt().await;
+        rt.agents = Arc::new(vec![agents::parse_builtin(agents::DEFAULT_PLAN, "Plan"), agents::parse_builtin(agents::DEFAULT_AUTO, "Auto")]);
+        let turn = Turn { agent: rt.agents[1].clone(), model: String::new(), effort: String::new(), depth: 0 };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(enter_plan(&rt, &turn, &json!({"goal": ""}), &tx).is_error);
+        assert!(!enter_plan(&rt, &turn, &json!({"goal": "add x"}), &tx).is_error);
+        let Some(Event::Handoff { agent, message: Some(m) }) = rx.recv().await else { panic!("no handoff to Plan") };
+        assert!(agent == "Plan" && m.contains("add x"));
+        // Plan hands back to Auto without asking the user.
+        assert!(!handoff(&rt, &json!({"summary": "plan ready"}), &tx, "s1").await.is_error);
+        let Some(Event::Handoff { agent, message: Some(m) }) = rx.recv().await else { panic!("no handoff back") };
+        assert!(agent == "Auto" && m.contains("Plan mode finished"));
+        assert!(rt.plan.lock().unwrap().return_to.is_none());
+        // rounds are capped per user message
+        for _ in 1..PLAN_ROUNDS {
+            assert!(!enter_plan(&rt, &turn, &json!({"goal": "again"}), &tx).is_error);
+        }
+        assert!(enter_plan(&rt, &turn, &json!({"goal": "again"}), &tx).is_error);
+    }
 
     #[test]
     fn plan_next_step_follows_open_questions() {
@@ -719,6 +833,7 @@ mod tests {
             asks: Default::default(),
             jobs: Default::default(),
             ssh: Default::default(),
+            plan: Default::default(),
         }
     }
 

@@ -339,7 +339,9 @@ pub fn set_global(key: &str, value: toml::Value) -> Result<()> {
 }
 
 /// sha256 of every DEFAULT_AUTO_SOUL shipped before; add the current one's hash here when it changes.
-const SHIPPED_AUTO_SOULS: [&str; 4] = [
+const SHIPPED_AUTO_SOULS: [&str; 6] = [
+    "d11f806aa58f0cafe41fdc484e8f5cede88a28778ba328e48e38c4a4e17f3210",
+    "8d781c221ab2365b800f632ea441fc4e251a635f3f7a31fac96aef5b1e211510",
     "fd0daae85700f041b464bdb696021a63fa4b77db7a22dab9b24c8ffe1aac5bac",
     "7f22cfc138a69fe436daf1e71aa8988b2d4d91c3be111c889dd82573a8306c5a",
     "889663e1048dda6448eb64ff38d2f7d13dc2b3f86890c8512969fb55864e7c72",

@@ -104,6 +104,7 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{}})),
         def("handoff", "Ask the user to switch to another agent (from `list_agents`) to carry out the plan. If accepted, that agent continues this conversation.",
             json!({"type":"object","properties":{"agent":{"type":"string","description":"default Build"},"summary":{"type":"string","description":"one line: what will be built"}},"required":["summary"]})),
+        enter_plan_def(),
         def("web_search", "Search the web. Returns titles, URLs and short highlights.",
             json!({"type":"object","properties":{"query":{"type":"string"},"num":{"type":"integer"}},"required":["query"]})),
         def("web_fetch", "Fetch a URL and return its main content as compact text.",
@@ -112,11 +113,20 @@ pub fn all_defs() -> Vec<ToolDef> {
 }
 
 /// Tools only agents that list them get: the default set stays close to read/write/edit/bash.
-pub const OPT_IN: &[&str] = &["ls", "find", "write_plan", "ask", "handoff", "list_agents"];
+pub const OPT_IN: &[&str] = &["ls", "find", "write_plan", "ask", "handoff", "list_agents", "enter_plan"];
 
-pub fn task_def(agents: &[String]) -> ToolDef {
-    def("task", &format!("Delegate a self-contained task to a subagent with a fresh context; only its final report returns. Use for broad searches or independent work. Agents: {}.", agents.join(", ")),
-        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 words"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string"},"background":{"type":"boolean","description":"Return a job id at once; the report arrives later"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent"},"model":{"type":"string","description":"Override the subagent model: `main` = your own (escalate a step that failed twice) or provider/model"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]}},"required":["description","prompt"]}))
+/// `task` for the agents a parent may spawn: `(name, description)` pairs, listed so the model can route.
+pub fn task_def(agents: &[(String, String)]) -> ToolDef {
+    let list: String = agents.iter().map(|(n, d)| format!("\n- {n}: {d}")).collect();
+    let names: Vec<&str> = agents.iter().map(|(n, _)| n.as_str()).collect();
+    def("task", &format!("Delegate a self-contained task to a subagent with a fresh context; only its final report returns. Several `task` calls in one reply run in parallel; use `background` only to keep working while they run. Agents:{list}"),
+        json!({"type":"object","properties":{"description":{"type":"string","description":"3-6 words"},"prompt":{"type":"string","description":"Full instructions; the subagent sees nothing else"},"agent":{"type":"string","enum":names},"background":{"type":"boolean","description":"Return a job id at once; the report arrives later"},"resume":{"type":"string","description":"Transcript path or id from an earlier report: continue that subagent"},"model":{"type":"string","description":"Override the subagent model: `main` = your own (escalate a step that failed twice) or provider/model"},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]}},"required":["description","prompt","agent"]}))
+}
+
+/// `enter_plan`: the agent (Auto) hands the conversation to Plan, which hands it back when the plan is saved.
+pub fn enter_plan_def() -> ToolDef {
+    def("enter_plan", "Switch this conversation to plan mode: the Plan agent plans the task (it may ask the user), saves the plan and the todo list, then hands back to you automatically for review. End your turn right after this call. To ask for a revision, call it again with precise feedback.",
+        json!({"type":"object","properties":{"goal":{"type":"string","description":"What to plan, the requirements, what you already know (path:line), constraints; for a revision, what to change"}},"required":["goal"]}))
 }
 
 pub fn resolve(cwd: &Path, p: &str) -> PathBuf {

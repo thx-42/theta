@@ -82,7 +82,7 @@ Canaux : `stable` (branche `main`, releases) ou `nightly` (branche `dev`, releas
 
 Mise à jour depuis θ lui-même : `theta update` cherche la dernière release, vérifie le sha256 et remplace le binaire (`--check` pour seulement regarder, `--force` pour réinstaller ou remplacer un build local). Elle met aussi à jour les guides, les agents et `SOUL.Auto.md` livrés, sauf ceux que tu as modifiés. `theta force-update` réinstalle même si tu es à jour et réécrit tout, agents et SOUL modifiés compris (ton ancienne version est gardée en `.bak`). Si le daemon tourne, `theta daemon stop` le relance sur la nouvelle version.
 
-Les agents livrés (`Build`, `Plan`, `Auto`) suivent la mise à jour : un agent non modifié est remplacé ; un agent que tu as édité est conservé, la nouvelle version est écrite en `<Agent>.md.new` et son diff est affiché une fois sur un terminal.
+Les agents livrés (`Build`, `Plan`, `Auto`, `Explore`) suivent la mise à jour : un agent non modifié est remplacé ; un agent que tu as édité est conservé, la nouvelle version est écrite en `<Agent>.md.new` et son diff est affiché une fois sur un terminal.
 
 Suivi des mises à jour (depuis un clone, ou `curl … | bash -s -- <cmd>`) :
 
@@ -125,15 +125,16 @@ context = 128000
 |---|---|
 | **Build** | Agent par défaut : lit, édite, lance et vérifie le code. |
 | **Plan** | Clarifie, trouve les angles morts, planifie. Lecture seule : ne code pas, passe la main (`handoff`). |
-| **Auto** | Agent autonome : il vise un résultat observé, cherche au lieu de demander et essaie au moins trois approches avant de déclarer un blocage. Il garde son contexte (le plus cher) petit : recherches, commandes, builds et boucles de correction partent chez des sous-agents `Explore`/`Build` moins chers. Le harness lance lui-même la vérification du projet après un `Build` qui a modifié des fichiers (`[tools] verify`). |
+| **Auto** | Agent autonome, rapide : cérémonie proportionnelle à la tâche. Il fait lui-même les petits changements (lecture, édition, `bash` pour build et tests), envoie les recherches à `Explore` (lecture seule, Haiku), les gros changements ou ceux en parallèle à `Build`, et ne fait relire par `Plan` que les diffs non triviaux. Pour une tâche grosse ou floue, il passe lui-même en plan mode (`enter_plan`) : `Plan` planifie puis rend la main à Auto sans confirmation, Auto relit le plan et l'exécute ou demande une révision. Le harness lance la vérification du projet après un `Build` qui a modifié des fichiers (`[tools] verify`). |
 
 ```
-        validation du plan
- user ◀──────────────────────▶ Auto
-                                │ task
-                  ┌─────────────┴─────────────┐
-                  ▼                           ▼
-             Build (écrit)             Plan (relit)
+                       enter_plan ▶
+ user ◀── ask ──▶ Auto ◀──────────────▶ Plan (plan mode)
+                   │      ◀ handoff auto
+                   │ task
+      ┌────────────┼──────────────┐
+      ▼            ▼              ▼
+ Explore (lit)  Build (écrit)  Plan (relit)
 ```
 
 **Règles de délégation**
@@ -237,7 +238,7 @@ post_message = ["notify-send theta"]           # dernière réponse sur stdin ; 
   SOUL.md                     consignes appliquées à TOUS les agents
   agents/Build.md             agent par défaut
   agents/Plan.md              clarifie et planifie, sans coder, puis passe la main à Build
-  agents/Auto.md              orchestre Build et Plan de bout en bout
+  agents/Auto.md              agent autonome (Explore, Build, Plan, plan mode)
   agents/*.md                 agents globaux  → affichés « (global) »
   sessions/<projet>/*.jsonl   sessions
 <projet>/.theta/              local au projet (racine = dossier contenant .theta ou .git)

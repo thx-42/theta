@@ -23,7 +23,8 @@ struct State {
     epoch: u64,
     /// Events of the step in flight, for clients that attach mid-run.
     replay: Vec<Event>,
-    handoff: Option<String>,
+    /// Accepted handoff: the next agent and the message it starts with.
+    handoff: Option<(String, Option<String>)>,
 }
 
 struct Live {
@@ -178,6 +179,7 @@ impl Server {
         rt.asks = Default::default();
         rt.jobs = Default::default();
         rt.ssh = Default::default();
+        rt.plan = Default::default();
         let jobs_sink = bus.clone();
         rt.jobs.on_change(move |l| {
             let _ = jobs_sink.send(Push::Jobs(l));
@@ -205,6 +207,7 @@ impl Server {
         }
         let mut st = live.st.lock().unwrap();
         if let Some(a) = agent.and_then(|n| agents::find(&st.rt.agents, n).cloned()) {
+            st.rt.plan.lock().unwrap().return_to = None;
             let pick = pick_of(live, &a.name);
             let _ = live.session.lock().unwrap().set_agent(&a.name);
             switch_agent(&mut st, a, pick);
@@ -610,6 +613,8 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
         Req::SetAgent(name) => {
             let mut st = live.st.lock().unwrap();
             if let Some(a) = agents::find(&st.rt.agents, &name).cloned() {
+                // A manual switch cancels a pending Plan → Auto return.
+                st.rt.plan.lock().unwrap().return_to = None;
                 let pick = pick_of(live, &a.name);
                 let _ = live.session.lock().unwrap().set_agent(&a.name);
                 switch_agent(&mut st, a, pick);
@@ -686,6 +691,8 @@ fn send(live: &Arc<Live>, text: String, extra: String, images: Vec<Block>, out: 
         return;
     }
     let _ = live.bus.send(Push::Event(Event::User(text)));
+    // A new user message gives the agent fresh plan rounds.
+    st.rt.plan.lock().unwrap().rounds = 0;
     launch_turn(live, &mut st);
 }
 
@@ -718,6 +725,7 @@ fn interrupt(live: &Arc<Live>) {
     st.epoch += 1;
     st.replay.clear();
     st.handoff = None;
+    st.rt.plan.lock().unwrap().return_to = None;
     st.rt.asks.lock().unwrap().clear();
     let _ = live.bus.send(Push::Event(Event::Interrupted));
 }
@@ -772,7 +780,7 @@ where
             }
             match &ev {
                 Event::Step { .. } => st.replay.clear(),
-                Event::Handoff { agent } => st.handoff = Some(agent.clone()),
+                Event::Handoff { agent, message } => st.handoff = Some((agent.clone(), message.clone())),
                 Event::Done => {
                     st.run = None;
                     st.replay.clear();
@@ -825,15 +833,15 @@ fn after_run(live: &Arc<Live>, st: &mut State) {
             }
         });
     }
-    if let Some(name) = st.handoff.take()
+    if let Some((name, message)) = st.handoff.take()
         && let Some(a) = agents::find(&st.rt.agents, &name).cloned()
     {
         let pick = pick_of(live, &a.name);
         switch_agent(st, a, pick);
         let _ = live.bus.send(meta(st));
-        let text = "Plan approved. Implement it now, following the todo list.";
-        if live.session.lock().unwrap().add_msg(Msg::user(text), None).is_ok() {
-            let _ = live.bus.send(Push::Event(Event::User(text.into())));
+        let text = message.unwrap_or_else(|| "Plan approved. Implement it now, following the todo list.".into());
+        if live.session.lock().unwrap().add_msg(Msg::user(&text), None).is_ok() {
+            let _ = live.bus.send(Push::Event(Event::User(text)));
             launch_turn(live, st);
         }
     }

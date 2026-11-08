@@ -1179,7 +1179,7 @@ impl Ui {
                 self.out_tokens += usage.output;
                 self.stream_chars = 0;
             }
-            Event::Handoff { agent } => self.notify(format!("switching to {agent} after this reply")),
+            Event::Handoff { agent, .. } => self.notify(format!("switching to {agent} after this reply")),
             Event::Ask { id, question, options } => {
                 self.status = "waiting for your answer".into();
                 self.asks.push_back(AskView { question, options, sel: 0, input: Editor::default(), id });
