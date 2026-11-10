@@ -7,7 +7,12 @@ use crate::types::{Block, Delta, Msg, Role, Usage};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-fn convert(messages: &[Msg]) -> Vec<Value> {
+/// Prefix of a `Block::Thinking` signature that holds a whole reasoning item (id, summary, encrypted_content) as JSON.
+const REASONING: &str = "oai:";
+
+/// `replay`: send the model's own reasoning items back. With `store: false` nothing is kept server-side, so without
+/// them the model starts each step of a tool loop having forgotten why it made the call.
+fn convert(messages: &[Msg], replay: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for m in messages {
         match m.role {
@@ -32,6 +37,11 @@ fn convert(messages: &[Msg]) -> Vec<Value> {
             Role::Assistant => {
                 for b in &m.content {
                     match b {
+                        Block::Thinking { signature: Some(sig), .. } if replay => {
+                            if let Some(item) = sig.strip_prefix(REASONING).and_then(|j| serde_json::from_str::<Value>(j).ok()) {
+                                out.push(item);
+                            }
+                        }
                         Block::Text { text } if !text.is_empty() => out.push(
                             json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}),
                         ),
@@ -55,10 +65,12 @@ pub async fn stream(
     on: OnDelta<'_>,
 ) -> Result<Response> {
     let codex = p.api == Api::Codex;
+    // OpenAI's own endpoints return the reasoning encrypted; other servers speaking this API may not take it back.
+    let replay = codex || p.id == "openai";
     let mut body = json!({
         "model": req.model.id,
         "instructions": req.system,
-        "input": convert(req.messages),
+        "input": convert(req.messages, replay),
         "stream": true,
         "store": false,
         "tool_choice": "auto",
@@ -75,6 +87,9 @@ pub async fn stream(
     if req.model.reasoning {
         let effort = match req.effort { "max" => "xhigh", e => e };
         body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+        if replay {
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
     }
     let url = if codex { format!("{}/codex/responses", p.base_url) } else { format!("{}/responses", p.base_url) };
     let mut rb = client.post(url).bearer_auth(&creds.token).header("accept", "text/event-stream");
@@ -95,6 +110,7 @@ pub async fn stream(
     let mut text = String::new();
     let mut thinking = String::new();
     let mut calls: Vec<Block> = Vec::new();
+    let mut reasoning: Vec<Value> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = "stop".to_string();
     let mut last_phase = String::new();
@@ -121,6 +137,10 @@ pub async fn stream(
             }
             "response.output_item.added" if v["item"]["type"] == "function_call" => {
                 on(Delta::ToolStart { name: v["item"]["name"].as_str().unwrap_or("").into() });
+            }
+            "response.output_item.done" if v["item"]["type"] == "reasoning" && v["item"]["encrypted_content"].is_string() => {
+                let it = &v["item"];
+                reasoning.push(json!({"type":"reasoning","id":it["id"],"summary":it["summary"],"encrypted_content":it["encrypted_content"]}));
             }
             "response.output_item.done" if v["item"]["type"] == "message" => {
                 last_phase = v["item"]["phase"].as_str().unwrap_or("").into();
@@ -150,8 +170,15 @@ pub async fn stream(
         }
     }
     let mut content = Vec::new();
-    if !thinking.is_empty() {
-        content.push(Block::Thinking { text: thinking, signature: None });
+    if reasoning.is_empty() {
+        if !thinking.is_empty() {
+            content.push(Block::Thinking { text: thinking, signature: None });
+        }
+    } else {
+        // One block per reasoning item, in order; the summary shown to the user rides on the first.
+        for (i, item) in reasoning.into_iter().enumerate() {
+            content.push(Block::Thinking { text: if i == 0 { std::mem::take(&mut thinking) } else { String::new() }, signature: Some(format!("{REASONING}{item}")) });
+        }
     }
     if !text.is_empty() {
         content.push(Block::Text { text });
@@ -164,4 +191,29 @@ pub async fn stream(
     }
     content.extend(calls);
     Ok(Response { msg: Msg { role: Role::Assistant, content, model: None }, usage, stop })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_items_are_replayed_before_their_calls() {
+        let item = json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"abc"});
+        let msgs = [
+            Msg::user("go"),
+            Msg {
+                role: Role::Assistant,
+                content: vec![
+                    Block::Thinking { text: "why".into(), signature: Some(format!("{REASONING}{item}")) },
+                    Block::ToolCall { id: "c1".into(), name: "read".into(), args: json!({"path":"a"}), sig: None },
+                ],
+                model: None,
+            },
+        ];
+        let out = convert(&msgs, true);
+        assert_eq!(out[1], item);
+        assert_eq!(out[2]["type"], "function_call");
+        assert_eq!(convert(&msgs, false).len(), 2);
+    }
 }
