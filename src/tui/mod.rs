@@ -285,6 +285,19 @@ enum ToolState {
     Done { ok: bool },
 }
 
+/// A subagent launched by a subagent of a `task` call (Auto → Plan → Explore): shown under that call.
+struct Kid {
+    id: String,
+    /// Call id of the task that launched it: the root call or another kid.
+    parent: String,
+    /// Agent that launched it, and the agent that runs.
+    by: String,
+    who: String,
+    title: String,
+    done: Option<bool>,
+    sub: Counts,
+}
+
 enum Item {
     User(String),
     /// Steered message, shown when typed. `delivered`: the agent has taken it into the session.
@@ -292,7 +305,7 @@ enum Item {
     /// `agent`: the agent that wrote this part (drives its gutter color).
     Assistant { text: String, thinking: String, done: bool, agent: String },
     /// `who`: for `task` calls, the subagent type that runs (empty otherwise).
-    Tool { id: String, name: String, summary: String, state: ToolState, out: String, display: Option<String>, sub: Counts, agent: String, who: String },
+    Tool { id: String, name: String, summary: String, state: ToolState, out: String, display: Option<String>, sub: Counts, agent: String, who: String, kids: Vec<Kid> },
     Info(String),
     Error(String),
 }
@@ -1114,7 +1127,7 @@ impl Ui {
         } else {
             String::new()
         };
-        Item::Tool { id, name, summary, state: ToolState::Running, out: String::new(), display: None, sub: Counts::default(), agent: self.app.turn.agent.name.clone(), who }
+        Item::Tool { id, name, summary, state: ToolState::Running, out: String::new(), display: None, sub: Counts::default(), agent: self.app.turn.agent.name.clone(), who, kids: Vec::new() }
     }
 
     /// Agents that wrote the parts of the turn started by user item `i`, first-seen order.
@@ -1238,17 +1251,8 @@ impl Ui {
             }
             Event::Title(t) => self.notify(format!("session: {t}")),
             Event::Sub { id, event } => {
-                if let Event::Transcript(p) = *event {
-                    self.transcripts.insert(id, p);
-                } else if let Event::ToolStart { name, .. } = *event {
-                    self.counts.add(&name);
-                    if let Some(i) = self.items.iter().rposition(|it| matches!(it, Item::Tool { id: tid, .. } if *tid == id)) {
-                        if let Item::Tool { sub, .. } = &mut self.items[i] {
-                            sub.add(&name);
-                        }
-                        self.touch(i);
-                    }
-                }
+                let root = id.clone();
+                self.sub_event(&root, &id, *event);
             }
             Event::Transcript(_) => {}
             Event::Error(e) => {
@@ -1264,6 +1268,54 @@ impl Ui {
                 self.refresh_diff();
                 self.flush_queued();
             }
+        }
+    }
+
+    /// Progress of a subagent: `root` is the `task` call shown in the chat, `id` the call whose subagent emitted `ev`.
+    fn sub_event(&mut self, root: &str, id: &str, ev: Event) {
+        let Some(i) = self.items.iter().rposition(|it| matches!(it, Item::Tool { id: tid, .. } if tid == root)) else { return };
+        match ev {
+            Event::Transcript(p) => {
+                self.transcripts.insert(id.to_string(), p);
+            }
+            Event::Sub { id: inner, event } => self.sub_event(root, &inner, *event),
+            Event::ToolStart { id: cid, name, args } => {
+                self.counts.add(&name);
+                let by = self.sub_name(i, id);
+                let who = match args.get("agent").and_then(|v| v.as_str()) {
+                    Some(n) => agents::find(&self.app.rt.agents, n).map(|a| a.name.clone()).unwrap_or_else(|| n.to_string()),
+                    None => by.clone(),
+                };
+                if let Item::Tool { sub, kids, .. } = &mut self.items[i] {
+                    if id == root {
+                        sub.add(&name);
+                    } else if let Some(k) = kids.iter_mut().find(|k| k.id == id) {
+                        k.sub.add(&name);
+                    }
+                    if name == "task" {
+                        kids.push(Kid { id: cid, parent: id.to_string(), by, who, title: tool_summary("task", &args), done: None, sub: Counts::default() });
+                    }
+                }
+                self.touch(i);
+            }
+            Event::ToolEnd { id: cid, is_error, .. } => {
+                if let Item::Tool { kids, .. } = &mut self.items[i]
+                    && let Some(k) = kids.iter_mut().find(|k| k.id == cid)
+                {
+                    k.done = Some(!is_error);
+                    self.touch(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Name of the agent running call `id` of the `task` item `i`.
+    fn sub_name(&self, i: usize, id: &str) -> String {
+        match &self.items[i] {
+            Item::Tool { id: tid, who, .. } if tid == id => who.clone(),
+            Item::Tool { kids, .. } => kids.iter().find(|k| k.id == id).map(|k| k.who.clone()).unwrap_or_default(),
+            _ => String::new(),
         }
     }
 
@@ -1432,23 +1484,34 @@ impl Ui {
         self.overlay = Some(Overlay::Jobs(JobsView { sel: 0, view: None, text: String::new(), polled: Instant::now() }));
     }
 
-    /// Subagent and shell tool calls, newest first: (kind, state (None = running, Some(ok)), label, output).
+    /// Subagent and shell tool calls, newest first, nested subagents under their launcher:
+    /// (kind, state (None = running, Some(ok)), label, output, call id).
     fn activity(&self) -> Vec<(&'static str, Option<bool>, String, String, String)> {
-        self.items
-            .iter()
-            .rev()
-            .filter_map(|it| match it {
-                Item::Tool { id, name, summary, state, out, .. } if name == "task" || name == "bash" => {
-                    let kind = if name == "task" { "agent" } else { "shell" };
-                    let done = match state {
-                        ToolState::Running => None,
-                        ToolState::Done { ok } => Some(*ok),
-                    };
-                    Some((kind, done, summary.clone(), out.clone(), id.clone()))
+        let mut rows = Vec::new();
+        for it in self.items.iter().rev() {
+            let Item::Tool { id, name, summary, state, out, agent, who, kids, .. } = it else { continue };
+            let done = match state {
+                ToolState::Running => None,
+                ToolState::Done { ok } => Some(*ok),
+            };
+            match name.as_str() {
+                "task" => {
+                    let who = if who.is_empty() { agent } else { who };
+                    rows.push(("agent", done, format!("{agent} ▸ {who}  {summary}"), out.clone(), id.clone()));
+                    for k in kids {
+                        let (mut depth, mut p) = (1, k.parent.as_str());
+                        while let Some(q) = kids.iter().find(|x| x.id == p) {
+                            depth += 1;
+                            p = q.parent.as_str();
+                        }
+                        rows.push(("agent", k.done, format!("{}└ {} ▸ {}  {}", "  ".repeat(depth - 1), k.by, k.who, k.title), String::new(), k.id.clone()));
+                    }
                 }
-                _ => None,
-            })
-            .collect()
+                "bash" => rows.push(("shell", done, summary.clone(), out.clone(), id.clone())),
+                _ => {}
+            }
+        }
+        rows
     }
 
     /// Refresh the output shown in `/jobs` about once a second.
@@ -2185,12 +2248,6 @@ impl Ui {
     }
 
     /// Rows of the pending question's answer list: its options plus the free-text row.
-    fn ask_options(&self) -> usize {
-        match &self.overlay {
-            Some(Overlay::Ask(a)) => a.options.len() + 1,
-            _ => 0,
-        }
-    }
 
     /// Mouse over a popup row: `click` also activates it (Enter). Returns whether the popup took the event.
     fn overlay_mouse(&mut self, col: u16, row: u16, click: bool) -> bool {
@@ -2745,7 +2802,7 @@ impl Ui {
                 }
                 if out.len() == 1 { vec![] } else { out }
             }
-            Item::Tool { name, summary, state, out, display, sub, who, .. } => {
+            Item::Tool { name, summary, state, out, display, sub, who, agent, kids, .. } => {
                 // The plan is what the user reviews before Build starts: shown whole, in compact mode too.
                 if let (true, Some(plan), ToolState::Done { ok: true }) = (name == "write_plan", display, state) {
                     let mut out = vec![Line::default(), Line::from(Span::styled("  plan", theme::accent().add_modifier(Modifier::BOLD)))];
@@ -2756,7 +2813,8 @@ impl Ui {
                     }));
                     return out;
                 }
-                if !full {
+                // Compact mode keeps only the new agents (task), on one line.
+                if !full && name != "task" {
                     return vec![];
                 }
                 let (icon, st) = match state {
@@ -2764,18 +2822,71 @@ impl Ui {
                     ToolState::Done { ok: true } => ("✓", theme::ok()),
                     ToolState::Done { ok: false } => ("✗", theme::err()),
                 };
-                let mut head = vec![Span::styled(format!("  {icon} "), st), Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)), Span::raw(" ")];
-                if !who.is_empty() {
-                    head.push(Span::styled(format!("({who}) "), theme::agent(who).add_modifier(Modifier::BOLD)));
-                }
-                let mut lines = markdown::wrap(vec![Span::styled(summary.clone(), theme::dim())], width, std::mem::take(&mut head), vec![Span::raw("      ")]);
-                if lines.len() > 2 {
+                let mut lines;
+                if name == "task" {
+                    // Who launched whom, what for, and whether it still works: in compact mode too.
+                    let (word, wst) = match state {
+                        ToolState::Running => ("working", theme::accent()),
+                        ToolState::Done { ok: true } => ("done   ", theme::ok()),
+                        ToolState::Done { ok: false } => ("failed ", theme::err()),
+                    };
+                    let who_s = if who.is_empty() { agent } else { who };
+                    let head = vec![
+                        Span::styled(format!("  {icon} "), st),
+                        Span::styled(format!("{word} "), wst.add_modifier(Modifier::BOLD)),
+                        Span::styled(agent.clone(), theme::agent(agent).add_modifier(Modifier::BOLD)),
+                        Span::styled(" ▸ ", theme::dim()),
+                        Span::styled(who_s.clone(), theme::agent(who_s).add_modifier(Modifier::BOLD)),
+                        Span::raw("  "),
+                    ];
+                    lines = markdown::wrap(vec![Span::styled(summary.clone(), theme::dim())], width, head, vec![Span::raw("      ")]);
                     lines.truncate(2);
-                }
-                if name == "task" && (sub.read + sub.write + sub.cmd + sub.tools) > 0 {
-                    let mut l = vec![Span::styled("    ⎿ ", theme::dim())];
-                    l.extend(sub.spans());
-                    lines.push(Line::from(l));
+                    for k in kids {
+                        let mut depth = 1;
+                        let mut p = k.parent.as_str();
+                        while let Some(q) = kids.iter().find(|x| x.id == p) {
+                            depth += 1;
+                            p = q.parent.as_str();
+                        }
+                        let (ki, kw, ks) = match k.done {
+                            None => (SPIN[self.spin % SPIN.len()], "working", theme::accent()),
+                            Some(true) => ("✓", "done   ", theme::ok()),
+                            Some(false) => ("✗", "failed ", theme::err()),
+                        };
+                        let pad = "  ".repeat(depth);
+                        let mut head = vec![
+                            Span::styled(format!("  {pad}└ {ki} "), ks),
+                            Span::styled(format!("{kw} "), ks.add_modifier(Modifier::BOLD)),
+                            Span::styled(k.by.clone(), theme::agent(&k.by).add_modifier(Modifier::BOLD)),
+                            Span::styled(" ▸ ", theme::dim()),
+                            Span::styled(k.who.clone(), theme::agent(&k.who).add_modifier(Modifier::BOLD)),
+                            Span::raw("  "),
+                        ];
+                        let used: usize = head.iter().map(|s| s.content.width()).sum();
+                        let title: String = k.title.chars().take(width.saturating_sub(used + 1)).collect();
+                        head.push(Span::styled(title, theme::dim()));
+                        let c = k.sub.spans();
+                        if !c.is_empty() {
+                            head.push(Span::raw("  "));
+                            head.extend(c);
+                        }
+                        lines.push(Line::from(head));
+                    }
+                    if (sub.read + sub.write + sub.cmd + sub.tools) > 0 {
+                        let mut l = vec![Span::styled("    ⎿ ", theme::dim())];
+                        l.extend(sub.spans());
+                        lines.push(Line::from(l));
+                    }
+                    if !full {
+                        return lines;
+                    }
+                } else {
+                    let mut head = vec![Span::styled(format!("  {icon} "), st), Span::styled(name.clone(), theme::accent().add_modifier(Modifier::BOLD)), Span::raw(" ")];
+                    if !who.is_empty() {
+                        head.push(Span::styled(format!("({who}) "), theme::agent(who).add_modifier(Modifier::BOLD)));
+                    }
+                    lines = markdown::wrap(vec![Span::styled(summary.clone(), theme::dim())], width, std::mem::take(&mut head), vec![Span::raw("      ")]);
+                    lines.truncate(2);
                 }
                 let gutter = |s: &str, style: Style| Line::from(vec![Span::styled("    ⎿ ", theme::dim()), Span::styled(s.to_string(), style)]);
                 let clip = |s: &str| -> String { s.chars().take(width.saturating_sub(8)).collect() };
@@ -2891,12 +3002,23 @@ impl Ui {
         // A pending question takes the input's place: question, options, free-text row, hint.
         let ask = match &self.overlay {
             Some(Overlay::Ask(a)) => {
-                let mut q: Vec<String> = Vec::new();
-                for l in a.question.lines() {
-                    q.extend(markdown::wrap(vec![Span::raw(l.to_string())], width.saturating_sub(4), vec![], vec![]).iter().map(|x| x.spans.iter().map(|s| s.content.as_ref()).collect::<String>()));
-                }
+                // Control characters (tabs, \r, escapes) in model text garble the terminal: flatten them.
+                let clean = |t: &str| -> String { t.replace('\t', "    ").chars().filter(|c| !c.is_control() || *c == '\n').collect() };
+                let w = width.saturating_sub(6).max(8);
+                let wrap = |t: &str| -> Vec<String> {
+                    let mut out = Vec::new();
+                    for l in clean(t).lines() {
+                        out.extend(markdown::wrap(vec![Span::raw(l.to_string())], w, vec![], vec![]).iter().map(|x| x.spans.iter().map(|s| s.content.as_ref()).collect::<String>()));
+                    }
+                    if out.is_empty() {
+                        out.push(String::new());
+                    }
+                    out
+                };
+                let q = wrap(&a.question);
+                let opts: Vec<Vec<String>> = a.options.iter().map(|o| wrap(o)).collect();
                 let free = a.input.layout(width.saturating_sub(4));
-                Some((q, free))
+                Some((q, free, opts))
             }
             _ => None,
         };
@@ -2940,10 +3062,14 @@ impl Ui {
         };
         let input_h = match &ask {
             _ if pick.is_some() => pick.as_ref().map_or(0, |p| p.3 as u16 + 4),
-            Some((q, (free, _))) => ((q.len() + self.ask_options() + free.len() + 1) as u16 + 2).min(main.height.saturating_sub(4).max(5)),
+            Some((q, (free, _), opts)) => ((q.len() + opts.iter().map(|o| o.len()).sum::<usize>() + 1 + free.len().max(1) + 1) as u16 + 2).min(main.height.saturating_sub(4).max(5)),
             None => input_lines.len().min(8) as u16 + chips + 2,
         };
-        let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
+        // Finished tasks collapse into a count; the window shows what is left.
+        let todo_done = self.todos.iter().filter(|t| t.status == "done").count();
+        let todo_open: Vec<Todo> = self.todos.iter().filter(|t| t.status != "done").cloned().collect();
+        let todo_rows = todo_open.len().min(8) + usize::from(todo_done > 0);
+        let todo_h = if todo_open.is_empty() && !self.running { 0 } else { (todo_rows + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, _gap, input_area, _gap2, status] = Layout::vertical([
             Constraint::Min(3),
@@ -2986,7 +3112,11 @@ impl Ui {
         // todos
         if todo_h > 0 {
             let mut tl = vec![Line::from(Span::styled(" Tasks", theme::dim().add_modifier(Modifier::BOLD)))];
-            for t in self.todos.iter().take(8) {
+            if todo_done > 0 {
+                let st = theme::dim().add_modifier(Modifier::CROSSED_OUT);
+                tl.push(Line::from(vec![Span::styled(" ✓ ", st), Span::styled(format!("{todo_done} done"), st)]));
+            }
+            for t in todo_open.iter().take(8) {
                 let (mark, st) = match t.status.as_str() {
                     "done" => ("✓", theme::dim().add_modifier(Modifier::CROSSED_OUT)),
                     "in_progress" => ("▸", theme::accent().add_modifier(Modifier::BOLD)),
@@ -3030,6 +3160,11 @@ impl Ui {
                     spans.push(Span::styled(format!(" {r}"), theme::dim()));
                 }
                 spans.push(Span::styled(format!("  {time}"), theme::dim()));
+                let c = self.counts.spans();
+                if !c.is_empty() {
+                    spans.push(Span::styled("  ", theme::dim()));
+                    spans.extend(c);
+                }
             } else {
                 if self.interrupted {
                     spans.push(Span::styled("interrupted  ", theme::err()));
@@ -3071,18 +3206,23 @@ impl Ui {
             f.render_widget(Paragraph::new(il).style(band), inner);
             self.input_hit = (Rect::default(), 0, 0);
             f.set_cursor_position((inner.x + 2 + title.width() as u16 + 1 + p.filter.width() as u16, inner.y));
-        } else if let (Some((q, (free, (crow, ccol)))), Some(Overlay::Ask(a))) = (&ask, &self.overlay) {
+        } else if let (Some((q, (free, (crow, ccol)), opts)), Some(Overlay::Ask(a))) = (&ask, &self.overlay) {
             let mut il: Vec<Line> = q.iter().map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().add_modifier(Modifier::BOLD)))).collect();
             let mut hits = self.ov_hits.borrow_mut();
             hits.clear();
-            let y0 = inner.y + q.len() as u16;
-            for (i, o) in a.options.iter().enumerate() {
+            let mut y = inner.y + q.len() as u16;
+            for (i, o) in opts.iter().enumerate() {
                 let on = i == a.sel;
-                il.push(Line::from(vec![Span::styled(if on { "› " } else { "  " }, theme::accent()), Span::styled(format!("{}. {o}", i + 1), if on { theme::accent().add_modifier(Modifier::BOLD) } else { theme::fg() })]));
-                hits.push((y0 + i as u16, inner.x, inner.right().saturating_sub(1), i));
+                let st = if on { theme::accent().add_modifier(Modifier::BOLD) } else { theme::fg() };
+                for (n, l) in o.iter().enumerate() {
+                    let lead = if n == 0 { format!("{}. ", i + 1) } else { "   ".into() };
+                    il.push(Line::from(vec![Span::styled(if on && n == 0 { "› " } else { "  " }, theme::accent()), Span::styled(format!("{lead}{l}"), st)]));
+                    hits.push((y, inner.x, inner.right().saturating_sub(1), i));
+                    y += 1;
+                }
             }
             let on_free = a.sel == a.options.len();
-            let free_y = y0 + a.options.len() as u16;
+            let free_y = y;
             hits.push((free_y, inner.x, inner.right().saturating_sub(1), a.options.len()));
             drop(hits);
             let mark = Span::styled(if on_free { "› " } else { "  " }, theme::accent());
@@ -3276,23 +3416,24 @@ impl Ui {
                     hit(n, top + n);
                 }
                 let mut l: Vec<Line> = rows.iter().enumerate().skip(top).take(vis).map(|(i, (kind, state, label, _, _))| {
-                    let (mark, st) = match state {
-                        None => ("●", theme::accent()),
-                        Some(true) => ("✓", theme::dim()),
-                        Some(false) => ("✗", theme::err()),
+                    let (mark, word, st) = match state {
+                        None => ("●", "working", theme::accent()),
+                        Some(true) => ("✓", "done   ", theme::ok()),
+                        Some(false) => ("✗", "failed ", theme::err()),
                     };
                     let sel = if i == v.sel { theme::sel() } else { Style::default() };
-                    let label: String = label.chars().take(iw.saturating_sub(14)).collect();
+                    let label: String = label.chars().take(iw.saturating_sub(24)).collect();
                     Line::from(vec![
                         Span::styled(format!(" {} ", if i == v.sel { "›" } else { " " }), theme::accent()),
-                        Span::styled(format!("{mark} "), st),
-                        Span::styled(format!("{kind:<6} {label}"), sel),
+                        Span::styled(format!("{mark} {word} "), st),
+                        Span::styled(format!("{kind:<5} "), theme::dim()),
+                        Span::styled(label, sel),
                     ])
                 }).collect();
                 if l.is_empty() {
-                    l.push(Line::from(Span::styled(" nothing yet", theme::dim())));
+                    l.push(Line::from(Span::styled(" no subagent or shell command in this session yet", theme::dim())));
                 }
-                f.render_widget(Paragraph::new(l).block(block("θ activity").title_bottom(hint(" ↑↓ select · enter output · esc close "))), r);
+                f.render_widget(Paragraph::new(l).block(block("θ activity · subagents and shell commands").title_bottom(hint(" ↑↓ select · enter open transcript / output · esc close "))), r);
             }
             Overlay::Jobs(v) => {
                 let mut l = Vec::new();

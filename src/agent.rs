@@ -806,12 +806,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
             if let (Some(log), Event::ToolStart { name, .. }) = (&log, &ev) {
                 log.push(&format!("→ {name}\n"));
             }
-            // A grandchild's activity counts as this subagent's: the UI tracks one level.
-            let ev = match ev {
-                Event::Sub { event, .. } if matches!(*event, Event::ToolStart { .. }) => *event,
-                Event::Sub { .. } => continue,
-                ev => ev,
-            };
+            // A grandchild's events travel nested (Sub in Sub): the UI shows who launched whom.
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
     });
