@@ -17,6 +17,7 @@
 - **OpenAI/Codex.** Les items de raisonnement chiffrés sont renvoyés entre deux appels d'outils (`store: false`).
 
 ### Corrections
+- Auto : le compte rendu final porte sur le travail demandé (ce qui a changé, où le voir, ce qui reste), plus sur la review, qui n'y apparaît que pour un défaut non corrigé. Auto et `Build` n'ajoutent plus de texte superflu dans ce qu'ils construisent (paragraphes d'intro, slogans, aides sous chaque champ dans une interface ; commentaires qui répètent le code).
 - Les appels d'outils d'une même réponse ne tournent plus tous en même temps : les lectures ensemble, les outils à effet (`bash`, `edit`, `write`, MCP, `ask`) un par un, dans l'ordre écrit.
 - `bash` : au timeout, la sortie déjà produite est rendue et tout le groupe de processus est tué (aussi à l'interruption) ; une commande qui laisse un enfant en fond rend la main quand le shell sort.
 - Plusieurs `Build` en parallèle ne lancent plus chacun le check du projet sur un arbre à moitié édité : un seul check à la fois, laissé au dernier agent qui écrit.
