@@ -3554,18 +3554,25 @@ pub(crate) fn set_window_title(title: &str) {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
 }
 
-/// "θ", then how many sessions work and how many finished (or wait for an answer) in the background.
-fn title_for(running: bool, background: &[TabStatus]) -> String {
+/// "θ", then how many sessions work and finished in the background. A question for the user takes the
+/// whole title instead, so it stands out in the tab or window bar. `questions`: the open ones, this tab's first.
+fn title_for(running: bool, questions: &[&str], background: &[TabStatus]) -> String {
+    if let Some(first) = questions.first() {
+        let q: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+        let q = if q.chars().count() > 90 { format!("{}…", q.chars().take(89).collect::<String>()) } else { q };
+        let more = if questions.len() > 1 { format!(" (+{} more)", questions.len() - 1) } else { String::new() };
+        return format!("Theta needs your answer{more}: {q}");
+    }
     let working = usize::from(running) + background.iter().filter(|s| **s == TabStatus::Working).count();
     let finished = background.iter().filter(|s| matches!(s, TabStatus::Done | TabStatus::Error)).count();
-    let mut parts = vec!["θ".to_string()];
-    if working > 0 {
-        parts.push(format!("{working} working"));
-    }
-    if finished > 0 {
-        parts.push(format!("{finished} finished"));
-    }
-    parts.join(" · ")
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+    let state = match (working, finished) {
+        (0, 0) => "ready".to_string(),
+        (w, 0) => format!("{} working…", plural(w, "session", "sessions")),
+        (0, f) => format!("{} finished, come take a look", plural(f, "session", "sessions")),
+        (w, f) => format!("{w} working, {f} finished"),
+    };
+    format!("theta · {state}")
 }
 
 /// Copy via OSC 52: the local terminal's clipboard, also over SSH.
@@ -3627,7 +3634,16 @@ impl Ui {
     /// Window title: the active tab's run is live in `Ui`, the other tabs carry their status.
     fn window_title(&self) -> String {
         let background: Vec<TabStatus> = self.tabs.iter().enumerate().filter(|(i, _)| *i != self.cur).map(|(_, t)| t.status).collect();
-        title_for(self.running, &background)
+        let here = match &self.overlay {
+            Some(Overlay::Ask(a)) => Some(a.question.as_str()),
+            _ => None,
+        };
+        let questions: Vec<&str> = here
+            .into_iter()
+            .chain(self.asks.iter().map(|a| a.question.as_str()))
+            .chain(self.tabs.iter().enumerate().filter(|(i, _)| *i != self.cur).filter_map(|(_, t)| t.asking.as_deref()))
+            .collect();
+        title_for(self.running, &questions, &background)
     }
 
     fn title_now(&self) -> String {
@@ -3676,6 +3692,7 @@ impl Ui {
         self.swap_view(&mut view);
         let from = &mut self.tabs[self.cur];
         from.status = if view.running { TabStatus::Working } else { TabStatus::Idle };
+        from.asking = view.asks.front().map(|a| a.question.clone());
         from.title = title;
         from.agent = agent;
         from.model = model;
@@ -3690,7 +3707,7 @@ impl Ui {
         let view = self.tabs[to].view.take().expect("background tab keeps its view");
         self.install(view, to);
         let t = &mut self.tabs[to];
-        (t.status, t.errored) = (TabStatus::Idle, false);
+        (t.status, t.errored, t.asking) = (TabStatus::Idle, false, None);
         for p in std::mem::take(&mut t.backlog) {
             self.on_push(p);
         }
@@ -4517,9 +4534,12 @@ mod tests {
     #[test]
     fn window_title_counts_working_and_finished_sessions() {
         use super::{TabStatus::*, title_for};
-        assert_eq!(title_for(false, &[Idle, Idle]), "θ");
-        assert_eq!(title_for(true, &[]), "θ · 1 working");
-        assert_eq!(title_for(true, &[Working, Done, Error, Idle]), "θ · 2 working · 2 finished");
-        assert_eq!(title_for(false, &[Working, Done]), "θ · 1 working · 1 finished");
+        assert_eq!(title_for(false, &[], &[Idle, Idle]), "theta · ready");
+        assert_eq!(title_for(true, &[], &[]), "theta · 1 session working…");
+        assert_eq!(title_for(true, &[], &[Working, Done, Error, Idle]), "theta · 2 working, 2 finished");
+        assert_eq!(title_for(false, &[], &[Done]), "theta · 1 session finished, come take a look");
+        assert_eq!(title_for(false, &[], &[Working, Working]), "theta · 2 sessions working…");
+        assert_eq!(title_for(true, &["Delete  the\nfile?"], &[Done]), "Theta needs your answer: Delete the file?");
+        assert_eq!(title_for(true, &["A?", "B?"], &[]), "Theta needs your answer (+1 more): A?");
     }
 }

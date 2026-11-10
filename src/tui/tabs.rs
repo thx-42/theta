@@ -47,6 +47,8 @@ pub struct Tab {
     pub status: TabStatus,
     /// The run in progress hit an error.
     pub errored: bool,
+    /// The question waiting for the user's answer, if any.
+    pub asking: Option<String>,
     /// Pushes received while in the background, replayed when the tab is activated.
     pub backlog: Vec<Push>,
     /// Parked state; `None` for the active tab, whose state lives in `Ui`.
@@ -55,7 +57,7 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(id: u64) -> Self {
-        Tab { id, title: String::new(), agent: String::new(), model: String::new(), status: TabStatus::Idle, errored: false, backlog: vec![], view: None }
+        Tab { id, title: String::new(), agent: String::new(), model: String::new(), status: TabStatus::Idle, errored: false, asking: None, backlog: vec![], view: None }
     }
 
     /// Follow a push meant for a tab that is not on screen.
@@ -69,18 +71,20 @@ impl Tab {
                 self.agent = s.agent.clone();
                 self.model = s.model.clone();
                 self.errored = false;
+                self.asking = None;
                 self.status = if s.running { TabStatus::Working } else { TabStatus::Idle };
             }
             Push::Event(e) => match e {
                 Event::Started => {
                     self.errored = false;
+                    self.asking = None;
                     self.status = TabStatus::Working;
                 }
-                Event::Answered(_) => self.status = TabStatus::Working,
+                Event::Answered(_) => (self.asking, self.status) = (None, TabStatus::Working),
                 // A question needs the user: flag it like a finished run.
-                Event::Ask { .. } => self.status = TabStatus::Done,
+                Event::Ask { question, .. } => (self.asking, self.status) = (Some(question.clone()), TabStatus::Done),
                 Event::Error(_) => self.errored = true,
-                Event::Interrupted => self.status = TabStatus::Idle,
+                Event::Interrupted => (self.asking, self.status) = (None, TabStatus::Idle),
                 Event::Done if self.status != TabStatus::Idle => self.status = if self.errored { TabStatus::Error } else { TabStatus::Done },
                 Event::Title(t) => self.title = t.clone(),
                 Event::User(t) if self.title.is_empty() => self.title = t.clone(),
