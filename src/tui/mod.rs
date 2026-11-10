@@ -188,7 +188,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/ssh", "run tools on a server: <ssh arguments> | off"),
     ("/cd", "browse the ssh server's folders: (none) opens the explorer | <dir>"),
     ("/jobs", "background shells, linters and subagents (alt+j)"),
-    ("/undo", "remove the last turn and put its prompt back in the input"),
+    ("/undo", "remove the last turn and put its prompt back in the input: (none) | files = also put the files back"),
     ("/diff", "changes: session | turn | unpushed, popup | split | close"),
     ("/model", "change model"),
     ("/agent", "change agent"),
@@ -1293,7 +1293,7 @@ impl Ui {
                 },
             },
             "/tree" => self.open_tree(),
-            "/undo" => self.undo_turn(),
+            "/undo" => self.undo_turn(arg == "files"),
             "/diff" => self.open_diff(arg),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
@@ -1798,15 +1798,37 @@ impl Ui {
     }
 
     /// Drop the last turn from the active branch (kept in the tree) and edit its prompt.
-    fn undo_turn(&mut self) {
+    /// `files`: also put the working tree back to what it was when the last run started (the `/diff turn` base).
+    fn undo_turn(&mut self, files: bool) {
         if self.running {
             return self.notify("interrupt the agent first (Esc)");
         }
-        let last = tree::last_prompt(&self.app.session.lock().unwrap());
+        let (last, id) = {
+            let s = self.app.session.lock().unwrap();
+            (tree::last_prompt(&s), s.id.clone())
+        };
         let Some((parent, text)) = last else { return self.notify("nothing to undo") };
+        let base = self.diff_base.get(&id).and_then(|b| b.1.clone());
+        let note = match (files, base) {
+            (false, Some(_)) => "undone: edit and press Enter to resend (files untouched; `/undo files` also puts them back)".to_string(),
+            (false, None) => "undone: edit and press Enter to resend".to_string(),
+            (true, None) => "undone; no snapshot of the files before that turn, they were left as they are".to_string(),
+            (true, Some(tree)) => match crate::diff::restore(&self.app.rt.cwd, &tree) {
+                Ok((0, _)) => "undone; the files had not changed".to_string(),
+                Ok((n, kept)) => {
+                    // One snapshot per turn: a second `/undo files` must not claim to restore an older turn.
+                    if let Some(b) = self.diff_base.get_mut(&id) {
+                        b.1 = None;
+                    }
+                    self.refresh_diff();
+                    format!("undone, {n} file(s) put back; what was there is kept: git checkout {kept} -- .")
+                }
+                Err(e) => return self.notify(format!("files not restored, nothing undone: {e}")),
+            },
+        };
         self.remote.send(Req::Leaf(parent));
         self.input.set(text);
-        self.notify("undone: edit and press Enter to resend");
+        self.notify(note);
     }
 
     fn open_tree(&mut self) {

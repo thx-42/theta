@@ -50,6 +50,40 @@ pub fn diff(cwd: &Path, scope: &str, session: Option<&str>, turn: Option<&str>) 
     git(cwd, &["diff", "--no-color", "--no-ext-diff", &base, &now], None)
 }
 
+/// Put the working tree back to `tree` (a snapshot taken earlier): files changed or deleted since are rewritten,
+/// files created since are removed; ignored files and the index are left alone. The state it replaces is kept under
+/// a ref first, so the restore itself can be undone. Returns (files rewritten or removed, that ref).
+pub fn restore(cwd: &Path, tree: &str) -> Result<(usize, String), String> {
+    // From the top of the repository: the paths git lists are relative to it.
+    let top = std::path::PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"], None)?);
+    let cwd = top.as_path();
+    let now = snapshot(cwd)?;
+    if now == tree {
+        return Ok((0, String::new()));
+    }
+    let keep = git(cwd, &["-c", "user.name=theta", "-c", "user.email=theta@localhost", "commit-tree", &now, "-m", "theta: before /undo files"], None)?;
+    let name = format!("refs/theta/undo/{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    git(cwd, &["update-ref", &name, &keep], None)?;
+    let list = |filter: &str| -> Result<Vec<String>, String> {
+        Ok(git(cwd, &["diff", "--name-only", "-z", "--no-renames", &format!("--diff-filter={filter}"), tree, &now], None)?.split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
+    };
+    let (added, changed) = (list("A")?, list("MD")?);
+    let idx = std::env::temp_dir().join(format!("theta-restore-{}", std::process::id()));
+    let i = Some(idx.as_path());
+    let r = git(cwd, &["read-tree", tree], i).and_then(|_| {
+        // Only what differs: untouched files keep their timestamps (no needless rebuild).
+        let mut args = vec!["checkout-index", "-f", "--"];
+        args.extend(changed.iter().map(String::as_str));
+        if changed.is_empty() { Ok(String::new()) } else { git(cwd, &args, i) }
+    });
+    let _ = std::fs::remove_file(&idx);
+    r?;
+    for p in &added {
+        let _ = std::fs::remove_file(top.join(p));
+    }
+    Ok((added.len() + changed.len(), name))
+}
+
 /// The `diff` tool: the working tree (untracked files included) against `base` (a commit, default HEAD), whole or for
 /// one `path`; `stat` gives the per-file summary only.
 pub fn against(cwd: &Path, base: Option<&str>, path: Option<&str>, stat: bool) -> Result<String, String> {
@@ -97,6 +131,14 @@ mod tests {
         assert!(!against(&d, None, Some("b.txt"), false).unwrap().contains("a.txt"));
         assert!(against(&d, None, None, true).unwrap().contains("2 files changed"));
         assert!(against(&d, Some("--output=x"), None, false).is_err() && against(&d, Some("nope"), None, false).is_err());
+        // restore: back to `base` (a.txt only), and what was there stays reachable
+        std::fs::write(d.join("a.txt"), "changed\n").unwrap();
+        let (n, kept) = restore(&d, &base).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "one\n");
+        assert!(!d.join("b.txt").exists());
+        assert!(git(&d, &["show", &format!("{kept}:b.txt")], None).unwrap().contains("two"));
+        assert_eq!(restore(&d, &base).unwrap().0, 0);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
