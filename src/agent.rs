@@ -273,9 +273,9 @@ fn drain_steer(steer: &Steer, session: &Arc<Mutex<Session>>, tx: &Tx, rt: &Runti
 const REPORT_CAP: usize = 6000;
 
 /// Subagents (often a cheaper model) drift into workarounds when blocked; the orchestrator can unblock them, they cannot.
-const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing around it. Every tool call must move that step forward: no docs, refactors, cleanup, reviews of unrelated files or git unless the brief asks.\nWhen something stands in the way (a refused command, a missing tool or binary, missing access, credentials or a service, a check you cannot fix in two tries), do not work around it:\n- never build a replacement for a missing tool (your own parser, linter, interpreter binding, test harness, mock runtime);\n- never redo a refused command another way (python, awk, another shell command): use the tool the refusal names;\n- never search for passwords, keys or connection strings, and never change a live database or service the brief did not name (read-only MCP probes are fine);\n- never install packages unless the brief says so.\nInstead: finish what you can, mark the blocked check `not verified` with the reason, and report it as a blocker, or stop and ask (`questions:`). A blocker reported in one line is worth more to the orchestrator than an hour of workaround.";
+const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing around it. If a layer the brief needs is missing, list it in the report instead of building it. Verify once and fix at most twice, then report what still fails under `deviations:`. Every tool call must move that step forward: no docs, refactors, cleanup, reviews of unrelated files or git unless the brief asks.\nWhen something stands in the way (a refused command, a missing tool or binary, missing access, credentials or a service, a check you cannot fix in two tries), do not work around it:\n- never build a replacement for a missing tool (your own parser, linter, interpreter binding, test harness, mock runtime);\n- never redo a refused command another way (python, awk, another shell command): use the tool the refusal names;\n- never search for passwords, keys or connection strings, and never change a live database or service the brief did not name (read-only MCP probes are fine);\n- never install packages unless the brief says so.\nInstead: finish what you can, mark the blocked check `not verified` with the reason, and report it as a blocker, or stop and ask (`questions:`). A blocker reported in one line is worth more to the orchestrator than an hour of workaround.";
 
-const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists only the defects, one line each as `path:line problem` (max 15 lines, nothing about what is fine); no defect: `no defects`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
+const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under {budget} characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000). Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists only the defects, one line each as `path:line problem` (max 15 lines, nothing about what is fine); no defect: `no defects`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
 
 /// Auto ends a turn that changed files without having read the diff: the strongest model reviews before the user does.
 const REVIEW_MSG: &str = "Files changed during this turn and you have not read the diff since your last change. Before your final answer, run `git diff` (and read the new files) as the user's most demanding reviewer: bugs and unhandled failure paths; missing junctions (is everything this change must be wired to actually wired, does it work from the user's entry point?); leftovers (debug code, stale callers, docs, tests). Fix what you find, verify again, then give your final answer.";
@@ -286,18 +286,31 @@ const CHECKPOINT_MSG: &str = "Checkpoint: stop calling tools now. Your next mess
 pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, steer: Steer) -> Result<()> {
     let (provider, model) = rt.resolve(&turn.model)?;
     let extra = if turn.depth > 0 { rt.settings.skills.subagent.clone() } else { vec![] };
-    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra), turn.depth == 0);
+    let tools = rt.tools_for(&turn.agent, turn.depth);
+    let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    // Facts the agent would otherwise spend a turn finding out. Local only: over ssh the project is elsewhere.
+    let mut env = Vec::new();
+    if rt.ssh.get().is_none() {
+        if let Some(b) = git(&rt.cwd, &["branch", "--show-current"]).await {
+            env.push(format!("git branch: {}", if b.trim().is_empty() { "(detached HEAD)" } else { b.trim() }));
+        }
+        if let Some(c) = verify_command(&rt.settings, &rt.cwd).filter(|_| names.iter().any(|n| n == "bash")) {
+            env.push(format!("project check: `{c}`"));
+        }
+    }
+    let mut system = agents::system_prompt(&turn.agent, &rt.project, &rt.cwd, &crate::skills::auto_section(&rt.skills, &extra), turn.depth == 0, &names, &env);
     if turn.depth > 0 {
         system.push_str("\n\n");
         system.push_str(WORK_RULE);
         system.push_str("\n\n");
-        system.push_str(REPORT_RULE);
+        // A searcher or planner hands back findings the orchestrator would otherwise look up again; a builder's diff speaks for itself.
+        let budget = if agents::is_readonly(&turn.agent) { "2000" } else { "800" };
+        system.push_str(&REPORT_RULE.replace("{budget}", budget));
     }
     if let Some(h) = rt.ssh.get() {
         system.push_str("\n\n");
         system.push_str(&crate::ssh::prompt_note(&h));
     }
-    let tools = rt.tools_for(&turn.agent, turn.depth);
     let session_id = session.lock().unwrap().id.clone();
     let ctx = rt.tool_ctx(&session_id);
     let mut overflow_retry = false;
@@ -958,8 +971,10 @@ mod tests {
     #[tokio::test]
     async fn default_tool_set_is_lean() {
         let rt = test_rt().await;
-        let build = agents::find(&agents::discover(std::path::Path::new("/nonexistent")), "Build").unwrap().clone();
-        let names: Vec<_> = rt.tools_for(&build, 0).into_iter().map(|d| d.name).collect();
+        // An agent file without `tools:` gets the lean set; Build lists its own (with find and ls).
+        let mut plain = agents::parse_builtin(agents::DEFAULT_BUILD, "Build");
+        plain.tools = None;
+        let names: Vec<_> = rt.tools_for(&plain, 0).into_iter().map(|d| d.name).collect();
         assert!(names.iter().all(|n| !tools::OPT_IN.contains(&n.as_str())), "{names:?}");
         assert!(names.contains(&"bash".to_string()) && names.contains(&"job".to_string()));
     }

@@ -62,6 +62,19 @@ pub fn discover(project: &Path, auto: &[String]) -> Vec<Skill> {
     out
 }
 
+/// Skills every install gets: the defaults of `[skills] subagent` name them.
+const SHIPPED: &[(&str, &str)] = &[("caveman", include_str!("../.theta/skills/caveman.md")), ("ponytail", include_str!("../.theta/skills/ponytail.md"))];
+
+/// Write the shipped skills that are missing from `dir` (an existing file is the user's and is left alone).
+pub fn install_shipped(dir: &Path) {
+    for (name, text) in SHIPPED {
+        let path = dir.join(format!("{name}.md"));
+        if !path.exists() && !dir.join(name).join("SKILL.md").exists() {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
 fn block(s: &Skill) -> String {
     format!("<skill name=\"{}\">\n{}\n</skill>", s.name, s.body)
 }

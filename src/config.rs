@@ -388,6 +388,7 @@ pub fn bootstrap() -> Result<()> {
     std::fs::create_dir_all(h.join("cache"))?;
     sync_souls(false)?;
     sync_agents(&h.join("agents"), false);
+    crate::skills::install_shipped(&h.join("skills"));
     let changed = write_docs()?;
     if !changed.is_empty() {
         eprintln!("theta: guides updated in {}: {}", h.join("docs").display(), changed.join(", "));

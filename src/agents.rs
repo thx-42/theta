@@ -176,12 +176,38 @@ fn read(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// SOUL (global, then project) + agent prompt + auto skills + environment + project context file.
-/// `with_guides`: the theta guides are for the main agent; subagents skip them (smaller cold prefix).
 /// Models drift to `bash` for everything; the dedicated tools cap output, respect .gitignore and are counted in the UI.
-const TOOL_RULE: &str = "# Tools\nUse `read`, `grep`, `find` and `ls` to look at files and `edit`/`write` to change them. Use `bash` only to run commands (builds, tests, git, services), not for cat, sed, head, grep, find or ls. Call independent tools in the same turn (several reads or greps at once), and read a whole function or section in one `read`, not 30-line slices: every turn resends the whole context.";
+/// Written from the tools the agent really has: a rule that names a tool it lacks sends it in circles.
+fn tool_rule(tools: &[String]) -> String {
+    let has = |n: &str| tools.iter().any(|t| t == n);
+    let tick = |names: &[&str]| names.iter().filter(|n| has(n)).map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+    let (look, change) = (tick(&["read", "grep", "find", "ls"]), tick(&["edit", "write"]));
+    let mut s = String::from("# Tools\n");
+    match (look.is_empty(), change.is_empty()) {
+        (false, false) => s += &format!("Use {look} to look at files and {change} to change them. "),
+        (false, true) => s += &format!("Use {look} to look at files. "),
+        (true, false) => s += &format!("Use {change} to change files. "),
+        (true, true) => {}
+    }
+    if has("bash") && !look.is_empty() {
+        s += "Use `bash` only to run commands (builds, tests, git, services), not for what those tools do (cat, sed, head, grep). ";
+        if !has("find") || !has("ls") {
+            s += "Listing files with `bash` (`ls`, `git ls-files`) is fine. ";
+        }
+    }
+    if has("read") {
+        s += "Call independent tools in the same turn (several reads or greps at once), and read a whole function or section in one `read`, not 30-line slices: every turn resends the whole context. ";
+    }
+    if has("bash") || !change.is_empty() {
+        s += "Reading tools written in one reply run together; tools that change something run one after the other, in the order you write them.";
+    }
+    s.trim_end().to_string()
+}
 
-pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, with_guides: bool) -> String {
+/// SOUL (global, then project) + agent prompt + tool rule + auto skills + environment + instruction files.
+/// `main`: the pointer to the theta guides is for the main agent; subagents skip it.
+/// `tools`: names of the tools this run offers. `env`: extra lines for the environment block (git branch, project check).
+pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, main: bool, tools: &[String], env: &[String]) -> String {
     let mut parts = Vec::new();
     if let Some(s) = read(&config::home().join("SOUL.md")) {
         parts.push(s);
@@ -197,22 +223,29 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, wi
         }
     }
     parts.push(agent.prompt.clone());
-    parts.push(TOOL_RULE.to_string());
+    parts.push(tool_rule(tools));
     if !skills.is_empty() {
         parts.push(skills.to_string());
     }
-    if let Some(guides) = with_guides.then(guides).flatten() {
+    if let Some(guides) = main.then(guides).flatten() {
         parts.push(guides);
     }
     let date = chrono_date();
-    parts.push(format!(
+    let mut environment = format!(
         "# Environment\n- cwd: {}\n- project root: {}\n- platform: {} {}\n- date: {date}",
         cwd.display(),
         project.display(),
         std::env::consts::OS,
         std::env::consts::ARCH
-    ));
-    for name in ["AGENTS.md", "CLAUDE.md"] {
+    );
+    for line in env {
+        environment += &format!("\n- {line}");
+    }
+    parts.push(environment);
+    if let Some(ctx) = read(&config::home().join("AGENTS.md")) {
+        parts.push(format!("# User instructions (~/.theta/AGENTS.md)\n{ctx}"));
+    }
+    for name in ["AGENTS.md", "AGENT.md", "CLAUDE.md"] {
         if let Some(ctx) = read(&project.join(name)) {
             parts.push(format!("# Project instructions ({name})\n{ctx}"));
             break;
@@ -221,12 +254,13 @@ pub fn system_prompt(agent: &Agent, project: &Path, cwd: &Path, skills: &str, wi
     parts.join("\n\n")
 }
 
-/// Every guide in ~/.theta/docs, in name order: lets theta explain and configure itself.
+/// Where the guides are, not their text: 6k tokens in every session for questions that are rarely asked.
+/// The agent reads the one it needs when theta itself is the subject.
 fn guides() -> Option<String> {
-    let mut files: Vec<_> = std::fs::read_dir(config::home().join("docs")).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
-    files.sort();
-    let texts: Vec<String> = files.iter().filter_map(|p| read(p)).collect();
-    (!texts.is_empty()).then(|| format!("# theta guides (~/.theta/docs)\n\n{}", texts.join("\n\n")))
+    let dir = config::home().join("docs");
+    let mut names: Vec<String> = std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.ends_with(".md")).collect();
+    names.sort();
+    (!names.is_empty()).then(|| format!("# theta guides\nHow theta itself works and is configured (settings, agents, tools, skills, MCP, commands) is written in {}: {}. Read the one that applies before you answer a question about theta or change its configuration; do not answer from memory.", dir.display(), names.join(", ")))
 }
 
 fn chrono_date() -> String {
@@ -260,20 +294,20 @@ name: Build
 description: Default coding agent — reads, edits, runs and verifies code
 can: read, edit and write files, run shell commands, build and test, search the web, delegate to subagents
 cannot: ask the user questions mid-task or hand off to another agent (as a subagent, it asks the orchestrator instead)
-tools: read, grep, edit, write, bash, job, todo, web_search, web_fetch, task, mcp__*
+tools: read, grep, find, ls, edit, write, bash, job, todo, web_search, web_fetch, task, mcp__*
 ---
 You are theta, a coding agent working in the user's terminal on their project.
 
 Work loop:
-1. Understand: use grep/find/read to locate the relevant code. Prefer targeted reads (offset/limit) over whole large files.
+1. Understand: `grep`, `find` and `read` to locate the relevant code; read the whole function or section you are about to change, and its callers.
 2. Plan: for multi-step work, keep a `todo` list and update it as you go.
-3. Change: use `edit` for surgical changes and `write` only for new files or full rewrites.
-4. Verify: run the build/tests with `bash`. Fix what you broke.
+3. Change: `edit` for surgical changes, `write` only for new files or full rewrites.
+4. Verify: run the build and the tests with `bash`. Fix what you broke. Nothing to run it with: say "not verified", do not write your own harness.
 5. Report: a short summary of what changed and anything left unverified.
 
-Stay inside the brief's scope; if a needed layer is missing, list it in the report instead of building it. Verify once and fix at most twice, then report what still fails under `deviations:`; if the verification tool is missing, report "not verified" instead of writing your own harness.
-MCP tools connected to a real runtime (a game server, a framework, a service) are how you check behaviour where the code runs: use them for read-only probes and for the checks the brief names. No persistent change through them (data, players, files) unless the brief says so.
-Live state: never `git commit` or `git push`, and never write to a shared database or a remote service, unless the brief says so. Project rules that ask for commits or pushes apply to the final delivery, which the orchestrator runs. Never put a password in a command line: use the config file that holds it.
+Stay inside the scope of the request; if a needed layer is missing, say so instead of building it unasked.
+MCP tools connected to a real runtime (a game server, a framework, a service) are how you check behaviour where the code runs: use them for read-only probes and for the checks asked for. No persistent change through them (data, players, files) unless asked.
+Commits and pushes: working with the user directly, follow the project instructions (commit or push when they say so, otherwise only when the user asks). As a subagent, never commit or push unless the brief says so: delivery belongs to the orchestrator. Never write to a shared database or a remote service unless asked. Never put a password in a command line: use the config file that holds it.
 
 Use `task` with agent `Explore` for broad searches or independent research so your context stays small.
 Use `web_search` / `web_fetch` for current docs or facts you are unsure of.
@@ -395,6 +429,39 @@ mod tests {
         let b = parse("plain prompt", "Plain", Scope::Global);
         assert_eq!((b.name.as_str(), b.prompt.as_str()), ("Plain", "plain prompt"));
         assert!(chrono_date().starts_with("20"));
+    }
+
+    #[test]
+    fn tool_rule_names_only_the_tools_offered() {
+        let t = |v: &[&str]| tool_rule(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let full = t(&["read", "grep", "find", "ls", "edit", "write", "bash"]);
+        assert!(full.contains("`read`, `grep`, `find`, `ls`") && full.contains("`edit`, `write`") && !full.contains("is fine"), "{full}");
+        let lean = t(&["read", "grep", "edit", "bash"]);
+        assert!(!lean.contains("`find`") && !lean.contains("`write`") && lean.contains("Listing files with `bash`"), "{lean}");
+        let ro = t(&["read", "grep", "find", "ls"]);
+        assert!(!ro.contains("bash") && !ro.contains("change"), "{ro}");
+        let build = parse(DEFAULT_BUILD, "Build", Scope::Builtin);
+        assert!(["find", "ls"].iter().all(|n| build.tools.as_ref().unwrap().iter().any(|t| t == n)));
+    }
+
+    #[test]
+    fn prompt_points_to_guides_and_reads_agent_md() {
+        let home = std::env::temp_dir().join(format!("theta-prompt-test-{}", std::process::id()));
+        let project = home.join("proj");
+        std::fs::create_dir_all(home.join("docs")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join("docs/config.md"), "GUIDE BODY ".repeat(500)).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "always answer in French").unwrap();
+        std::fs::write(project.join("AGENT.md"), "push every change to dev").unwrap();
+        let _g = crate::config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("THETA_HOME", &home) };
+        let a = parse("---\nname: X\n---\nbody", "X", Scope::Local);
+        let main = system_prompt(&a, &project, &project, "", true, &["read".into()], &["git branch: dev".into()]);
+        let sub = system_prompt(&a, &project, &project, "", false, &["read".into()], &[]);
+        unsafe { std::env::remove_var("THETA_HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(main.contains("config.md") && !main.contains("GUIDE BODY") && !sub.contains("config.md"), "{main}");
+        assert!(main.contains("push every change to dev") && main.contains("always answer in French") && main.contains("- git branch: dev"));
     }
 
     #[test]
