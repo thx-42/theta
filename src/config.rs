@@ -195,11 +195,15 @@ pub struct ToolSettings {
     pub auto_nudges: usize,
     /// Model calls after which a subagent must stop and write a handoff report (0 = never).
     pub checkpoint_steps: usize,
+    /// Ask before a shell command that destroys work or reaches outside the project (see `tools::shell::risky`).
+    pub guard: bool,
+    /// Extra regexes: a `bash` command matching one also needs the user's yes.
+    pub confirm: Vec<String>,
 }
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80, auto_nudges: 8, checkpoint_steps: 40 }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80, auto_nudges: 8, checkpoint_steps: 40, guard: true, confirm: vec![] }
     }
 }
 
@@ -533,6 +537,8 @@ max_lines = 300
 # auto_nudges = 8        # times Auto is sent back to work when it stops with unfinished todos; 0 = never
 # checkpoint_steps = 40  # model calls after which a subagent writes a handoff report for Auto; 0 = never
 disabled = []
+# guard = true           # ask before destructive shell commands (rm -r outside the project, force push, reset --hard, sudo, DROP…)
+# confirm = ["terraform apply", "kubectl delete"]   # extra regexes that also need your yes
 
 # Skills (~/.theta/skills, <project>/.theta/skills): `$name` in a message injects one.
 [skills]

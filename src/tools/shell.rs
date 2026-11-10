@@ -170,6 +170,48 @@ async fn effective(cmd: &str, ctx: &ToolCtx) -> String {
     if use_rtk { rtk_rewrite(cmd).await.unwrap_or(cmd.to_string()) } else { cmd.to_string() }
 }
 
+/// Why `cmd` should not run without the user's yes, if it destroys work or reaches outside the project.
+/// A short list of commands whose damage cannot be undone from here; everything else runs unasked.
+pub fn risky(cmd: &str, cwd: &std::path::Path, extra: &[String]) -> Option<String> {
+    static RULES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        [
+            (r"(^|[\s;&|(])(sudo|doas)\s", "runs as root"),
+            (r"\bgit\s+push\b[^;&|\n]*(\s--force\b|\s--force-with-lease\b|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s\+\S)", "force push"),
+            (r"\bgit\s+reset\b[^;&|\n]*--hard", "discards uncommitted work"),
+            (r"\bgit\s+clean\b[^;&|\n]*\s-[a-zA-Z]*f", "deletes untracked files"),
+            (r"(?i)\b(drop\s+(table|database|schema)|truncate\s+table)\b", "drops data"),
+            (r"\bmkfs(\.\w+)?\s|\bdd\b[^;&|\n]*\bof=/dev/", "writes to a device"),
+        ]
+        .into_iter()
+        .map(|(r, why)| (Regex::new(r).unwrap(), why))
+        .collect()
+    });
+    if let Some((_, why)) = rules.iter().find(|(r, _)| r.is_match(cmd)) {
+        return Some((*why).to_string());
+    }
+    // `rm -r` is routine inside the project (build folders); elsewhere it is not.
+    for part in cmd.split([';', '&', '|', '\n']) {
+        let mut words = part.split_whitespace().skip_while(|w| w.contains('=') || matches!(*w, "command" | "exec" | "time" | "nohup"));
+        if words.next() != Some("rm") {
+            continue;
+        }
+        let (flags, targets): (Vec<&str>, Vec<&str>) = words.partition(|w| w.starts_with('-'));
+        if !flags.iter().any(|f| *f == "--recursive" || (!f.starts_with("--") && f.contains(['r', 'R']))) {
+            continue;
+        }
+        for t in targets {
+            let t = t.trim_matches(['"', '\'']);
+            let inside = std::path::Path::new(t).starts_with(cwd) || t.starts_with("/tmp/") || t.starts_with("/var/tmp/");
+            let outside = (t.starts_with('/') && !inside) || t.starts_with('~') || t.starts_with('$') || t.split('/').any(|c| c == "..") || matches!(t, "." | "*" | "./" | "./*");
+            if outside {
+                return Some(format!("recursive delete of `{t}`"));
+            }
+        }
+    }
+    extra.iter().filter_map(|p| Regex::new(p).ok().map(|r| (r, p))).find(|(r, _)| r.is_match(cmd)).map(|(_, p)| format!("matches `{p}` in [tools] confirm"))
+}
+
 /// Bytes of one foreground command's output kept in memory.
 const MAX_CAPTURE: usize = 8 * 1024 * 1024;
 
@@ -282,6 +324,18 @@ mod tests {
         let out = super::bash(&serde_json::json!({"command": "sleep 4 & echo started", "timeout": 30}), &ctx()).await.unwrap();
         assert!(!out.is_error && out.content.contains("started"), "{}", out.content);
         assert!(t0.elapsed() < std::time::Duration::from_secs(3), "waited for the background child: {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn guard_asks_for_what_cannot_be_undone() {
+        let cwd = std::path::Path::new("/home/u/proj");
+        let risky = |c: &str| super::risky(c, cwd, &["terraform apply".to_string()]);
+        for c in ["sudo apt install x", "git push --force origin main", "git push -f", "git push origin +main", "cd x && git reset --hard HEAD~1", "git clean -fdx", "psql -c 'DROP TABLE users'", "rm -rf ~/work", "rm -rf /etc/x", "rm -fr ../other", "FOO=1 rm -r $DIR", "rm -rf *", "terraform apply -auto-approve", "dd if=a of=/dev/sda"] {
+            assert!(risky(c).is_some(), "{c}");
+        }
+        for c in ["rm -rf target", "rm -rf ./node_modules build/", "rm -rf /home/u/proj/dist", "rm -rf /tmp/x", "rm file.txt", "git push origin dev", "git push -u origin dev", "git reset HEAD~1", "git clean -n", "cargo test", "echo pseudo code", "grep -r dropdown ."] {
+            assert!(risky(c).is_none(), "{c}: {:?}", risky(c));
+        }
     }
 
     #[test]

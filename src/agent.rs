@@ -475,7 +475,25 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 }
                 let _ = tx.send(Event::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
-                let mut out = if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
+                // A command whose damage cannot be undone needs the user's yes; the prompt alone is not a guard.
+                let risk = (name == "bash" && rt.settings.tools.guard).then(|| args.get("command").and_then(|v| v.as_str()).and_then(|c| tools::shell::risky(c, &rt.cwd, &rt.settings.tools.confirm).map(|why| (c.to_string(), why)))).flatten();
+                let refused = match risk {
+                    None => None,
+                    Some((_, why)) if turn.depth > 0 => Some(tools::ToolOut::err(format!("not run: this command needs the user's confirmation ({why}) and a subagent cannot ask. Do not reach the same result another way: report it as a blocker."))),
+                    Some((cmd, why)) => {
+                        let a = ask(&rt, &json!({"question": format!("Run this command? ({why})\n{cmd}"), "type": "choice", "options": ["Run it", "Do not run it"]}), &tx).await;
+                        if a.is_error {
+                            Some(tools::ToolOut::err(format!("not run: this command needs the user's confirmation ({why}) and nobody is there to give it. Do not reach the same result another way: say what is left to do.")))
+                        } else if a.content.trim_end().ends_with("Run it") {
+                            None
+                        } else {
+                            Some(tools::ToolOut::err(format!("not run: the user did not approve this command ({why}). {} Do not reach the same result another way.", a.content)))
+                        }
+                    }
+                };
+                let mut out = if let Some(r) = refused {
+                    r
+                } else if name == "job" && args.get("action").and_then(|v| v.as_str()) == Some("wait") {
                     let pending = || !steer.lock().unwrap().is_empty();
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if let Some(open) = (name == "task" && turn.depth == 0 && writes_files(&rt, &turn, &args)).then(|| tools::fs::open_questions(&ctx.session_id)).filter(|q| !q.is_empty()) {
