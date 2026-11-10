@@ -54,6 +54,7 @@ pub mod theme {
         pub sel: Color,
         pub band: Color,
         /// Text on the θ badge.
+        #[allow(dead_code)]
         pub on_accent: Color,
         /// Whole-screen background, used when `theme_bg` is on.
         pub bg: Color,
@@ -165,15 +166,12 @@ pub mod theme {
     pub fn err() -> Style { Style::default().fg(current().err) }
     pub fn user() -> Style { Style::default().add_modifier(Modifier::BOLD) }
     /// The θ badge of the status bar, in the color of the active agent.
-    pub fn logo(name: &str) -> Style { Style::default().fg(current().on_accent).bg(Color::Indexed(color_for(name))).add_modifier(Modifier::BOLD) }
     pub fn sel() -> Style { Style::default().bg(current().sel).add_modifier(Modifier::BOLD) }
     pub fn band() -> Style { Style::default().bg(current().band) }
 }
 
 const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Inference indicator glyphs (pulses like Claude Code's).
-const PULSE: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
-const VERBS: &[&str] = &["Thinking", "Pondering", "Reasoning", "Working", "Computing", "Brewing", "Forging", "Weaving", "Crafting", "Mulling"];
 
 
 /// Main actions behind ctrl+p, in menu order. Descriptions come from COMMANDS.
@@ -234,6 +232,14 @@ pub fn tool_summary(name: &str, args: &Value) -> String {
         "task" => g("description"),
         "write_plan" => format!("{} lines", g("content").lines().count()),
         "ask" => g("question"),
+        "job" => match g("action").as_str() {
+            "wait" => if g("mode") == "all" { "waiting for all subagents".into() } else { "waiting for the next subagent".into() },
+            "list" => "listing jobs".into(),
+            "output" => format!("output of {}", g("id")),
+            "kill" => format!("stopping {}", g("id")),
+            "todos" => format!("progress of {}", g("id")),
+            _ => args.to_string(),
+        },
         "handoff" => format!("→ {} · {}", args.get("agent").and_then(|v| v.as_str()).unwrap_or("Build"), g("summary")),
         _ => args.to_string(),
     };
@@ -261,11 +267,13 @@ impl Counts {
     fn spans(&self) -> Vec<Span<'static>> {
         let mut v = Vec::new();
         for (n, label) in [(self.read, "read"), (self.write, "write"), (self.cmd, "cmd"), (self.tools, "tools")] {
+            if n == 0 {
+                continue;
+            }
             if !v.is_empty() {
                 v.push(Span::styled(" · ", theme::dim()));
             }
-            v.push(Span::styled(n.to_string(), if n > 0 { Style::default().add_modifier(Modifier::BOLD) } else { theme::dim() }));
-            v.push(Span::styled(format!(" {label}"), theme::dim()));
+            v.push(Span::styled(format!("{n} {label}"), theme::dim()));
         }
         v
     }
@@ -681,7 +689,6 @@ struct Ui {
     quit_armed: Option<Instant>,
     notice: Option<(String, Instant)>,
     spin: usize,
-    verb: &'static str,
     /// Output tokens of finished steps + streamed chars of the current one (for the live counter).
     out_tokens: u64,
     stream_chars: usize,
@@ -991,7 +998,6 @@ impl Ui {
         self.started = Instant::now();
         self.counts = Counts::default();
         self.status = "thinking".into();
-        self.verb = VERBS[rand::random_range(0..VERBS.len())];
         self.out_tokens = 0;
         self.stream_chars = 0;
         self.scroll_top = None;
@@ -1611,12 +1617,12 @@ impl Ui {
             Target::Agent(i) => format!("{} model", rt.agents[i].name),
         };
         let sel = items.iter().position(|i| i.value == current).unwrap_or(0);
-        self.overlay = Some(Overlay::Pick(Picker { title: format!("{title}  (type to filter)"), items, filter: String::new(), sel, purpose: Purpose::Model(target) }));
+        self.overlay = Some(Overlay::Pick(Picker { title: title.clone(), items, filter: String::new(), sel, purpose: Purpose::Model(target) }));
     }
 
     fn open_actions(&mut self) {
         let items = ACTIONS.iter().map(|c| item(*c, COMMANDS.iter().find(|(n, _)| n == c).map_or("", |(_, d)| *d), *c)).collect();
-        self.overlay = Some(Overlay::Pick(Picker { title: "Actions  (type to filter)".into(), items, filter: String::new(), sel: 0, purpose: Purpose::Actions }));
+        self.overlay = Some(Overlay::Pick(Picker { title: "Actions".into(), items, filter: String::new(), sel: 0, purpose: Purpose::Actions }));
     }
 
     fn open_agents(&mut self) {
@@ -2005,17 +2011,9 @@ impl Ui {
                 if let Some((c, _)) = hints.get(self.cmd_sel).cloned() {
                     self.complete(&c);
                     self.cmd_sel = 0;
-                } else if self.input.text.starts_with('/') {
-                } else {
-                    self.cycle_agent();
                 }
             }
-            KeyCode::BackTab => {
-                let order = ["low", "medium", "high", "xhigh", "max"];
-                let i = order.iter().position(|e| *e == self.app.turn.effort).unwrap_or(1);
-                let e = order[(i + 1) % order.len()];
-                self.set_effort(e);
-            }
+            KeyCode::BackTab => self.cycle_agent(),
             KeyCode::Backspace if self.input.text.is_empty() => {
                 self.images.pop();
             }
@@ -2132,6 +2130,14 @@ impl Ui {
         let max_top = self.last_total.saturating_sub(self.last_view);
         let top = self.scroll_top.unwrap_or(max_top) as i64 + delta;
         self.scroll_top = if top >= max_top as i64 { None } else { Some(top.max(0) as usize) };
+    }
+
+    /// Rows of the pending question's answer list: its options plus the free-text row.
+    fn ask_options(&self) -> usize {
+        match &self.overlay {
+            Some(Overlay::Ask(a)) => a.options.len() + 1,
+            _ => 0,
+        }
     }
 
     /// Mouse over a popup row: `click` also activates it (Enter). Returns whether the popup took the event.
@@ -2824,7 +2830,61 @@ impl Ui {
         self.input_w = width.saturating_sub(2);
         let (input_lines, cursor) = self.input.layout(self.input_w);
         let chips = u16::from(!self.images.is_empty());
-        let input_h = input_lines.len().min(8) as u16 + chips + 2;
+        // A pending question takes the input's place: question, options, free-text row, hint.
+        let ask = match &self.overlay {
+            Some(Overlay::Ask(a)) => {
+                let mut q: Vec<String> = Vec::new();
+                for l in a.question.lines() {
+                    q.extend(markdown::wrap(vec![Span::raw(l.to_string())], width.saturating_sub(4), vec![], vec![]).iter().map(|x| x.spans.iter().map(|s| s.content.as_ref()).collect::<String>()));
+                }
+                let free = a.input.layout(width.saturating_sub(4));
+                Some((q, free))
+            }
+            _ => None,
+        };
+        // A picker also lives in the input area: filter row, then the list (grouped), then a hint.
+        let pick = match &self.overlay {
+            Some(Overlay::Pick(p)) => {
+                let vis = p.visible();
+                let rows = p.rows().max(1);
+                let body_h = rows.min(12).min(main.height.saturating_sub(7) as usize).max(1);
+                let mut body: Vec<Line<'static>> = Vec::new();
+                let mut at = Vec::new();
+                let mut sel_row = 0;
+                let lw = (width.saturating_sub(6) * 3 / 5).max(8);
+                for (n, &i) in vis.iter().enumerate() {
+                    let it = &p.items[i];
+                    if !it.group.is_empty() && (n == 0 || p.items[vis[n - 1]].group != it.group) {
+                        body.push(Line::from(Span::styled(format!("  {}", it.group), theme::dim())));
+                    }
+                    if n == p.sel {
+                        sel_row = body.len();
+                    }
+                    at.push(body.len());
+                    let on = n == p.sel;
+                    let label: String = it.label.chars().take(lw).collect();
+                    let pad = " ".repeat(lw.saturating_sub(label.width()) + 2);
+                    let detail: String = it.detail.chars().take(width.saturating_sub(lw + 8)).collect();
+                    let indent = if it.group.is_empty() { "" } else { "  " };
+                    body.push(Line::from(vec![
+                        Span::styled(if on { "› " } else { "  " }, theme::accent()),
+                        Span::styled(format!("{indent}{label}{pad}"), if on { theme::accent().add_modifier(Modifier::BOLD) } else { theme::fg() }),
+                        Span::styled(detail, theme::dim()),
+                    ]));
+                }
+                if vis.is_empty() {
+                    body.push(Line::from(Span::styled("  no match", theme::dim())));
+                }
+                let start = sel_row.saturating_sub(body_h.saturating_sub(1));
+                Some((body, at, start, body_h))
+            }
+            _ => None,
+        };
+        let input_h = match &ask {
+            _ if pick.is_some() => pick.as_ref().map_or(0, |p| p.3 as u16 + 4),
+            Some((q, (free, _))) => ((q.len() + self.ask_options() + free.len() + 1) as u16 + 2).min(main.height.saturating_sub(4).max(5)),
+            None => input_lines.len().min(8) as u16 + chips + 2,
+        };
         let todo_h = if self.todos.is_empty() || self.todos.iter().all(|t| t.status == "done") && !self.running { 0 } else { (self.todos.len().min(8) + 1) as u16 };
         let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, _gap, input_area, _gap2, status] = Layout::vertical([
@@ -2833,8 +2893,8 @@ impl Ui {
             Constraint::Length(if show_progress { 1 } else { 0 }),
             Constraint::Length(1),
             Constraint::Length(input_h),
+            Constraint::Length(0),
             Constraint::Length(1),
-            Constraint::Length(2),
         ])
         .areas(main);
 
@@ -2879,36 +2939,49 @@ impl Ui {
             f.render_widget(Paragraph::new(tl), todo_area);
         }
 
-        // progress line
+        // progress line: the action in plain words (animated), then time
         if show_progress {
-            let mut spans = Vec::new();
+            let mut spans = vec![Span::raw(" ")];
             let secs = if self.running { self.started.elapsed() } else { self.elapsed }.as_secs();
             let time = if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") };
             if self.running {
-                // ✻ Pondering… (12s · ↓ 1.2k tokens · esc to interrupt)
-                spans.push(Span::styled(format!(" {} ", PULSE[self.spin % PULSE.len()]), theme::accent()));
-                let verb = if self.status.starts_with("compacting") { "Compacting" } else if self.status.starts_with("waiting") { "Waiting for you" } else { self.verb };
+                let (name, rest) = self.status.split_once(' ').unwrap_or((self.status.as_str(), ""));
+                let verb = match name {
+                    "thinking" => "Thinking",
+                    "writing" => "Writing",
+                    "compacting" => "Compacting",
+                    "waiting" => "Waiting for you",
+                    "preparing" => "Preparing",
+                    "read" | "ls" | "view" => "Reading",
+                    "edit" | "write" | "patch" => "Editing",
+                    "bash" | "shell" => "Running",
+                    "grep" | "glob" | "find" | "search" => "Searching",
+                    "task" => "Delegating",
+                    n if n.starts_with("web") => "Fetching",
+                    _ => "Working",
+                };
+                let rest = if matches!(name, "thinking" | "writing" | "compacting" | "waiting") { "" } else { rest };
                 let n = verb.chars().count();
                 let hi = self.spin % (n + 8);
-                for (i, c) in verb.chars().chain("…".chars()).enumerate() {
-                    let st = if i + 1 >= hi && i <= hi + 1 { Style::default().add_modifier(Modifier::BOLD) } else { theme::accent() };
+                for (i, c) in verb.chars().enumerate() {
+                    let st = if i + 1 >= hi && i <= hi + 1 { theme::fg().add_modifier(Modifier::BOLD) } else { theme::dim() };
                     spans.push(Span::styled(c.to_string(), st));
                 }
-                let tok = self.out_tokens + self.stream_chars as u64 / 4;
-                let tok = if tok >= 1000 { format!("{:.1}k", tok as f64 / 1000.0) } else { tok.to_string() };
-                spans.push(Span::styled(format!(" ({time} · ↓ {tok} tokens · "), theme::dim()));
-                spans.push(Span::styled("esc", theme::fg()));
-                spans.push(Span::styled(" to interrupt)  ", theme::dim()));
-                spans.extend(self.counts.spans());
-                if !matches!(self.status.as_str(), "thinking" | "writing") && !self.status.starts_with("compacting") && !self.status.starts_with("waiting") {
-                    let st: String = self.status.chars().take(width / 3).collect();
-                    spans.push(Span::styled(format!("  ⎿ {st}"), theme::dim()));
+                if !rest.is_empty() {
+                    let r: String = rest.chars().take(width.saturating_sub(n + 16)).collect();
+                    spans.push(Span::styled(format!(" {r}"), theme::dim()));
                 }
+                spans.push(Span::styled(format!("  {time}"), theme::dim()));
             } else {
-                let (mark, style) = if self.interrupted { (" ■ interrupted  ", theme::err()) } else { (" ✓ done  ", theme::ok()) };
-                spans.push(Span::styled(mark, style));
-                spans.extend(self.counts.spans());
-                spans.push(Span::styled(format!("  · {time}"), theme::dim()));
+                if self.interrupted {
+                    spans.push(Span::styled("interrupted  ", theme::err()));
+                }
+                spans.push(Span::styled(time, theme::dim()));
+                let c = self.counts.spans();
+                if !c.is_empty() {
+                    spans.push(Span::styled("  ", theme::dim()));
+                    spans.extend(c);
+                }
             }
             f.render_widget(Paragraph::new(Line::from(spans)), progress);
         }
@@ -2918,6 +2991,59 @@ impl Ui {
         let band = theme::band();
         f.render_widget(UiBlock::default().style(band), input_area);
         let inner = Rect { y: input_area.y + 1, height: input_area.height.saturating_sub(2), ..input_area };
+        if let (Some((body, at, start, body_h)), Some(Overlay::Pick(p))) = (&pick, &self.overlay) {
+            let title = p.title.trim_end_matches("  (type to filter)");
+            let head = Line::from(vec![Span::styled(format!("  {title} "), theme::dim()), Span::raw(p.filter.clone())]);
+            let mut il = vec![head];
+            il.extend(body.iter().skip(*start).take(*body_h).cloned());
+            let mut h = hint("↑↓ select · enter choose · esc close");
+            h.spans.insert(0, Span::raw("  "));
+            while il.len() < body_h + 1 {
+                il.push(Line::default());
+            }
+            il.push(h);
+            let mut hits = self.ov_hits.borrow_mut();
+            hits.clear();
+            for (n, &b) in at.iter().enumerate() {
+                if b >= *start && b < start + body_h {
+                    hits.push((inner.y + 1 + (b - start) as u16, inner.x, inner.right().saturating_sub(1), n));
+                }
+            }
+            drop(hits);
+            f.render_widget(Paragraph::new(il).style(band), inner);
+            self.input_hit = (Rect::default(), 0, 0);
+            f.set_cursor_position((inner.x + 2 + title.width() as u16 + 1 + p.filter.width() as u16, inner.y));
+        } else if let (Some((q, (free, (crow, ccol)))), Some(Overlay::Ask(a))) = (&ask, &self.overlay) {
+            let mut il: Vec<Line> = q.iter().map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().add_modifier(Modifier::BOLD)))).collect();
+            let mut hits = self.ov_hits.borrow_mut();
+            hits.clear();
+            let y0 = inner.y + q.len() as u16;
+            for (i, o) in a.options.iter().enumerate() {
+                let on = i == a.sel;
+                il.push(Line::from(vec![Span::styled(if on { "› " } else { "  " }, theme::accent()), Span::styled(format!("{}. {o}", i + 1), if on { theme::accent().add_modifier(Modifier::BOLD) } else { theme::fg() })]));
+                hits.push((y0 + i as u16, inner.x, inner.right().saturating_sub(1), i));
+            }
+            let on_free = a.sel == a.options.len();
+            let free_y = y0 + a.options.len() as u16;
+            hits.push((free_y, inner.x, inner.right().saturating_sub(1), a.options.len()));
+            drop(hits);
+            let mark = Span::styled(if on_free { "› " } else { "  " }, theme::accent());
+            if a.input.text.is_empty() {
+                il.push(Line::from(vec![mark, Span::styled(if a.options.is_empty() { "type your answer" } else { "other…" }, theme::dim())]));
+            } else {
+                for (n, l) in free.iter().enumerate() {
+                    il.push(Line::from(vec![if n == 0 { mark.clone() } else { Span::raw("  ") }, Span::raw(l.clone())]));
+                }
+            }
+            let mut h = hint("↑↓ select · enter answer · esc skip");
+            h.spans.insert(0, Span::raw("  "));
+            il.push(h);
+            f.render_widget(Paragraph::new(il).style(band), inner);
+            self.input_hit = (Rect::default(), 0, 0);
+            if on_free {
+                f.set_cursor_position((inner.x + 2 + *ccol as u16, free_y + *crow as u16));
+            }
+        } else {
         let skip = cursor.0.saturating_sub(7);
         let prompt = theme::fg();
         let mut il: Vec<Line> = Vec::new();
@@ -2931,13 +3057,14 @@ impl Ui {
             il.push(Line::from(vec![prefix, Span::raw(l.clone())]));
         }
         if self.input.text.is_empty() && self.images.is_empty() {
-            il = vec![Line::from(vec![Span::styled("› ", prompt), Span::styled("Ask anything — / for commands, tab to switch agent", theme::dim())])];
+            il = vec![Line::from(vec![Span::styled("› ", prompt), Span::styled("Ask anything", theme::dim())])];
         }
         f.render_widget(Paragraph::new(il).style(band), inner);
         let text_area = Rect { x: inner.x + 2, y: inner.y + chips, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(chips) };
         self.input_hit = (text_area, skip, width.saturating_sub(2));
         if self.overlay.is_none() {
             f.set_cursor_position((inner.x + 2 + cursor.1 as u16, inner.y + chips + (cursor.0 - skip) as u16));
+        }
         }
 
         // slash-command hints
@@ -2969,37 +3096,23 @@ impl Ui {
             }
         }
 
-        // status bar: who and what model on the first row, the rest (ssh, jobs, remote, session, context, cost) on the second
+        // status bar, one row: agent · model · effort … ssh/jobs/remote … context · cost
         let a = &self.app.turn.agent;
         let ag = theme::agent(&a.name);
-        let mut top = vec![
-            Span::styled(" θ ", theme::logo(&a.name)),
-            Span::styled(format!(" {} ", a.name), Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({})", a.scope.label()), theme::dim()),
-            Span::styled("  ", theme::dim()),
-            Span::styled(self.app.turn.model.clone(), ag),
-            Span::styled(format!(" · {}", self.app.turn.effort), theme::dim()),
+        let mut left = vec![
+            Span::styled(format!(" {}", a.name), ag.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" · {} · {}", self.app.turn.model, self.app.turn.effort), theme::dim()),
         ];
-        if !self.verbose() {
-            top.push(Span::styled(" · compact", theme::dim()));
-        }
-        let mut left = vec![Span::raw(" ")];
-        let sep = |left: &mut Vec<Span<'static>>, s: Span<'static>| {
-            if left.len() > 1 {
-                left.push(Span::styled(" · ", theme::dim()));
-            }
-            left.push(s);
-        };
         if let Some(s) = &self.ssh {
-            sep(&mut left, Span::styled(format!("⇢ {}:{}", s.host, s.cwd), ag));
+            left.push(Span::styled(format!(" · {}:{}", s.host, s.cwd), theme::dim()));
         }
         let live = self.jobs.iter().filter(|j| j.status == JobStatus::Running).count();
         if live > 0 {
-            sep(&mut left, Span::styled(format!("⚙ {live}"), ag));
+            left.push(Span::styled(format!(" · {live} jobs"), theme::dim()));
         }
         match &self.remote_state {
-            RemoteState::Linked => sep(&mut left, Span::styled("⇄ remote", ag)),
-            RemoteState::Code { .. } => sep(&mut left, Span::styled("⇄ waiting for browser", theme::dim())),
+            RemoteState::Linked => left.push(Span::styled(" · remote", theme::dim())),
+            RemoteState::Code { .. } => left.push(Span::styled(" · waiting for browser", theme::dim())),
             _ => {}
         }
         let ctx_max = self.model_ctx();
@@ -3007,24 +3120,24 @@ impl Ui {
         let right = match &self.notice {
             Some((n, t)) if t.elapsed() < Duration::from_secs(4) => vec![Span::styled(format!("{n} "), ag)],
             _ => vec![
-                Span::styled(format!("{}k/{}k {}% ", self.ctx_tokens / 1000, ctx_max / 1000, pct), if pct >= 80 { theme::err() } else { theme::dim() }),
-                Span::styled(format!("${:.3} ", self.cost), theme::dim()),
+                Span::styled(format!("{pct}%"), if pct >= 80 { theme::err() } else { theme::dim() }),
+                Span::styled(format!(" · ${:.2} ", self.cost), theme::dim()),
             ],
         };
         let lw: usize = left.iter().map(|s| s.content.width()).sum();
         let rw: usize = right.iter().map(|s| s.content.width()).sum();
-        let mut second = left;
+        let mut row = left;
         if lw + rw < width {
-            second.push(Span::raw(" ".repeat(width - lw - rw)));
-            second.extend(right);
+            row.push(Span::raw(" ".repeat(width - lw - rw)));
+            row.extend(right);
         }
-        f.render_widget(Paragraph::new(vec![Line::from(top), Line::from(second)]), status);
+        f.render_widget(Paragraph::new(Line::from(row)), status);
 
         // overlays
         let prev = self.sel_area;
         self.sel_area = match &self.overlay {
+            Some(Overlay::Ask(_) | Overlay::Pick(_)) | None => area,
             Some(ov) => self.draw_overlay(f, ov, area).inner(Margin::new(2, 2)),
-            None => area,
         };
         // popup opened or closed: the old selection no longer lives in this area
         if prev != self.sel_area {
@@ -3033,47 +3146,21 @@ impl Ui {
     }
 
     fn splash(&self, h: usize) -> Vec<Line<'static>> {
-        const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
-        let accent = theme::agent(&a.name);
-        let white = theme::fg();
-        let mut out: Vec<Line<'static>> = LOGO
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let mut spans = vec![Span::styled(format!("  {l}"), accent)];
-                if i == LOGO.len() - 1 && crate::update::is_dev() {
-                    spans.push(Span::styled(" (dev)", theme::dim()));
-                }
-                Line::from(spans)
-            })
-            .collect();
-        out.push(Line::from(Span::styled(format!("  θ v{}  ·  terminal coding agent", env!("CARGO_PKG_VERSION")), theme::dim())));
-        out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
-        out.push(Line::from(vec![Span::styled("  agent  ", theme::dim()), Span::raw(agent_label(a))]));
-        out.push(Line::from(vec![Span::styled("  model  ", theme::dim()), Span::raw(self.app.turn.model.clone())]));
-        out.push(Line::from(vec![Span::styled("  cwd    ", theme::dim()), Span::raw(crate::config::tilde(&self.app.rt.cwd))]));
+        let mut out = vec![
+            Line::from(vec![Span::styled("  θ ", theme::agent(&a.name).add_modifier(Modifier::BOLD)), Span::styled(format!("v{}{}", env!("CARGO_PKG_VERSION"), if crate::update::is_dev() { " dev" } else { "" }), theme::dim())]),
+            Line::from(Span::styled(format!("  {}  ·  {}", self.app.turn.model, crate::config::tilde(&self.app.rt.cwd)), theme::dim())),
+        ];
         if let Some(s) = &self.ssh {
-            out.push(Line::from(vec![Span::styled("  ssh    ", theme::dim()), Span::raw(format!("{}:{}", s.host, s.cwd))]));
+            out.push(Line::from(Span::styled(format!("  ssh {}:{}", s.host, s.cwd), theme::dim())));
         }
         if let Some((p, _)) = self.app.rt.catalog.resolve(&self.app.turn.model) {
             let local = p.env.is_empty() && p.oauth.is_none();
             if !local && futures::executor::block_on(self.app.rt.auth.status(&p)).is_none() {
-                out.push(Line::default());
-                out.push(Line::from(vec![Span::styled("  ! ", theme::err()), Span::raw(format!("no credentials for {} — run ", p.name)), Span::styled("/login", theme::accent()), Span::raw(" or pick another model with "), Span::styled("ctrl+p", theme::accent())]));
+                out.push(Line::from(vec![Span::styled("  no credentials for ", theme::err()), Span::styled(p.name.clone(), theme::err()), Span::styled(" — /login", theme::dim())]));
             }
         }
-        out.push(Line::from(Span::styled(format!("  {}", "─".repeat(44)), theme::dim())));
-        out.push(Line::from(vec![
-            Span::styled("  /help", white),
-            Span::styled(" commands  ·  ", theme::dim()),
-            Span::styled("tab", white),
-            Span::styled(" agent  ·  ", theme::dim()),
-            Span::styled("ctrl+p", white),
-            Span::styled(" model  ·  ", theme::dim()),
-            Span::styled("ctrl+t", white),
-            Span::styled(" tree", theme::dim()),
-        ]));
+        out.push(Line::from(Span::styled("  /help · shift+tab agent · ctrl+p model", theme::dim())));
         let mut top = vec![Line::default(); h.saturating_sub(out.len()) / 2];
         top.extend(out);
         top
@@ -3092,10 +3179,10 @@ impl Ui {
             Overlay::Diff(v) => v.lines.len().min(60) + 3,
             Overlay::Mcp(_) => self.mcp_rows.len().max(1) + 6,
             Overlay::Activity(_) => self.activity().len().max(1) + 3,
-            Overlay::Pick(p) => p.rows().max(1) + 1,
+            Overlay::Pick(_) => 0,
             Overlay::Tree(t) => t.rows.len() + 2,
             Overlay::Settings(v) => self.settings_rows(v.tab).len() + 6,
-            Overlay::Ask(a) => wrapped_rows(&a.question, iw) + a.options.len() + 4,
+            Overlay::Ask(_) => 0,
             Overlay::Login(v) => v.lines.iter().map(|l| wrapped_rows(l, iw) + 1).sum::<usize>() + 4,
         } as u16;
         let min_h = if matches!(ov, Overlay::Pick(_)) { 12 } else { 5 };
@@ -3106,30 +3193,9 @@ impl Ui {
         let (y0, x0, x1) = (r.y + 2, r.x + 2, r.x + r.width.saturating_sub(2));
         let hit = |row: usize, idx: usize| self.ov_hits.borrow_mut().push((y0 + row as u16, x0, x1, idx));
         self.ov_hits.borrow_mut().clear();
-        let block = |t: &str| UiBlock::bordered().padding(Padding::uniform(1)).border_type(BorderType::Rounded).border_style(theme::accent()).title(Span::styled(format!(" {t} "), Style::default().add_modifier(Modifier::BOLD)));
+        let block = |t: &str| UiBlock::bordered().padding(Padding::uniform(1)).border_type(BorderType::Rounded).border_style(theme::dim()).title(Span::styled(format!(" {t} "), theme::dim()));
         match ov {
-            Overlay::Ask(a) => {
-                let mut l = vec![Line::from(Span::styled(a.question.clone(), Style::default().add_modifier(Modifier::BOLD))), Line::default()];
-                let first = wrapped_rows(&a.question, iw) + 1;
-                for i in 0..=a.options.len() {
-                    hit(first + i, i);
-                }
-                for (i, o) in a.options.iter().enumerate() {
-                    let st = if i == a.sel { theme::sel() } else { Style::default() };
-                    l.push(Line::from(vec![Span::styled(format!(" {} ", if i == a.sel { "›" } else { " " }), theme::accent()), Span::styled(format!("{}. {o}", i + 1), st)]));
-                }
-                let on_free = a.sel == a.options.len();
-                let text = if a.input.text.is_empty() { Span::styled(if a.options.is_empty() { "type your answer" } else { "or type your own answer" }, theme::dim()) } else { Span::raw(a.input.text.clone()) };
-                l.push(Line::from(vec![Span::styled(format!(" {} ✎ ", if on_free { "›" } else { " " }), theme::accent()), text.patch_style(if on_free { theme::sel() } else { Style::default() })]));
-                l.push(Line::default());
-                l.push(hint(" ↑↓ select · enter answer · 1-9 pick · esc skip "));
-                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(block("θ question")), r);
-                if on_free {
-                    let row = wrapped_rows(&a.question, iw) + 1 + a.options.len();
-                    let col = 5 + a.input.text[..a.input.cur].width();
-                    f.set_cursor_position((r.x + 1 + col as u16, r.y + 1 + row as u16));
-                }
-            }
+            Overlay::Ask(_) => {}
             Overlay::Dir(v) => {
                 let rows = h.saturating_sub(4) as usize;
                 let top = (v.sel + 1).saturating_sub(rows);
@@ -3310,41 +3376,7 @@ impl Ui {
                 l.push(hint("a key to run · esc cancel"));
                 f.render_widget(Paragraph::new(l).block(block("θ ctrl+x")), r);
             }
-            Overlay::Pick(p) => {
-                let vis = p.visible();
-                let rows = h.saturating_sub(4) as usize;
-                let mut l = vec![Line::from(vec![Span::styled("filter › ", theme::dim()), Span::raw(p.filter.clone()), Span::styled("▏", theme::accent())])];
-                let mut body = Vec::new();
-                let mut sel_row = 0;
-                let mut at = Vec::new();
-                for (n, &i) in vis.iter().enumerate() {
-                    let it = &p.items[i];
-                    if !it.group.is_empty() && (n == 0 || p.items[vis[n - 1]].group != it.group) {
-                        body.push(Line::from(Span::styled(it.group.clone(), theme::accent().add_modifier(Modifier::BOLD))));
-                    }
-                    if n == p.sel {
-                        sel_row = body.len();
-                    }
-                    at.push(body.len());
-                    let st = if n == p.sel { theme::sel() } else { Style::default() };
-                    let indent = if it.group.is_empty() { " " } else { "   " };
-                    let label: String = it.label.chars().take(iw * 3 / 5).collect();
-                    let pad = (iw * 3 / 5).saturating_sub(label.width() + indent.len() - 1) + 1;
-                    let detail: String = it.detail.chars().take(iw.saturating_sub(label.width() + pad + 4)).collect();
-                    body.push(Line::from(vec![Span::styled(format!("{indent}{label}{}", " ".repeat(pad)), st), Span::styled(detail, st.patch(theme::dim()))]));
-                }
-                let start = sel_row.saturating_sub(rows.saturating_sub(1));
-                for (n, &b) in at.iter().enumerate() {
-                    if b >= start && b < start + rows {
-                        hit(1 + b - start, n);
-                    }
-                }
-                l.extend(body.into_iter().skip(start).take(rows));
-                if vis.is_empty() {
-                    l.push(Line::from(Span::styled("  no match", theme::dim())));
-                }
-                f.render_widget(Paragraph::new(l).block(block(&p.title)), r);
-            }
+            Overlay::Pick(_) => {}
             Overlay::Diff(v) => {
                 let rows = h.saturating_sub(4) as usize;
                 let mut l = v.render(rows, iw);
@@ -3514,11 +3546,14 @@ fn setup() -> ratatui::DefaultTerminal {
     let t = ratatui::init();
     // Save the window title (xterm title stack) so the shell gets its own back on exit.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x1b[22;2t"), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
+    // Kitty keyboard protocol so Shift+Enter differs from Enter. Pushed without probing: xterm.js (VS Code) does not answer
+    // the support query yet honours the flags, and terminals that ignore the sequence are unaffected.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     t
 }
 
 fn teardown() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x1b[23;2t"), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x1b[23;2t"), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste, crossterm::event::PopKeyboardEnhancementFlags);
     ratatui::restore();
 }
 
@@ -3553,7 +3588,6 @@ impl Ui {
         swap(&mut self.jobs, &mut v.jobs);
         swap(&mut self.cost, &mut v.cost);
         swap(&mut self.ctx_tokens, &mut v.ctx_tokens);
-        swap(&mut self.verb, &mut v.verb);
         swap(&mut self.out_tokens, &mut v.out_tokens);
         swap(&mut self.stream_chars, &mut v.stream_chars);
         swap(&mut self.asks, &mut v.asks);
@@ -4132,7 +4166,6 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         quit_armed: None,
         notice: None,
         spin: 0,
-        verb: VERBS[0],
         out_tokens: 0,
         stream_chars: 0,
         asks: VecDeque::new(),

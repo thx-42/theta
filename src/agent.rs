@@ -240,7 +240,10 @@ const REPORT_CAP: usize = 6000;
 /// Subagents (often a cheaper model) drift into workarounds when blocked; the orchestrator can unblock them, they cannot.
 const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing around it. Every tool call must move that step forward: no docs, refactors, cleanup, reviews of unrelated files or git unless the brief asks.\nWhen something stands in the way (a refused command, a missing tool or binary, missing access, credentials or a service, a check you cannot fix in two tries), do not work around it:\n- never build a replacement for a missing tool (your own parser, linter, interpreter binding, test harness, mock runtime);\n- never redo a refused command another way (python, awk, another shell command): use the tool the refusal names;\n- never search for passwords, keys or connection strings, and never change a live database or service the brief did not name (read-only MCP probes are fine);\n- never install packages unless the brief says so.\nInstead: finish what you can, mark the blocked check `not verified` with the reason, and report it as a blocker, or stop and ask (`questions:`). A blocker reported in one line is worth more to the orchestrator than an hour of workaround.";
 
-const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists each defect on one line as `path:line problem`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
+const REPORT_RULE: &str ="# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under 600 characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000), Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists only the defects, one line each as `path:line problem` (max 15 lines, nothing about what is fine); no defect: `no defects`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
+
+/// Auto ends a turn that changed files without having read the diff: the strongest model reviews before the user does.
+const REVIEW_MSG: &str = "Files changed during this turn and you have not read the diff since your last change. Before your final answer, run `git diff` (and read the new files) as the user's most demanding reviewer: bugs and unhandled failure paths; missing junctions (is everything this change must be wired to actually wired, does it work from the user's entry point?); leftovers (debug code, stale callers, docs, tests). Fix what you find, verify again, then give your final answer.";
 
 const CHECKPOINT_MSG: &str = "Checkpoint: stop calling tools now. Your next message is a handoff report for the orchestrator (up to 3000 characters): what is done, what is not done, files touched (path:line), what was verified and how, blockers, and the exact next step. Do not continue the work in this message.";
 
@@ -270,6 +273,10 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let mut compact_failed = false;
     // A plan-mode switch is pending: the run must end so Plan takes over.
     let mut handed_off = false;
+    // Auto reviews its own diff: remember the tree it started from, and whether it looked at the diff since its last change.
+    let tree0 = if turn.depth == 0 && turn.agent.delegate_all { tree_state(&rt.cwd).await } else { None };
+    let mut diff_read = false;
+    let mut review_asked = false;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
         // A subagent that runs long hands its state back so the orchestrator can re-steer (resume or re-split).
@@ -358,6 +365,11 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
                 continue;
             }
+            if !review_asked && !diff_read && let Some(t0) = &tree0 && tree_state(&rt.cwd).await.is_some_and(|t| &t != t0) {
+                review_asked = true;
+                session.lock().unwrap().add_msg(Msg::user(REVIEW_MSG), None)?;
+                continue;
+            }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
                 let _ = tx.send(Event::Error("reply cut off at the output token limit — say \"continue\" to resume".into()));
             }
@@ -365,6 +377,13 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 crate::lint::flush(&ctx);
             }
             break;
+        }
+        for (_, name, args) in &calls {
+            match name.as_str() {
+                "edit" | "write" | "task" => diff_read = false,
+                "bash" if args.get("command").and_then(|v| v.as_str()).is_some_and(|c| c.contains("git diff")) => diff_read = true,
+                _ => {}
+            }
         }
         // Parallel subagents of one agent share a prompt prefix: let the first one write the cache, the others then read it.
         let mut seen_tasks: Vec<String> = Vec::new();
@@ -693,7 +712,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     if let Some(before) = before
         && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
             if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
-                checks = format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await);
+                checks.push_str(&format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await));
             }
             if let Some(stat) = git(&rt.cwd, &["diff", "HEAD", "--shortstat"]).await.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
                 checks.push_str(&format!("\n[changed since HEAD: {stat}]"));

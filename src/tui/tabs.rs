@@ -1,7 +1,7 @@
 //! Session tabs. Every tab is its own daemon connection; only the active one is mirrored in `Ui`,
 //! the others keep their state parked in a `View` and queue what the daemon pushes.
 
-use super::{AskView, Counts, Editor, Item, SPIN, VERBS, theme};
+use super::{AskView, Counts, Editor, Item, SPIN, theme};
 use crate::agent::{Event, Turn};
 use crate::client::Remote;
 use crate::proto::Push;
@@ -110,7 +110,6 @@ pub struct View {
     pub jobs: Vec<crate::jobs::JobInfo>,
     pub cost: f64,
     pub ctx_tokens: u64,
-    pub verb: &'static str,
     pub out_tokens: u64,
     pub stream_chars: usize,
     pub asks: VecDeque<AskView>,
@@ -139,7 +138,6 @@ impl View {
             jobs: vec![],
             cost: 0.0,
             ctx_tokens: 0,
-            verb: VERBS[0],
             out_tokens: 0,
             stream_chars: 0,
             asks: VecDeque::new(),

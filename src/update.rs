@@ -209,7 +209,7 @@ async fn daemon_idle() -> Result<bool> {
 }
 
 /// Ask the daemon to quit and wait until its socket is gone.
-async fn stop_daemon() -> Result<()> {
+pub(crate) async fn stop_daemon() -> Result<()> {
     let mut sock = UnixStream::connect(socket_path()).await?;
     sock.write_all(format!("{}\n", serde_json::to_string(&Req::Shutdown)?).as_bytes()).await?;
     drop(sock);

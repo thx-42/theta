@@ -317,7 +317,7 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 |---|---|
 | `enter` / `alt+enter`, `ctrl+j` | envoyer / nouvelle ligne |
 | `esc` | interrompre l'agent |
-| `tab` / `shift+tab` | agent suivant / effort suivant |
+| `shift+tab` | agent suivant (`tab` complète `/` et `@`) |
 | `ctrl+p` `ctrl+t` `ctrl+r` | modèle · arbre de conversation · sessions |
 | `ctrl+o` | sortie **full** (tools, thinking) ↔ **compact** (réponse finale + ligne `n read · n write · n cmd · n tools`) |
 | `pgup` `pgdn` `shift+↑↓` molette | défiler |

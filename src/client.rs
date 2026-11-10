@@ -67,21 +67,56 @@ async fn write(wr: &mut tokio::net::unix::OwnedWriteHalf, r: &Req) -> bool {
     wr.write_all(line.as_bytes()).await.is_ok()
 }
 
-/// Attach and wait for the snapshot. Returns the channels the UI runs on.
-pub async fn open(target: Target, cwd: PathBuf, agent: Option<String>, model: Option<String>) -> Result<(Remote, UnboundedReceiver<Push>, Snapshot)> {
-    let attach = Req::Attach { target, cwd: cwd.clone(), agent, model };
+/// The daemon accepted the connection but never sent a snapshot (typically one left over from before an update).
+#[derive(Debug)]
+struct NoAnswer;
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon did not answer within 10 s")
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
+type Lines = tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>;
+
+/// Connect, attach and wait (at most 10 s) for the snapshot.
+async fn handshake(attach: &Req) -> Result<(Snapshot, Lines, tokio::net::unix::OwnedWriteHalf)> {
     let sock = connect().await?;
     let (rd, mut wr) = sock.into_split();
-    if !write(&mut wr, &attach).await {
+    if !write(&mut wr, attach).await {
         bail!("daemon closed the connection");
     }
     let mut lines = BufReader::new(rd).lines();
-    let snap = loop {
-        let Some(line) = lines.next_line().await? else { bail!("daemon closed the connection") };
-        match serde_json::from_str::<Push>(&line) {
-            Ok(Push::Snapshot(s)) => break *s,
-            Ok(Push::Err(e)) => bail!("{e}"),
-            _ => {}
+    let wait = async {
+        loop {
+            let Some(line) = lines.next_line().await? else { bail!("daemon closed the connection") };
+            match serde_json::from_str::<Push>(&line) {
+                Ok(Push::Snapshot(s)) => return Ok(*s),
+                Ok(Push::Err(e)) => bail!("{e}"),
+                _ => {}
+            }
+        }
+    };
+    let snap = tokio::time::timeout(Duration::from_secs(10), wait).await.map_err(|_| anyhow::Error::new(NoAnswer))??;
+    Ok((snap, lines, wr))
+}
+
+/// Attach and wait for the snapshot. Returns the channels the UI runs on.
+pub async fn open(target: Target, cwd: PathBuf, agent: Option<String>, model: Option<String>) -> Result<(Remote, UnboundedReceiver<Push>, Snapshot)> {
+    let attach = Req::Attach { target, cwd: cwd.clone(), agent, model };
+    let (snap, lines, wr) = match handshake(&attach).await {
+        Ok(h) => h,
+        Err(first) => {
+            // A daemon left over from before an update may not understand this client and never answers:
+            // replace it once, then fail with a message instead of hanging. Any other failure (an explicit
+            // refusal, a closed connection) leaves the daemon alone: it may be running other sessions.
+            if !first.is::<NoAnswer>() {
+                return Err(first);
+            }
+            let _ = crate::update::stop_daemon().await;
+            handshake(&attach).await.map_err(|e| anyhow::anyhow!("{e} (after restarting the daemon; first attempt: {first})"))?
         }
     };
     let (req_tx, req_rx) = unbounded_channel();
