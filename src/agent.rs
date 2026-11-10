@@ -418,9 +418,16 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             })
             .collect();
         let names: Vec<String> = calls.iter().map(|c| c.1.clone()).collect();
-        let futs = calls.into_iter().zip(staggered).map(|((id, name, args), stagger)| {
+        let run_call = |((id, name, mut args), stagger): ((String, String, Value), bool)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
+                // The orchestrator's context is the expensive one: its own reads stay small, big ones go to a subagent.
+                // A `read` is capped by its `limit`, so the result ends on the `offset=` hint and no part of it is lost.
+                let cap = if turn.depth == 0 && turn.agent.delegate_all { rt.settings.tools.auto_max_lines } else { 0 };
+                if cap > 0 && name == "read" && args.is_object() {
+                    let limit = args.get("limit").and_then(|v| v.as_u64()).map_or(cap as u64, |l| l.min(cap as u64));
+                    args["limit"] = json!(limit);
+                }
                 if stagger {
                     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 }
@@ -439,7 +446,14 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else if name == "ask" {
                     ask(&rt, &args, &tx).await
                 } else if name.starts_with("mcp__") {
-                    rt.mcp.call(&name, &args).await
+                    let mut out = rt.mcp.call(&name, &args).await;
+                    // A server can answer with megabytes: the model gets the head and tail, the log file the rest.
+                    let (text, cut) = tools::truncate_middle(&out.content, rt.settings.tools.max_lines);
+                    if cut {
+                        let full = tools::save_log(out.content.as_bytes()).map(|f| format!("\n[full output: {}]", f.display())).unwrap_or_default();
+                        out.content = format!("{text}{full}");
+                    }
+                    out
                 } else if name == "list_agents" {
                     tools::ToolOut::ok(agents::catalog(&rt.agents))
                 } else if name == "handoff" {
@@ -449,9 +463,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else {
                     tools::run(&name, &args, &ctx).await
                 };
-                // The orchestrator's context is the expensive one: its own reads stay small, big ones go to a subagent.
-                let cap = rt.settings.tools.auto_max_lines;
-                if cap > 0 && turn.depth == 0 && turn.agent.delegate_all && matches!(name.as_str(), "read" | "grep" | "find" | "ls" | "bash") {
+                if cap > 0 && matches!(name.as_str(), "grep" | "find" | "ls" | "bash") {
                     let (t, cut) = tools::truncate_middle(&out.content, cap);
                     if cut {
                         out.content = format!("{t}\n[cut to {cap} lines: you are the orchestrator — have a subagent read or run larger things and report conclusions]");
@@ -467,8 +479,15 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 let _ = tx.send(Event::ToolEnd { id: id.clone(), content: out.content.clone(), is_error: out.is_error, display: out.display });
                 Block::ToolResult { id, content: out.content, is_error: out.is_error }
             }
-        });
-        let results = futures::future::join_all(futs).await;
+        };
+        // Reading tools written side by side run together; a tool with effects (shell, edit, MCP, question) runs alone,
+        // in the order the model wrote it: `git add` then `git commit`, an edit then the build.
+        let mut results: Vec<Block> = Vec::with_capacity(names.len());
+        let mut queue = calls.into_iter().zip(staggered);
+        for size in batch_sizes(&names) {
+            let batch: Vec<_> = queue.by_ref().take(size).collect();
+            results.extend(futures::future::join_all(batch.into_iter().map(&run_call)).await);
+        }
         if read_now && diff_read && tree0.is_some() {
             tree_read = tree_state(&rt.cwd).await;
         }
@@ -476,6 +495,22 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         session.lock().unwrap().add_msg(Msg { role: Role::User, content: results, model: None }, None)?;
     }
     Ok(())
+}
+
+/// How the tool calls of one reply are grouped: each group runs together, groups run one after the other.
+/// Consecutive reading tools share a group; a tool with effects is a group of its own.
+fn batch_sizes(names: &[String]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    let mut open = false; // the last group may still take reading tools
+    for n in names {
+        let safe = tools::concurrent_safe(n);
+        match out.last_mut() {
+            Some(last) if safe && open => *last += 1,
+            _ => out.push(1),
+        }
+        open = safe;
+    }
+    out
 }
 
 /// `ask` tool: show the question to the user and wait. A free-text answer is always allowed.
@@ -861,6 +896,15 @@ mod tests {
         assert!(open.contains("not ready") && open.contains("Q1 does RegisterNpc") && open.contains("`ask`"));
         let ready = plan_next_step(&[]);
         assert!(ready.contains("start the Builds") && ready.contains("Review"));
+    }
+
+    #[test]
+    fn effect_tools_run_alone_and_in_order() {
+        let n = |v: &[&str]| batch_sizes(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(n(&["read", "grep", "task"]), [3]);
+        assert_eq!(n(&["bash", "bash"]), [1, 1]);
+        assert_eq!(n(&["read", "edit", "bash", "read", "read", "mcp__db__query", "task", "task"]), [1, 1, 1, 2, 1, 2]);
+        assert!(n(&[]).is_empty());
     }
 
     #[test]
