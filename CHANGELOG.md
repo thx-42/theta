@@ -7,6 +7,24 @@
 - **Un niveau d'imbrication en lecture seule.** Un sous-agent read-only (`Plan`) peut lancer des agents read-only (`Explore`), au premier plan ; jamais un agent qui écrit, et rien de plus profond. Un `Build` en sous-agent ne lance rien.
 - **Boucle jusqu'à zéro défaut.** Le prompt Auto impose vérification → review → correction → nouvelle vérification avant le compte rendu, avec test via MCP quand un serveur atteint le vrai runtime. Auto est renvoyé relire `git diff` à chaque changement non relu (3 fois par tour au plus) et relancé sur des todos non terminés jusqu'à `auto_nudges` fois (8 par défaut, au lieu de 3).
 - **Plans en lots.** `Plan` écrit des lots parallélisables (fichiers disjoints, un `Build` par lot), dimensionnés au nombre d'agents annoncé dans le brief.
+- **Agent `Review` et outil `diff`.** `diff` montre l'arbre de travail (fichiers non suivis compris) face à un commit, sans shell ; options `path`, `base`, `stat`. L'agent caché `Review` part de ce diff, lit le code autour et ne rend que des défauts (`path:line: severity: problem. fix.`). Auto l'utilise à la place de `Plan` pour la review, et lit lui-même le diff sans la coupe à 80 lignes.
+- **Garde-fou sur les commandes irréversibles.** `sudo`, `git push --force`, `git reset --hard`, `git clean -f`, `DROP`/`TRUNCATE`, écriture sur un périphérique et `rm -r` hors du projet passent par une question à l'utilisateur ; refus en sous-agent et en `-p`. `[tools] guard = false` le coupe, `[tools] confirm` ajoute des regex.
+- **`/undo files`.** Remet aussi l'arbre de travail dans l'état du début du dernier run ; l'état remplacé est gardé sous `refs/theta/undo/<time>`.
+- **Sortie `bash` en direct** sous l'appel en cours, **notification** (bell + OSC 9, réglage `notify`) quand un run de 15 s ou plus finit ou pose une question, **reprise automatique** (2 fois) d'une réponse coupée à la limite de sortie.
+- **Retries visibles.** Un stream cassé (surcharge, coupure, fin prématurée) est rejoué : 6 essais avec backoff, `Retry-After` respecté, attente affichée dans la barre d'état.
+- **Prompts.** La règle d'outils est écrite depuis les outils réels de l'agent ; `Build` reçoit `find` et `ls` ; les guides (~6k tokens) ne sont plus collés dans chaque prompt, l'agent lit celui qu'il lui faut ; `AGENT.md` est lu comme `AGENTS.md`/`CLAUDE.md`, `~/.theta/AGENTS.md` s'applique partout ; branche git et commande de check dans le bloc Environment ; budget de rapport par rôle (2000 caractères en lecture seule, 800 pour un agent qui écrit) ; skills `caveman` et `ponytail` installés au premier lancement.
+- **`edit` plus parlant.** Un échec dit où le texte diverge du fichier, plusieurs correspondances donnent leurs lignes, `all: true` remplace toutes les occurrences, un écart d'indentation seul est accepté et ré-indenté, un fichier modifié depuis la dernière lecture est signalé.
+- **OpenAI/Codex.** Les items de raisonnement chiffrés sont renvoyés entre deux appels d'outils (`store: false`).
+
+### Corrections
+- Les appels d'outils d'une même réponse ne tournent plus tous en même temps : les lectures ensemble, les outils à effet (`bash`, `edit`, `write`, MCP, `ask`) un par un, dans l'ordre écrit.
+- `bash` : au timeout, la sortie déjà produite est rendue et tout le groupe de processus est tué (aussi à l'interruption) ; une commande qui laisse un enfant en fond rend la main quand le shell sort.
+- Plusieurs `Build` en parallèle ne lancent plus chacun le check du projet sur un arbre à moitié édité : un seul check à la fois, laissé au dernier agent qui écrit.
+- Un sous-agent dont le run échoue rend son dernier message, ses todos et son transcript au lieu d'une simple erreur.
+- Résultats MCP tronqués comme ceux de `bash` (texte complet dans `cache/logs`).
+- Auto : le plafond de lecture s'applique comme `limit`, une relecture ne tombe plus sur `[unchanged]` pour du contenu jamais vu ; le cache de lecture est vidé sur `/undo` et sur une bifurcation.
+- Prune moins agressif : à partir de 90k tokens (30k avant), 40k récents gardés. Le résumé de compaction se termine par l'état connu de theta (todos, fichier de plan, `git status`, jobs en cours).
+- CI : `cargo test` avant chaque build de release.
 
 ## 0.3.1
 

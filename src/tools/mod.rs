@@ -199,6 +199,11 @@ fn is_transcript(name: &str, args: &Value, ctx: &ToolCtx) -> bool {
 }
 
 pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
+    run_live(name, args, ctx, &mut |_| {}).await
+}
+
+/// `run`, with `live` fed the tail of a local shell command's output while it runs.
+pub async fn run_live(name: &str, args: &Value, ctx: &ToolCtx, live: &mut (dyn FnMut(String) + Send)) -> ToolOut {
     if let Some(bad) = args.get("_invalid_json") {
         return ToolOut::err(format!("invalid JSON arguments: {bad}"));
     }
@@ -217,7 +222,7 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
         "find" => fs::find(args, ctx),
         "grep" => fs::grep(args, ctx),
         "diff" => diff(args, ctx),
-        "bash" => shell::bash(args, ctx).await,
+        "bash" => shell::bash_live(args, ctx, live).await,
         "job" => job(args, ctx).await,
         "todo" => todo(args, ctx),
         "web_search" => web::search(args, ctx).await,

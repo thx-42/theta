@@ -235,7 +235,13 @@ fn viewing_only(cmd: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
+    bash_live(args, ctx, &mut |_| {}).await
+}
+
+/// `bash`, calling `live` with the last lines printed so far (a few times per second) while the command runs.
+pub async fn bash_live(args: &Value, ctx: &ToolCtx, live: &mut (dyn FnMut(String) + Send)) -> Result<ToolOut> {
     let cmd = s(args, "command").context("command required")?.to_string();
     let viewing = viewing_only(&cmd);
     let effective = effective(&cmd, ctx).await;
@@ -248,10 +254,17 @@ pub async fn bash(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     // Everything the command printed, up to MAX_CAPTURE: the model gets a truncated view, the log file the rest.
     let mut buf: Vec<u8> = Vec::new();
     let mut dropped = 0usize;
+    let mut shown = std::time::Instant::now();
     let mut sink = |b: &[u8]| {
         let room = MAX_CAPTURE.saturating_sub(buf.len()).min(b.len());
         buf.extend_from_slice(&b[..room]);
         dropped += b.len() - room;
+        if shown.elapsed() >= Duration::from_millis(250) {
+            shown = std::time::Instant::now();
+            let recent = compact(&String::from_utf8_lossy(&buf[buf.len().saturating_sub(2000)..]));
+            let lines: Vec<&str> = recent.lines().filter(|l| !l.trim().is_empty()).collect();
+            live(lines[lines.len().saturating_sub(5)..].join("\n"));
+        }
     };
     let (code, timed_out) = run_with(&effective, &ctx.cwd, Some(Duration::from_secs(timeout)), &mut sink).await?;
     let raw = String::from_utf8_lossy(&buf);

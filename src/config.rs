@@ -67,6 +67,8 @@ pub struct Settings {
     pub theme: String,
     /// Paint the whole screen in the theme's background instead of the terminal's
     pub theme_bg: bool,
+    /// Ring the terminal (bell + desktop notification escape) when a run that took a while ends or asks a question
+    pub notify: bool,
     /// Tab bar hidden (ctrl+x b); keeps tab_orientation for when it comes back
     pub tab_hidden: bool,
     /// Sidebar width in columns (vertical tab bar only)
@@ -99,6 +101,7 @@ impl Default for Settings {
             tab_orientation: "horizontal".into(),
             theme: "theta".into(),
             theme_bg: false,
+            notify: true,
             tab_hidden: false,
             tab_width: 24,
             agent: "Build".into(),
@@ -500,6 +503,7 @@ model = "anthropic/claude-sonnet-5-5"
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
 theme_bg = false                # theme paints the background
+notify = true                   # bell + terminal notification when a run of 15 s or more ends or asks a question
 theme = "theta"                 # color theme: one of /theme's ids
 tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
 tab_hidden = false               # ctrl+x b toggles; orientation is kept

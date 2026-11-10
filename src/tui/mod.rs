@@ -1177,6 +1177,14 @@ impl Ui {
                 }
                 self.status = "thinking".into();
             }
+            Event::ToolOutput { id, tail } => {
+                if let Some(i) = self.items.iter().rposition(|it| matches!(it, Item::Tool { id: tid, .. } if *tid == id)) {
+                    if let Item::Tool { state: ToolState::Running, out, .. } = &mut self.items[i] {
+                        *out = tail;
+                    }
+                    self.touch(i);
+                }
+            }
             Event::Step { usage, model } => {
                 self.close_streaming();
                 if let Some((_, m)) = self.app.rt.catalog.resolve(&model) {
@@ -1188,6 +1196,7 @@ impl Ui {
             }
             Event::Handoff { agent, .. } => self.notify(format!("switching to {agent} after this reply")),
             Event::Ask { id, question, options } => {
+                self.attention(&format!("question: {question}"));
                 self.status = "waiting for your answer".into();
                 self.asks.push_back(AskView { question, options, sel: 0, input: Editor::default(), id });
             }
@@ -1249,11 +1258,19 @@ impl Ui {
             Event::Done => {
                 self.close_streaming();
                 self.mark_seen();
+                self.attention("done");
                 self.running = false;
                 self.elapsed = self.started.elapsed();
                 self.refresh_diff();
                 self.flush_queued();
             }
+        }
+    }
+
+    /// The user has likely looked away from a run this long: tell the terminal.
+    fn attention(&self, what: &str) {
+        if self.running && self.app.rt.settings.notify && self.started.elapsed() >= Duration::from_secs(15) {
+            ping(what);
         }
     }
 
@@ -2771,6 +2788,12 @@ impl Ui {
                     if dl.len() > 14 {
                         lines.push(gutter(&format!("… {} more lines", dl.len() - 14), theme::dim()));
                     }
+                } else if matches!(state, ToolState::Running) {
+                    // What the command is printing right now.
+                    let ls: Vec<&str> = out.lines().collect();
+                    for l in &ls[ls.len().saturating_sub(3)..] {
+                        lines.push(gutter(&clip(l), theme::dim()));
+                    }
                 } else if matches!(state, ToolState::Done { ok: false }) {
                     for l in out.lines().take(4) {
                         lines.push(gutter(&clip(l), theme::err()));
@@ -3546,6 +3569,14 @@ fn title_for(running: bool, background: &[TabStatus]) -> String {
 }
 
 /// Copy via OSC 52: the local terminal's clipboard, also over SSH.
+/// Bell and OSC 9 notification: the terminal (or its tab) flags that theta wants attention.
+fn ping(text: &str) {
+    let clean: String = text.chars().filter(|c| !c.is_control()).take(120).collect();
+    let mut out = std::io::stdout();
+    let _ = std::io::Write::write_all(&mut out, format!("\x07\x1b]9;theta: {clean}\x07").as_bytes());
+    let _ = std::io::Write::flush(&mut out);
+}
+
 pub(crate) fn copy_osc52(text: &str) {
     let b64 = base64::engine::general_purpose::STANDARD.encode(text);
     let mut out = std::io::stdout();

@@ -819,6 +819,8 @@ where
 fn remember(replay: &mut Vec<Event>, ev: &Event) {
     match (replay.last_mut(), ev) {
         (Some(Event::Text(a)), Event::Text(b)) | (Some(Event::Thinking(a)), Event::Thinking(b)) => a.push_str(b),
+        // Only the latest tail of a command matters.
+        (Some(Event::ToolOutput { id: a, tail }), Event::ToolOutput { id: b, tail: new }) if a == b => *tail = new.clone(),
         _ => replay.push(ev.clone()),
     }
 }

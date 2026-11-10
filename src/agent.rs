@@ -25,6 +25,8 @@ pub enum Event {
     ToolPending(String),
     ToolStart { id: String, name: String, args: Value },
     ToolEnd { id: String, content: String, is_error: bool, display: Option<String> },
+    /// Last lines printed so far by the running shell command of tool call `id`.
+    ToolOutput { id: String, tail: String },
     /// One model step finished.
     Step { usage: Usage, model: String },
     Todos(Vec<Todo>),
@@ -319,6 +321,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     let mut steps = 0usize;
     let mut checkpoints = 0usize;
     let mut compact_failed = false;
+    let mut continued = 0u8;
     // A plan-mode switch is pending: the run must end so Plan takes over.
     let mut handed_off = false;
     // Auto reviews its own diff: remember the tree it started from, and whether it looked at the diff since its last change.
@@ -404,6 +407,12 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                     continue;
                 }
             }
+            // Cut at the output limit: carry on from there (twice at most), instead of handing the user half an answer.
+            if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") && continued < 2 {
+                continued += 1;
+                session.lock().unwrap().add_msg(Msg::user("Your reply was cut off at the output token limit. Continue exactly where you stopped, without repeating what is already written. If you were writing something large, do it in several smaller tool calls."), None)?;
+                continue;
+            }
             // A turn that only announced its plan (or said nothing) is not an answer: push the model to act.
             if !handed_off && (resp.stop == "commentary" || empty) && stalls < 3 {
                 stalls += 1;
@@ -429,7 +438,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 }
             }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
-                let _ = tx.send(Event::Error("reply cut off at the output token limit — say \"continue\" to resume".into()));
+                let _ = tx.send(Event::Error("reply cut off at the output token limit again — say \"continue\" to resume".into()));
             }
             if turn.depth == 0 {
                 crate::lint::flush(&ctx);
@@ -522,7 +531,11 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else if name == "enter_plan" {
                     enter_plan(&rt, &turn, &args, &tx)
                 } else {
-                    tools::run(&name, &args, &ctx).await
+                    let (live_tx, live_id) = (tx.clone(), id.clone());
+                    let mut live = move |tail: String| {
+                        let _ = live_tx.send(Event::ToolOutput { id: live_id.clone(), tail });
+                    };
+                    tools::run_live(&name, &args, &ctx, &mut live).await
                 };
                 if cap > 0 && matches!(name.as_str(), "grep" | "find" | "ls" | "bash") {
                     let (t, cut) = tools::truncate_middle(&out.content, cap);
@@ -787,7 +800,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let log = log.cloned();
     let forward = tokio::spawn(async move {
         while let Some(ev) = srx.recv().await {
-            if matches!(ev, Event::Text(_) | Event::Thinking(_) | Event::Retry { .. }) {
+            if matches!(ev, Event::Text(_) | Event::Thinking(_) | Event::Retry { .. } | Event::ToolOutput { .. }) {
                 continue;
             }
             if let (Some(log), Event::ToolStart { name, .. }) = (&log, &ev) {
