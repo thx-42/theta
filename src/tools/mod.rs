@@ -64,7 +64,7 @@ pub enum Kind {
 
 pub fn kind(name: &str) -> Kind {
     match name {
-        "read" | "ls" | "find" | "grep" => Kind::Read,
+        "read" | "ls" | "find" | "grep" | "diff" => Kind::Read,
         "write" | "edit" | "write_plan" => Kind::Write,
         "bash" => Kind::Command,
         _ => Kind::Other,
@@ -92,6 +92,8 @@ pub fn all_defs() -> Vec<ToolDef> {
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern"]})),
         def("find", "Find files by glob pattern (respects .gitignore), e.g. `**/*.rs`.",
             json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"integer"}},"required":["pattern"]})),
+        def("diff", "What changed in the working tree, as a unified diff: uncommitted and untracked files against `base` (default HEAD). Read-only. For a large change, `stat` first, then one `path` at a time.",
+            json!({"type":"object","properties":{"path":{"type":"string","description":"limit to a file or directory"},"base":{"type":"string","description":"commit, branch or tag to compare with (default HEAD)"},"stat":{"type":"boolean","description":"per-file summary only"}}})),
         def("ls", "List a directory (dirs end with /).",
             json!({"type":"object","properties":{"path":{"type":"string"}}})),
         def("write_plan", "Save this session's plan as markdown (one file per session, rewritten on each call).",
@@ -113,7 +115,7 @@ pub fn all_defs() -> Vec<ToolDef> {
 }
 
 /// Tools only agents that list them get: the default set stays close to read/write/edit/bash.
-pub const OPT_IN: &[&str] = &["ls", "find", "write_plan", "ask", "handoff", "list_agents", "enter_plan"];
+pub const OPT_IN: &[&str] = &["ls", "find", "diff", "write_plan", "ask", "handoff", "list_agents", "enter_plan"];
 
 /// `task` for the agents a parent may spawn: `(name, description)` pairs, listed so the model can route.
 pub fn task_def(agents: &[(String, String)]) -> ToolDef {
@@ -187,7 +189,7 @@ pub fn save_log(raw: &[u8]) -> Option<PathBuf> {
 /// Tools that only read: several in one reply run at the same time. Everything else (shell, edits, MCP, questions)
 /// runs alone, in the order the model wrote it. `task` stays parallel: that is how subagents fan out.
 pub fn concurrent_safe(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "find" | "ls" | "web_search" | "web_fetch" | "task" | "job" | "list_agents")
+    matches!(name, "read" | "grep" | "find" | "ls" | "diff" | "web_search" | "web_fetch" | "task" | "job" | "list_agents")
 }
 
 /// Subagent transcripts live on this machine: reading them must not go to the ssh host.
@@ -214,6 +216,7 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
         "ls" => fs::ls(args, ctx),
         "find" => fs::find(args, ctx),
         "grep" => fs::grep(args, ctx),
+        "diff" => diff(args, ctx),
         "bash" => shell::bash(args, ctx).await,
         "job" => job(args, ctx).await,
         "todo" => todo(args, ctx),
@@ -222,6 +225,22 @@ pub async fn run(name: &str, args: &Value, ctx: &ToolCtx) -> ToolOut {
         _ => Err(anyhow::anyhow!("unknown tool `{name}`")),
     };
     res.unwrap_or_else(|e| ToolOut::err(format!("{e:#}")))
+}
+
+/// `diff` tool: the working tree against a commit, capped like any output (the full text goes to a log file).
+fn diff(args: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOut> {
+    let text = crate::diff::against(&ctx.cwd, s(args, "base"), s(args, "path"), b(args, "stat")).map_err(|e| anyhow::anyhow!(e))?;
+    if text.trim().is_empty() {
+        return Ok(ToolOut::ok("no changes"));
+    }
+    let (mut out, cut) = truncate_middle(&text, ctx.settings.tools.max_lines);
+    if cut {
+        out.push_str("\n[diff cut: call again with `stat`, then one `path` at a time]");
+        if let Some(f) = save_log(text.as_bytes()) {
+            out.push_str(&format!("\n[full diff: {}]", f.display()));
+        }
+    }
+    Ok(ToolOut::ok(out))
 }
 
 /// `job` tool: list | output | kill | wait. The agent loop handles `wait` itself so a user message can interrupt it.

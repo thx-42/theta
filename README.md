@@ -248,7 +248,7 @@ post_message = ["notify-send theta"]           # dernière réponse sur stdin ; 
   agents/*.md                 agents locaux   → affichés « (local) », prioritaires sur un global du même nom
 ```
 
-Le prompt système = SOUL global + SOUL projet + prompt de l'agent + environnement + `AGENTS.md`/`CLAUDE.md` du projet.
+Le prompt système = SOUL global + SOUL projet + prompt de l'agent + environnement + `~/.theta/AGENTS.md` + `AGENTS.md`/`AGENT.md`/`CLAUDE.md` du projet.
 
 ### MCP
 

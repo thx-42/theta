@@ -17,7 +17,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 
 /// Tools that run on the host. The others (todo, web, ask, jobs, plan...) stay local.
-const REMOTE_TOOLS: &[&str] = &["read", "write", "edit", "ls", "find", "grep", "bash"];
+const REMOTE_TOOLS: &[&str] = &["read", "write", "edit", "ls", "find", "grep", "bash", "diff"];
 
 /// `sh -c '...'` so that the remote login shell (bash, zsh, fish, csh) only has to parse a quoted string.
 const AGENT_CMD: &str = r#"sh -c 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH" exec theta ssh-agent'"#;

@@ -9,7 +9,8 @@ Read the guide that matches the request before you change anything.
 - Project dir: `<project>/.theta/` holds `settings.toml`, `agents/`, `skills/`, `SOUL.md`, `SOUL.<Agent>.md`.
 - Project root = nearest ancestor with `.theta/` or `.git/`.
 - Project settings override global settings. Local agents and skills override global ones with the same name.
-- `AGENTS.md` or `CLAUDE.md` in the project root is added to the system prompt.
+- `AGENTS.md`, `AGENT.md` or `CLAUDE.md` in the project root (the first found) is added to the system prompt; `~/.theta/AGENTS.md` is added for every project.
+- These guides are not in the prompt: the main agent is told where they are and reads the one it needs.
 
 ## Guides
 

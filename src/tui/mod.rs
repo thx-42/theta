@@ -226,6 +226,7 @@ pub fn tool_summary(name: &str, args: &Value) -> String {
         "bash" => g("command").lines().next().unwrap_or("").to_string(),
         "grep" => format!("{} {}", g("pattern"), g("path")),
         "find" => g("pattern"),
+        "diff" => format!("{}{}", if g("path").is_empty() { "working tree".to_string() } else { g("path") }, if args.get("stat").and_then(|v| v.as_bool()).unwrap_or(false) { " (stat)" } else { "" }),
         "web_search" => g("query"),
         "web_fetch" => g("url"),
         "todo" => format!("{} items", args.get("todos").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0)),

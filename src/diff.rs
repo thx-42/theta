@@ -50,6 +50,27 @@ pub fn diff(cwd: &Path, scope: &str, session: Option<&str>, turn: Option<&str>) 
     git(cwd, &["diff", "--no-color", "--no-ext-diff", &base, &now], None)
 }
 
+/// The `diff` tool: the working tree (untracked files included) against `base` (a commit, default HEAD), whole or for
+/// one `path`; `stat` gives the per-file summary only.
+pub fn against(cwd: &Path, base: Option<&str>, path: Option<&str>, stat: bool) -> Result<String, String> {
+    git(cwd, &["rev-parse", "--is-inside-work-tree"], None).map_err(|_| "not a git repository".to_string())?;
+    let base = base.unwrap_or("HEAD");
+    if base.starts_with('-') {
+        return Err("base must be a commit, branch or tag".into());
+    }
+    let base = git(cwd, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")], None).map_err(|_| format!("unknown commit `{base}`"))?;
+    let now = snapshot(cwd)?;
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
+    if stat {
+        args.push("--stat");
+    }
+    args.extend([base.as_str(), now.as_str()]);
+    if let Some(p) = path {
+        args.extend(["--", p]);
+    }
+    git(cwd, &args, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +91,12 @@ mod tests {
         let t = diff(&d, "turn", None, Some(&base)).unwrap();
         assert!(t.contains("b.txt") && !t.contains("a.txt"));
         assert!(diff(&d, "session", None, None).unwrap().contains("a.txt"));
+        // the tool: untracked files count, a path narrows it, stat summarizes
+        let all = against(&d, None, None, false).unwrap();
+        assert!(all.contains("+one") && all.contains("+two"));
+        assert!(!against(&d, None, Some("b.txt"), false).unwrap().contains("a.txt"));
+        assert!(against(&d, None, None, true).unwrap().contains("2 files changed"));
+        assert!(against(&d, Some("--output=x"), None, false).is_err() && against(&d, Some("nope"), None, false).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
