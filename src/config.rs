@@ -172,7 +172,7 @@ pub struct Compaction {
 
 impl Default for Compaction {
     fn default() -> Self {
-        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 20_000, max_tokens: 150_000, prune_tokens: 30_000 }
+        Compaction { enabled: true, threshold: 0.8, keep_recent_tokens: 40_000, max_tokens: 150_000, prune_tokens: 90_000 }
     }
 }
 
@@ -520,9 +520,9 @@ subagent_effort = ""                   # "" = effort of the spawning agent
 [compaction]
 enabled = true
 threshold = 0.8
-keep_recent_tokens = 20000
+keep_recent_tokens = 40000
 max_tokens = 150000      # compact at the lower of threshold x window and this; 0 = no ceiling
-prune_tokens = 30000    # above this, old tool outputs are shortened before any summary (no model call); 0 = never
+prune_tokens = 90000    # above this, old tool outputs are shortened before any summary (no model call); 0 = never
 
 [tools]
 rtk = "auto"             # route shell commands through rtk when installed

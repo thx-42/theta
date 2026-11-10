@@ -135,6 +135,36 @@ pub fn serialize(msgs: &[Msg]) -> String {
     out
 }
 
+/// What theta itself knows for sure, appended to the summary: a small model's digest must not be the only memory of
+/// the todo list, the plan file or the files that changed.
+async fn recorded_state(rt: &Runtime, session_id: &str) -> String {
+    let mut out = Vec::new();
+    let todos = rt.todos.lock().unwrap().clone();
+    if !todos.is_empty() {
+        out.push(format!("Todo list:\n{}", crate::tools::render_todos(&todos)));
+    }
+    let plan = crate::config::home().join("plan").join(format!("{session_id}.md"));
+    if !session_id.is_empty() && plan.exists() {
+        out.push(format!("Plan file: {}", plan.display()));
+    }
+    if rt.ssh.get().is_none()
+        && let Ok(o) = tokio::process::Command::new("git").args(["status", "--porcelain"]).current_dir(&rt.cwd).output().await
+        && o.status.success()
+    {
+        let text = String::from_utf8_lossy(&o.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        if !lines.is_empty() {
+            let more = if lines.len() > 40 { format!("\n… and {} more", lines.len() - 40) } else { String::new() };
+            out.push(format!("Working tree (`git status --porcelain`):\n{}{more}", lines[..lines.len().min(40)].join("\n")));
+        }
+    }
+    let running: Vec<String> = rt.jobs.list().into_iter().filter(|j| j.status == crate::jobs::Status::Running).map(|j| format!("{} {:?} {}", j.id, j.kind, j.label)).collect();
+    if !running.is_empty() {
+        out.push(format!("Background jobs still running:\n{}", running.join("\n")));
+    }
+    if out.is_empty() { String::new() } else { format!("\n\n## State recorded by theta (exact)\n{}", out.join("\n\n")) }
+}
+
 /// Summarize everything before the kept tail. Returns tokens before compaction.
 pub async fn run(rt: &Runtime, session: &Arc<Mutex<Session>>, main_model: &str) -> Result<u64> {
     let (to_summarize, previous, first_kept, before) = {
@@ -162,6 +192,8 @@ pub async fn run(rt: &Runtime, session: &Arc<Mutex<Session>>, main_model: &str) 
     if summary.is_empty() {
         bail!("empty summary");
     }
+    let id = session.lock().unwrap().id.clone();
+    let summary = format!("{summary}{}", recorded_state(rt, &id).await);
     session.lock().unwrap().add_compaction(summary, first_kept, before)?;
     rt.read_cache.lock().unwrap().clear();
     Ok(before)

@@ -25,7 +25,7 @@ effort = "high"
 ```
 
 ### `[compaction]`
-- `enabled` (bool), `threshold` (fraction of window, default 0.8), `keep_recent_tokens` (default 20000), `max_tokens` (ceiling, 0 = none, default 150000).
+- `enabled` (bool), `threshold` (fraction of window, default 0.8), `keep_recent_tokens` (default 40000), `max_tokens` (ceiling, 0 = none, default 150000), `prune_tokens` (default 90000, 0 = never: above it, tool outputs older than `keep_recent_tokens` are shortened without a model call; each prune rewrites the cached prefix once, so a low value costs more than it saves).
 
 ### `[tools]`
 - `rtk`: `auto | on | off`, route shell commands through `rtk` when installed.

@@ -121,6 +121,14 @@ pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let path = resolve(&ctx.cwd, s(args, "path").context("path required")?);
     let original = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let edits = args.get("edits").and_then(|e| e.as_array()).context("edits required")?;
+    // The model's picture of the file is the last read: say so when the file moved since (a formatter, the user, `sed`).
+    let stale = {
+        let (prefix, suffix, now) = (format!("{}:", path.display()), format!(":{}", ctx.session_id), hash(&original));
+        let cache = ctx.read_cache.lock().unwrap();
+        let mut seen = cache.iter().filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(&suffix)).map(|(_, h)| *h).peekable();
+        seen.peek().is_some() && seen.all(|h| h != now)
+    };
+    let mut notes: Vec<String> = Vec::new();
     let mut text = original.clone();
     for (i, e) in edits.iter().enumerate() {
         let old = e.get("old").and_then(|v| v.as_str()).context("edit.old required")?;
@@ -128,18 +136,31 @@ pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
         if old.is_empty() {
             bail!("edit {}: `old` is empty", i + 1);
         }
+        let all = e.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
         let count = text.matches(old).count();
         match count {
             1 => text = text.replacen(old, new, 1),
             0 => {
-                // Fallback: tolerate trailing-whitespace differences line by line.
-                match fuzzy_find(&text, old) {
-                    Some((start, end)) => text.replace_range(start..end, new),
-                    None => bail!("edit {}: `old` not found in {}. Re-read the file and copy the text exactly.", i + 1, path.display()),
+                // Fallbacks: trailing whitespace, then indentation (the replacement is re-indented to the file's).
+                if let Some((start, end)) = fuzzy_find(&text, old, false) {
+                    text.replace_range(start..end, new);
+                } else if let Some((start, end)) = fuzzy_find(&text, old, true) {
+                    let fixed = reindent(new, indent_of(old), indent_of(&text[start..end]));
+                    text.replace_range(start..end, &fixed);
+                    notes.push(format!("edit {}: matched ignoring indentation; `new` was re-indented to the file's", i + 1));
+                } else {
+                    bail!("edit {}: `old` not found in {}. {}", i + 1, path.display(), near_miss(&text, old));
                 }
             }
-            c => bail!("edit {}: `old` matches {c} places; add surrounding context to make it unique", i + 1),
+            c if all => {
+                text = text.replace(old, new);
+                notes.push(format!("edit {}: {c} occurrences replaced", i + 1));
+            }
+            c => bail!("edit {}: `old` matches {c} places (lines {}); add surrounding context to make it unique, or set `all` to replace every one", i + 1, match_lines(&text, old)),
         }
+    }
+    if stale {
+        notes.push("note: the file had changed on disk since you last read it; read it again before further edits".into());
     }
     if text == original {
         bail!("edits produced no change");
@@ -151,12 +172,70 @@ pub fn edit(args: &Value, ctx: &ToolCtx) -> Result<ToolOut> {
     let (plus, minus) = d.lines().fold((0, 0), |(p, m), l| {
         if l.starts_with('+') { (p + 1, m) } else if l.starts_with('-') { (p, m + 1) } else { (p, m) }
     });
-    Ok(ToolOut { content: format!("edited {} (+{plus} -{minus})", rel(ctx, &path)), is_error: false, display: Some(d) })
+    let notes = if notes.is_empty() { String::new() } else { format!("\n{}", notes.join("\n")) };
+    Ok(ToolOut { content: format!("edited {} (+{plus} -{minus}){notes}", rel(ctx, &path)), is_error: false, display: Some(d) })
 }
 
-/// Match `needle` ignoring trailing whitespace on each line. Returns byte range in `hay`.
-fn fuzzy_find(hay: &str, needle: &str) -> Option<(usize, usize)> {
-    let want: Vec<&str> = needle.lines().map(|l| l.trim_end()).collect();
+/// 1-based line numbers where `needle` starts, at most ten.
+fn match_lines(hay: &str, needle: &str) -> String {
+    let lines: Vec<String> = hay.match_indices(needle).take(10).map(|(i, _)| (hay[..i].matches('\n').count() + 1).to_string()).collect();
+    lines.join(", ")
+}
+
+/// Why `old` did not match, in a form that saves the model a re-read: where its first line is and where the text departs.
+fn near_miss(hay: &str, old: &str) -> String {
+    let want: Vec<&str> = old.lines().map(str::trim).collect();
+    let Some(first) = want.iter().position(|l| !l.is_empty()) else { return "Re-read the file and copy the text exactly.".into() };
+    let lines: Vec<&str> = hay.lines().collect();
+    let cut = |l: &str| l.chars().take(160).collect::<String>();
+    // The candidate that agrees with `old` the longest.
+    let best = (0..lines.len())
+        .filter(|&i| lines[i].trim() == want[first])
+        .map(|i| (i, (first..want.len()).take_while(|&j| lines.get(i + j - first).is_some_and(|l| l.trim() == want[j])).count()))
+        .max_by_key(|&(_, n)| n);
+    match best {
+        Some((i, n)) => {
+            let at = i + n;
+            let theirs = want.get(first + n).copied().unwrap_or("");
+            format!("Its first line is at line {}, but line {} differs: the file has `{}`, `old` has `{}`. Copy the text from the file exactly.", i + 1, at + 1, cut(lines.get(at).copied().unwrap_or("(end of file)").trim()), cut(theirs))
+        }
+        None => format!("No line of the file matches its first line `{}`: the code moved or was never there. `grep` for it, then read that part.", cut(want[first])),
+    }
+}
+
+/// Leading whitespace of the first non-blank line.
+fn indent_of(s: &str) -> &str {
+    let l = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    &l[..l.len() - l.trim_start().len()]
+}
+
+/// Move `text` from the indentation the model wrote (`from`) to the file's (`to`): the first-line indent is swapped on
+/// every line that carries it, and spaces deeper than it become tabs when the file indents with tabs.
+fn reindent(text: &str, from: &str, to: &str) -> String {
+    if from == to {
+        return text.to_string();
+    }
+    // Spaces per level the model used, when the file uses tabs: guessed from the first-line indents.
+    let unit = (to.starts_with('\t') && !from.is_empty() && from.chars().all(|c| c == ' ') && from.len() % to.len() == 0).then(|| from.len() / to.len());
+    let mut out: Vec<String> = Vec::new();
+    for l in text.split('\n') {
+        let Some(rest) = l.strip_prefix(from) else {
+            out.push(l.to_string());
+            continue;
+        };
+        let deeper = rest.len() - rest.trim_start_matches(' ').len();
+        match unit {
+            Some(u) if u > 0 && deeper % u == 0 => out.push(format!("{to}{}{}", "\t".repeat(deeper / u), &rest[deeper..])),
+            _ => out.push(format!("{to}{rest}")),
+        }
+    }
+    out.join("\n")
+}
+
+/// Match `needle` line by line, ignoring trailing whitespace (and leading too with `any_indent`). Returns byte range in `hay`.
+fn fuzzy_find(hay: &str, needle: &str, any_indent: bool) -> Option<(usize, usize)> {
+    let norm = |l: &str| if any_indent { l.trim().to_string() } else { l.trim_end().to_string() };
+    let want: Vec<String> = needle.lines().map(norm).collect();
     if want.is_empty() {
         return None;
     }
@@ -169,7 +248,7 @@ fn fuzzy_find(hay: &str, needle: &str) -> Option<(usize, usize)> {
     let lines: Vec<&str> = hay.lines().collect();
     let mut found = None;
     for i in 0..lines.len().saturating_sub(want.len() - 1) {
-        if (0..want.len()).all(|j| lines[i + j].trim_end() == want[j]) {
+        if (0..want.len()).all(|j| norm(lines[i + j]) == want[j]) {
             if found.is_some() {
                 return None; // ambiguous
             }
@@ -333,9 +412,53 @@ mod tests {
     #[test]
     fn fuzzy_ignores_trailing_ws() {
         let hay = "fn a() {  \n    x();\n}\n";
-        let (s, e) = fuzzy_find(hay, "fn a() {\n    x();").unwrap();
+        let (s, e) = fuzzy_find(hay, "fn a() {\n    x();", false).unwrap();
         assert_eq!(&hay[s..e], "fn a() {  \n    x();");
-        assert!(fuzzy_find("a\nb\na\nb\n", "a\nb").is_none());
+        assert!(fuzzy_find("a\nb\na\nb\n", "a\nb", false).is_none());
+    }
+
+    fn ctx_in(dir: &std::path::Path) -> crate::tools::ToolCtx {
+        crate::tools::ToolCtx {
+            cwd: dir.to_path_buf(),
+            settings: Default::default(),
+            http: reqwest::Client::new(),
+            todos: Default::default(),
+            read_cache: Default::default(),
+            session_id: "s".into(),
+            jobs: Default::default(),
+            ssh: Default::default(),
+        }
+    }
+
+    #[test]
+    fn edit_explains_failures_and_tolerates_indentation() {
+        let dir = std::env::temp_dir().join(format!("theta-edit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.go");
+        let c = ctx_in(&dir);
+        let run = |edits: serde_json::Value| edit(&serde_json::json!({"path": "a.go", "edits": edits}), &c);
+        std::fs::write(&f, "func a() {\n\tif x {\n\t\ty()\n\t}\n}\nfoo()\nfoo()\n").unwrap();
+        // several matches: the lines are named, `all` replaces them
+        let e = format!("{:#}", run(serde_json::json!([{"old": "foo()", "new": "bar()"}])).err().unwrap());
+        assert!(e.contains("2 places") && e.contains("lines 6, 7") && e.contains("`all`"), "{e}");
+        let ok = run(serde_json::json!([{"old": "foo()", "new": "bar()", "all": true}])).unwrap();
+        assert!(ok.content.contains("2 occurrences replaced"), "{}", ok.content);
+        // the model wrote spaces where the file has tabs: matched, and the replacement gets tabs
+        let ok = run(serde_json::json!([{"old": "    if x {\n        y()\n    }", "new": "    if x {\n        y()\n        z()\n    }"}])).unwrap();
+        assert!(ok.content.contains("ignoring indentation"), "{}", ok.content);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "func a() {\n\tif x {\n\t\ty()\n\t\tz()\n\t}\n}\nbar()\nbar()\n");
+        // not found: where the text departs
+        let e = format!("{:#}", run(serde_json::json!([{"old": "if x {\n    w()", "new": ""}])).err().unwrap());
+        assert!(e.contains("first line is at line 2") && e.contains("line 3 differs") && e.contains("y()"), "{e}");
+        let e = format!("{:#}", run(serde_json::json!([{"old": "nothing like this", "new": ""}])).err().unwrap());
+        assert!(e.contains("No line of the file matches"), "{e}");
+        // changed behind the model's back since its read
+        read(&serde_json::json!({"path": "a.go"}), &c).unwrap();
+        std::fs::write(&f, "one\ntwo\n").unwrap();
+        let ok = run(serde_json::json!([{"old": "two", "new": "2"}])).unwrap();
+        assert!(ok.content.contains("changed on disk"), "{}", ok.content);
+        assert!(!run(serde_json::json!([{"old": "one", "new": "1"}])).unwrap().content.contains("changed on disk"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
