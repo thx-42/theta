@@ -1,6 +1,6 @@
 //! Anthropic Messages API (API key or Claude Pro/Max OAuth).
 
-use super::{OnDelta, Request, Response, Sse, parse_args, send};
+use super::{OnDelta, Request, Response, Sse, StreamError, parse_args, send};
 use crate::auth::Resolved;
 use crate::catalog::Provider;
 use crate::types::{Block, Delta, Msg, Role, Usage};
@@ -164,6 +164,7 @@ pub async fn stream(
     let mut json_bufs: Vec<String> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = String::new();
+    let mut ended = false;
     while let Some(ev) = sse.next().await {
         let (_, data) = ev?;
         let v: Value = match serde_json::from_str(&data) {
@@ -240,9 +241,17 @@ pub async fn stream(
                     usage.output = o;
                 }
             }
+            "message_stop" => ended = true,
+            // Load and server faults pass; the same request can succeed a moment later.
+            "error" if matches!(v["error"]["type"].as_str(), Some("overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error")) => {
+                return Err(StreamError(format!("anthropic: {}", v["error"])).into());
+            }
             "error" => bail!("anthropic: {}", v["error"]),
             _ => {}
         }
+    }
+    if !ended && stop.is_empty() {
+        return Err(StreamError("anthropic: the stream ended before the reply was complete".into()).into());
     }
     if stop == "refusal" {
         blocks.push(Block::Text { text: "\n[model declined this request]".into() });

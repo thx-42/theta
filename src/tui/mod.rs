@@ -1202,6 +1202,18 @@ impl Ui {
             Event::Steer(t) => self.steer_taken(t),
             Event::Interrupted => self.on_interrupted(),
             Event::Todos(t) => self.todos = t,
+            Event::Retry { attempt, wait, reason } => {
+                // The step starts over: drop what it had streamed.
+                if let Some(Item::Assistant { text, thinking, done: false, .. }) = self.items.last_mut() {
+                    text.clear();
+                    thinking.clear();
+                    let i = self.items.len() - 1;
+                    self.touch(i);
+                }
+                self.stream_chars = 0;
+                self.status = format!("retry {attempt} in {wait}s");
+                self.notify(format!("provider error, retrying in {wait}s ({attempt}): {reason}"));
+            }
             Event::Compacting => {
                 self.status = "compacting context".into();
                 self.push(Item::Info("compacting context…".into()));

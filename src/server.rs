@@ -782,6 +782,13 @@ where
             }
             match &ev {
                 Event::Step { .. } => st.replay.clear(),
+                Event::Retry { .. } => {
+                    // The step starts over: what it had streamed is void.
+                    while matches!(st.replay.last(), Some(Event::Text(_) | Event::Thinking(_) | Event::ToolPending(_) | Event::Retry { .. })) {
+                        st.replay.pop();
+                    }
+                    remember(&mut st.replay, &ev);
+                }
                 Event::Handoff { agent, message } => st.handoff = Some((agent.clone(), message.clone())),
                 Event::Done => {
                     st.run = None;

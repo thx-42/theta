@@ -142,6 +142,7 @@ pub async fn build_runtime(cwd: std::path::PathBuf) -> Result<agent::Runtime> {
         jobs: Default::default(),
         ssh: Default::default(),
         plan: Default::default(),
+        gate: Default::default(),
     })
 }
 

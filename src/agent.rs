@@ -30,6 +30,8 @@ pub enum Event {
     Todos(Vec<Todo>),
     Compacting,
     Compacted { before: u64 },
+    /// The model request failed and is sent again in `wait` seconds; the text streamed for this step is void.
+    Retry { attempt: u32, wait: u64, reason: String },
     /// `/btw` answer: shown in the chat, never added to the session.
     Side { question: String, answer: String },
     Title(String),
@@ -92,6 +94,31 @@ pub struct Runtime {
     pub jobs: crate::jobs::Jobs,
     pub ssh: crate::ssh::Slot,
     pub plan: Arc<Mutex<PlanState>>,
+    pub gate: Arc<Gate>,
+}
+
+/// Keeps the harness check honest when several writing subagents run side by side: one check at a time,
+/// and none while another writer is still editing the tree.
+#[derive(Default)]
+pub struct Gate {
+    writers: std::sync::atomic::AtomicUsize,
+    verify: tokio::sync::Mutex<()>,
+}
+
+/// One writing subagent at work; leaving (also on error or abort) is counted on drop.
+struct Writer(Arc<Gate>);
+
+impl Writer {
+    fn enter(gate: &Arc<Gate>) -> Writer {
+        gate.writers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Writer(gate.clone())
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.0.writers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// What one run needs: who answers, with which model, and which tools.
@@ -319,6 +346,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 Delta::Text(t) => Event::Text(t),
                 Delta::Thinking(t) => Event::Thinking(t),
                 Delta::ToolStart { name } => Event::ToolPending(name),
+                Delta::Retry { attempt, wait, reason } => Event::Retry { attempt, wait, reason },
             });
         };
         let resp = match llm::complete(&rt.http, &rt.auth, &provider, req, &mut on).await {
@@ -726,7 +754,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let log = log.cloned();
     let forward = tokio::spawn(async move {
         while let Some(ev) = srx.recv().await {
-            if matches!(ev, Event::Text(_) | Event::Thinking(_)) {
+            if matches!(ev, Event::Text(_) | Event::Thinking(_) | Event::Retry { .. }) {
                 continue;
             }
             if let (Some(log), Event::ToolStart { name, .. }) = (&log, &ev) {
@@ -745,10 +773,13 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     let writes = !agents::is_readonly(&turn.agent);
     let before = if writes { tree_state(&rt.cwd).await } else { None };
     let who = turn.agent.name.clone();
+    let writer = writes.then(|| Writer::enter(&rt.gate));
     let res = Box::pin(run(rt.clone(), session.clone(), turn, stx, Steer::default())).await;
+    drop(writer);
     let _ = forward.await;
-    res?;
-    let answer = session.lock().unwrap().context().last().map(|m| m.text()).unwrap_or_default();
+    // A run that died (provider error, overflow) still did work: hand back what it said last, its todos and its transcript.
+    let failed = res.err().map(|e| format!("{e:#}"));
+    let answer = session.lock().unwrap().context().iter().rev().find(|m| m.role == Role::Assistant).map(|m| m.text()).filter(|t| failed.is_some() || !t.is_empty()).unwrap_or_default();
     // Whole transcript, resumes included: lets the orchestrator see a step that burns tokens without progress.
     let (calls, input) = session.lock().unwrap().entries.iter().fold((0u64, 0u64), |(n, t), e| match &e.kind {
         crate::session::Kind::Msg { usage: Some(u), .. } => (n + 1, t + u.input + u.cache_read + u.cache_write),
@@ -756,6 +787,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     });
     // The 600-char rule is only a prompt: cap what actually enters the orchestrator's context.
     let answer = match answer.char_indices().nth(REPORT_CAP) {
+        _ if answer.is_empty() && failed.is_some() => "(it had not written anything yet)".into(),
         _ if answer.is_empty() => "(subagent returned no text)".into(),
         Some((i, _)) => format!("{}… [report cut, see transcript]", &answer[..i]),
         None => answer,
@@ -785,8 +817,15 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     }
     if let Some(before) = before
         && tree_state(&rt.cwd).await.is_some_and(|after| after != before) {
-            if let Some(cmd) = verify_command(&rt.settings, &rt.cwd) {
-                checks.push_str(&format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await));
+            if let Some(cmd) = verify_command(&rt.settings, &rt.cwd).filter(|_| failed.is_none()) {
+                // One check at a time, and never on a tree another writer is still editing: the last one to finish runs it.
+                let _turn = rt.gate.verify.lock().await;
+                let others = rt.gate.writers.load(std::sync::atomic::Ordering::SeqCst);
+                if others > 0 {
+                    checks.push_str(&format!("\n[verify deferred: {others} other writing subagent(s) still editing; the last one to finish runs `{cmd}` on the whole tree]"));
+                } else {
+                    checks.push_str(&format!("\n{}", verify(&rt.cwd, &cmd, rt.settings.tools.bash_timeout.max(600)).await));
+                }
             }
             if let Some(stat) = git(&rt.cwd, &["diff", "HEAD", "--shortstat"]).await.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
                 checks.push_str(&format!("\n[changed since HEAD: {stat}]"));
@@ -798,7 +837,11 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
     } else {
         format!("\n[to continue it: task agent=\"{who}\" resume=<transcript>]")
     };
-    Ok(tools::ToolOut::ok(format!("{answer}{checks}\n[cost: {calls} model calls, {}k input tokens]{next}\n[transcript: {transcript}]", input / 1000)))
+    let tail = format!("{checks}\n[cost: {calls} model calls, {}k input tokens]{next}\n[transcript: {transcript}]", input / 1000);
+    Ok(match failed {
+        Some(e) => tools::ToolOut::err(format!("{who} stopped on an error: {e}\nIts work so far is kept; resume it to carry on from where it stopped. Last message:\n{answer}{tail}")),
+        None => tools::ToolOut::ok(format!("{answer}{tail}")),
+    })
 }
 
 /// Name the session from its first exchange using the title model.
@@ -964,6 +1007,7 @@ mod tests {
             jobs: Default::default(),
             ssh: Default::default(),
             plan: Default::default(),
+            gate: Default::default(),
         }
     }
 

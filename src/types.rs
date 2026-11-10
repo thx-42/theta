@@ -108,6 +108,8 @@ pub enum Delta {
     Text(String),
     Thinking(String),
     ToolStart { name: String },
+    /// The request failed and is sent again after `wait` seconds: what was streamed so far is void.
+    Retry { attempt: u32, wait: u64, reason: String },
 }
 
 /// Rough token estimate (4 chars per token) for messages without provider usage.
