@@ -666,6 +666,8 @@ fn handle(live: &Arc<Live>, req: Req, out: &UnboundedSender<Push>) {
                 return err("interrupt the agent first");
             }
             let _ = live.session.lock().unwrap().set_leaf(target);
+            // Another branch: what the model "already read" is no longer in its context.
+            live.st.lock().unwrap().rt.read_cache.lock().unwrap().clear();
         }
         Req::Attach { .. } | Req::Reload | Req::McpConnect(_) | Req::McpStatus | Req::McpRows | Req::Busy | Req::Shutdown | Req::SaveTabs { .. } | Req::Seen => {}
         Req::RemoteStart { .. } | Req::RemoteStop | Req::RemoteStatus | Req::Overview { .. } => {}
