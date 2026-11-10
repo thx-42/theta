@@ -173,6 +173,23 @@ pub fn truncate_middle(text: &str, max_lines: usize) -> (String, bool) {
     (joined, true)
 }
 
+/// Keep the full text of an output that was truncated for the model; returns the file to point it at.
+pub fn save_log(raw: &[u8]) -> Option<PathBuf> {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = crate::config::home().join("cache/logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+    let file = dir.join(format!("{ms}-{}.log", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::write(&file, raw).ok()?;
+    Some(file)
+}
+
+/// Tools that only read: several in one reply run at the same time. Everything else (shell, edits, MCP, questions)
+/// runs alone, in the order the model wrote it. `task` stays parallel: that is how subagents fan out.
+pub fn concurrent_safe(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "find" | "ls" | "web_search" | "web_fetch" | "task" | "job" | "list_agents")
+}
+
 /// Subagent transcripts live on this machine: reading them must not go to the ssh host.
 fn is_transcript(name: &str, args: &Value, ctx: &ToolCtx) -> bool {
     matches!(name, "read" | "grep")
