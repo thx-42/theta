@@ -365,7 +365,8 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
                 continue;
             }
-            if !review_asked && !diff_read && let Some(t0) = &tree0 && tree_state(&rt.cwd).await.is_some_and(|t| &t != t0) {
+            // Not when Plan is about to take over: the run must end there.
+            if !handed_off && !review_asked && !diff_read && let Some(t0) = &tree0 && tree_state(&rt.cwd).await.is_some_and(|t| &t != t0) {
                 review_asked = true;
                 session.lock().unwrap().add_msg(Msg::user(REVIEW_MSG), None)?;
                 continue;
