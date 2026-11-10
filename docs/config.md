@@ -32,6 +32,7 @@ effort = "high"
 - `bash_timeout`: seconds, default 120. `max_lines`: lines before middle-truncation, default 300.
 - `verify`: command the harness runs after a subagent that can write changed the working tree; its result (`ok` or `FAILED` with the output tail) is appended to the subagent's report. Empty = detect (`cargo test --quiet` with a `Cargo.toml`, `go test ./...` with a `go.mod`), `off` = never.
 - `auto_max_lines`: lines of `read`, `grep`, `find`, `ls` and `bash` output the Auto agent itself receives, default 80, 0 = no cap. Bigger reads go to a subagent.
+- `auto_nudges`: times the Auto agent is sent back to work when it stops with unfinished todos, default 8, 0 = never. It is also sent back to read `git diff` when files changed since its last read (3 times per turn at most).
 - `disabled`: tool names turned off for every agent, built-in or `mcp__<server>__<tool>`. Per-agent control: `tools:` in the agent file (see `tools.md`).
 
 ### `[skills]`

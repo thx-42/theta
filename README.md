@@ -140,7 +140,8 @@ context = 128000
 **Règles de délégation**
 
 - Un agent à outils read-only (comme `Plan`) ne peut spawner que des agents read-only. Seul un agent `delegate: all` (comme `Auto`) peut déléguer l'écriture.
-- Seul le thread principal spawne des sous-agents : un sous-agent ne peut jamais en lancer d'autres, pas de récursion.
+- Un seul niveau d'imbrication, en lecture seule : un sous-agent read-only (par exemple un `Plan` chargé d'une sous-tâche) peut lancer des agents read-only comme `Explore`, jamais un agent qui écrit, et ces derniers ne lancent rien.
+- `Auto` découpe une très grosse tâche en sous-tâches : un `Plan` par sous-tâche en parallèle (chacun avec ses `Explore` et son fichier de plan), puis un `Build` par lot, puis vérification et review en boucle jusqu'à zéro défaut.
 - `Auto` est relancé s'il s'arrête avec des todos non terminés (3 fois max).
 
 ### Définir un agent

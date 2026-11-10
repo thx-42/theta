@@ -142,10 +142,18 @@ impl Runtime {
 
     pub fn tools_for(&self, agent: &Agent, depth: u8) -> Vec<ToolDef> {
         let mut defs = tools::all_defs();
-        if depth == 0 {
-            // Orchestrators (`delegate: all`) are not offered as subagents: they could not delegate from there.
-            let spawnable: Vec<_> = self.agents.iter().filter(|a| agents::can_spawn(agent, a) && !a.delegate_all).map(|a| (a.name.clone(), a.description.clone())).collect();
-            defs.push(tools::task_def(&spawnable));
+        // Orchestrators (`delegate: all`) are not offered as subagents: they could not delegate from there.
+        // One level of nesting, reading only: a read-only subagent (a Plan working on one sub-task) may start read-only agents (Explore), nothing deeper.
+        if depth == 0 || (depth == 1 && agents::is_readonly(agent)) {
+            let spawnable: Vec<_> = self
+                .agents
+                .iter()
+                .filter(|a| agents::can_spawn(agent, a) && !a.delegate_all && (depth == 0 || agents::is_readonly(a)))
+                .map(|a| (a.name.clone(), a.description.clone()))
+                .collect();
+            if depth == 0 || !spawnable.is_empty() {
+                defs.push(tools::task_def(&spawnable));
+            }
         }
         defs.extend(self.mcp.defs());
         defs.retain(|d| !self.settings.tools.disabled.contains(&d.name));
@@ -276,7 +284,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
     // Auto reviews its own diff: remember the tree it started from, and whether it looked at the diff since its last change.
     let tree0 = if turn.depth == 0 && turn.agent.delegate_all { tree_state(&rt.cwd).await } else { None };
     let mut diff_read = false;
-    let mut review_asked = false;
+    let mut reviews = 0u8;
+    // Tree at the last diff read or review nudge: a change made by `bash` after it (a formatter, `sed -i`) is unread too.
+    let mut tree_read: Option<String> = None;
     loop {
         drain_steer(&steer, &session, &tx, &rt, turn.depth);
         // A subagent that runs long hands its state back so the orchestrator can re-steer (resume or re-split).
@@ -360,16 +370,22 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 continue;
             }
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
-            if turn.depth == 0 && turn.agent.delegate_all && !handed_off && nudges < 3 && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
+            if turn.depth == 0 && turn.agent.delegate_all && !handed_off && usize::from(nudges) < rt.settings.tools.auto_nudges && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
                 nudges += 1;
                 session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
                 continue;
             }
             // Not when Plan is about to take over: the run must end there.
-            if !handed_off && !review_asked && !diff_read && let Some(t0) = &tree0 && tree_state(&rt.cwd).await.is_some_and(|t| &t != t0) {
-                review_asked = true;
-                session.lock().unwrap().add_msg(Msg::user(REVIEW_MSG), None)?;
-                continue;
+            // Asked again when files change after a review (a fix is a change too), three times per turn at most.
+            if !handed_off && reviews < 3 && let Some(t0) = &tree0 {
+                let now = tree_state(&rt.cwd).await;
+                if now.as_ref().is_some_and(|t| t != t0) && (!diff_read || now != tree_read) {
+                    reviews += 1;
+                    diff_read = true;
+                    tree_read = now;
+                    session.lock().unwrap().add_msg(Msg::user(REVIEW_MSG), None)?;
+                    continue;
+                }
             }
             if matches!(resp.stop.as_str(), "max_tokens" | "length" | "MAX_TOKENS") {
                 let _ = tx.send(Event::Error("reply cut off at the output token limit — say \"continue\" to resume".into()));
@@ -379,10 +395,11 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
             break;
         }
+        let mut read_now = false;
         for (_, name, args) in &calls {
             match name.as_str() {
                 "edit" | "write" | "task" => diff_read = false,
-                "bash" if args.get("command").and_then(|v| v.as_str()).is_some_and(|c| c.contains("git diff")) => diff_read = true,
+                "bash" if args.get("command").and_then(|v| v.as_str()).is_some_and(|c| c.contains("git diff")) => (diff_read, read_now) = (true, true),
                 _ => {}
             }
         }
@@ -414,7 +431,8 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 } else if let Some(open) = (name == "task" && turn.depth == 0 && writes_files(&rt, &turn, &args)).then(|| tools::fs::open_questions(&ctx.session_id)).filter(|q| !q.is_empty()) {
                     // Building on a guess costs more round trips than settling it first.
                     tools::ToolOut::err(format!("The plan still has open questions:\n{}\nSettle each one first (an Explore with that exact question, an MCP test, or `ask` for a user decision), write the answer and its evidence into the plan, empty `## Open questions`, then start the Build.", open.join("\n")))
-                } else if name == "task" && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                } else if name == "task" && turn.depth == 0 && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // Depth 0 only: job reports are delivered to the main agent, a nested background job would leak into its context.
                     background_subagent(&rt, &turn, &id, &args, &tx)
                 } else if name == "task" {
                     subagent(&rt, &turn, &id, &args, &tx, None).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
@@ -451,6 +469,9 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             }
         });
         let results = futures::future::join_all(futs).await;
+        if read_now && diff_read && tree0.is_some() {
+            tree_read = tree_state(&rt.cwd).await;
+        }
         handed_off |= results.iter().zip(&names).any(|(r, n)| n == "enter_plan" && matches!(r, Block::ToolResult { is_error: false, .. }));
         session.lock().unwrap().add_msg(Msg { role: Role::User, content: results, model: None }, None)?;
     }
@@ -609,7 +630,7 @@ pub fn sub_transcript(id: &str) -> PathBuf {
 /// `log` (background jobs) receives one line per tool call the subagent makes.
 async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: &Tx, log: Option<&crate::jobs::Out>) -> Result<tools::ToolOut> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).context("prompt required")?;
-    anyhow::ensure!(parent.depth == 0, "subagents cannot spawn subagents");
+    anyhow::ensure!(parent.depth <= 1, "a subagent's subagent cannot spawn subagents");
     // Own todo list: the main one belongs to the orchestrator. Background jobs expose theirs through `job todos`.
     let mut rt = rt.clone();
     rt.todos = log.map(|l| l.1.clone()).unwrap_or_default();
@@ -623,6 +644,7 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         }
         None => parent.agent.clone(),
     };
+    anyhow::ensure!(parent.depth == 0 || (named && agents::is_readonly(&parent.agent) && agents::is_readonly(&agent)), "only a read-only subagent can start agents, and only read-only ones (name one with `agent`, e.g. Explore)");
     // `model: "main"` escalates to the orchestrator's own model; an unknown name falls back to the defaults.
     let asked = args.get("model").and_then(|v| v.as_str()).and_then(|m| if m == "main" { Some(parent.model.clone()) } else { rt.resolve(m).ok().map(|_| m.to_string()) });
     let model = match asked {
@@ -675,6 +697,12 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
             if let (Some(log), Event::ToolStart { name, .. }) = (&log, &ev) {
                 log.push(&format!("→ {name}\n"));
             }
+            // A grandchild's activity counts as this subagent's: the UI tracks one level.
+            let ev = match ev {
+                Event::Sub { event, .. } if matches!(*event, Event::ToolStart { .. }) => *event,
+                Event::Sub { .. } => continue,
+                ev => ev,
+            };
             let _ = fwd_tx.send(Event::Sub { id: id.clone(), event: Box::new(ev) });
         }
     });
@@ -698,6 +726,16 @@ async fn subagent(rt: &Runtime, parent: &Turn, call_id: &str, args: &Value, tx: 
         None => answer,
     };
     let mut checks = String::new();
+    // A planning subagent saved its own plan file: point the orchestrator at it, with what it left open.
+    let sub_id = session.lock().unwrap().id.clone();
+    let plan_file = crate::config::home().join("plan").join(format!("{sub_id}.md"));
+    if plan_file.exists() {
+        checks.push_str(&format!("\n[plan file: {}]", plan_file.display()));
+        let open = tools::fs::open_questions(&sub_id);
+        if !open.is_empty() {
+            checks.push_str(&format!("\n[open questions in that plan: {}]", open.join("; ")));
+        }
+    }
     let open: Vec<String> = rt.todos.lock().unwrap().iter().filter(|t| t.status != "done").map(|t| t.content.clone()).collect();
     if !open.is_empty() {
         checks.push_str(&format!("\n[unfinished in its todo: {}]", open.join("; ")));
@@ -765,6 +803,34 @@ mod tests {
         assert!(defs.iter().any(|d| d.name == "enter_plan") && defs.iter().any(|d| d.name == "bash"));
         // subagents never get plan mode
         assert!(!rt.tools_for(&auto, 1).iter().any(|d| d.name == "enter_plan"));
+    }
+
+    #[tokio::test]
+    async fn nested_task_is_read_only_and_one_level_deep() {
+        let mut rt = test_rt().await;
+        rt.agents = Arc::new(vec![
+            agents::parse_builtin(agents::DEFAULT_BUILD, "Build"),
+            agents::parse_builtin(agents::DEFAULT_EXPLORE, "Explore"),
+            agents::parse_builtin(agents::DEFAULT_PLAN, "Plan"),
+            agents::parse_builtin(agents::DEFAULT_AUTO, "Auto"),
+        ]);
+        let (build, explore, plan) = (rt.agents[0].clone(), rt.agents[1].clone(), rt.agents[2].clone());
+        // A Plan subagent may start read-only agents only.
+        let defs = rt.tools_for(&plan, 1);
+        let task = defs.iter().find(|d| d.name == "task").expect("Plan subagent has task");
+        let names: Vec<&str> = task.schema["properties"]["agent"]["enum"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"Explore") && !names.contains(&"Build") && !names.contains(&"Auto"), "{names:?}");
+        // A writing subagent delegates nothing; nothing nests deeper.
+        assert!(!rt.tools_for(&build, 1).iter().any(|d| d.name == "task"));
+        assert!(!rt.tools_for(&plan, 2).iter().any(|d| d.name == "task"));
+        assert!(!rt.tools_for(&explore, 1).iter().any(|d| d.name == "task"));
+        // The harness refuses what the tool list does not offer.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sub = Turn { agent: plan.clone(), model: String::new(), effort: String::new(), depth: 1 };
+        let err = subagent(&rt, &sub, "t1", &json!({"prompt": "x", "agent": "Build"}), &tx, None).await.err().expect("a writing agent is refused");
+        assert!(format!("{err:#}").contains("read-only"), "{err:#}");
+        let deep = Turn { agent: plan, model: String::new(), effort: String::new(), depth: 2 };
+        assert!(subagent(&rt, &deep, "t2", &json!({"prompt": "x", "agent": "Explore"}), &tx, None).await.is_err());
     }
 
     #[tokio::test]

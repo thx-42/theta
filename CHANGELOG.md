@@ -1,5 +1,13 @@
 # Changelog
 
+## Non publié
+
+### Nouveautés
+- **Auto multiplexé.** Pour une très grosse tâche, Auto la découpe en sous-tâches, lance un `Plan` par sous-tâche en parallèle, lit les plans, puis lance un `Build` par lot. Chaque `Plan` explore sa zone avec ses propres `Explore` et enregistre son propre fichier de plan (`[plan file: …]` dans son rapport).
+- **Un niveau d'imbrication en lecture seule.** Un sous-agent read-only (`Plan`) peut lancer des agents read-only (`Explore`), au premier plan ; jamais un agent qui écrit, et rien de plus profond. Un `Build` en sous-agent ne lance rien.
+- **Boucle jusqu'à zéro défaut.** Le prompt Auto impose vérification → review → correction → nouvelle vérification avant le compte rendu, avec test via MCP quand un serveur atteint le vrai runtime. Auto est renvoyé relire `git diff` à chaque changement non relu (3 fois par tour au plus) et relancé sur des todos non terminés jusqu'à `auto_nudges` fois (8 par défaut, au lieu de 3).
+- **Plans en lots.** `Plan` écrit des lots parallélisables (fichiers disjoints, un `Build` par lot), dimensionnés au nombre d'agents annoncé dans le brief.
+
 ## 0.3.1
 
 ### Nouveautés

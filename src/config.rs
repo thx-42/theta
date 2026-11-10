@@ -191,13 +191,15 @@ pub struct ToolSettings {
     pub verify: String,
     /// Lines of read/grep/find/ls/bash output Auto itself receives (0 = no cap); larger reads belong to subagents.
     pub auto_max_lines: usize,
+    /// Times Auto is sent back to work when it stops with unfinished todos (0 = never).
+    pub auto_nudges: usize,
     /// Model calls after which a subagent must stop and write a handoff report (0 = never).
     pub checkpoint_steps: usize,
 }
 
 impl Default for ToolSettings {
     fn default() -> Self {
-        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80, checkpoint_steps: 40 }
+        ToolSettings { rtk: "auto".into(), bash_timeout: 120, max_lines: 300, disabled: vec![], verify: String::new(), auto_max_lines: 80, auto_nudges: 8, checkpoint_steps: 40 }
     }
 }
 
@@ -527,6 +529,7 @@ bash_timeout = 120
 max_lines = 300
 # verify = ""            # run after a subagent changed files; "" = detect (Cargo.toml, go.mod), "off" = never
 # auto_max_lines = 80    # lines of read/grep/bash output the Auto agent itself receives; 0 = no cap
+# auto_nudges = 8        # times Auto is sent back to work when it stops with unfinished todos; 0 = never
 # checkpoint_steps = 40  # model calls after which a subagent writes a handoff report for Auto; 0 = never
 disabled = []
 

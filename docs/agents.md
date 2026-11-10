@@ -42,5 +42,7 @@ Subagent defaults: `[models] subagent`, `[models] subagent_effort`.
 ## Subagents
 
 - Any agent can run `task` to delegate. A read-only agent (Plan) can only spawn read-only agents, unless it sets `delegate: all` (Auto does).
+- Nesting is one level deep and read-only: a read-only subagent may start read-only agents (a Plan subagent starts its own Explore agents), always in the foreground; a writing subagent (Build) starts none; those cannot start anything.
+- A subagent that saves a plan with `write_plan` gets its own plan file; its report ends with `[plan file: …]` and, if any, `[open questions in that plan: …]`. Auto uses this to run one Plan per sub-task in parallel.
 - `background: true` runs a subagent without waiting. `job` waits for or reads results.
 - `/jobs` (alt+j) lists background shells, linters and subagents.
