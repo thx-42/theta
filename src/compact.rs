@@ -17,6 +17,9 @@ Use this EXACT format:
 ## Goal
 [What the user is trying to accomplish]
 
+## Requests
+- [Each thing the user asked for, in their exact words, with its state: done, in progress or not started. Never drop or merge one]
+
 ## Constraints & Preferences
 - [Requirements and preferences the user stated, or (none)]
 

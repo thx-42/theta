@@ -279,8 +279,8 @@ const WORK_RULE: &str = "# Work\nYour job is the step in the brief, nothing arou
 
 const REPORT_RULE: &str = "# Report\nYou are a subagent. Your last message is your report; the orchestrator reads nothing else. Keep it under {budget} characters unless the task prompt asks for another report size (a checkpoint handoff report may use up to 3000). Keep your `todo` list current (one item per step, edge cases included): the orchestrator reads it while you run. Terse: what you did, files touched (path:line), verification (command and result), open issues. List every requirement of the brief you did not implement exactly as written under `deviations:` (what you did instead, why); never present a substitute as the requested behaviour. Never paste code or logs; an investigator answers each question asked, with `path:line` evidence. A reviewer lists only the defects, one line each as `path:line problem` (max 15 lines, nothing about what is fine); no defect: `no defects`.\n\n# Questions to the orchestrator\nThe orchestrator wrote your brief and can answer you; it resumes you with your context intact. Before your first change, check the brief against the code. If something you need is missing, ambiguous or contradicts the code (a name, a file, a shape, a requirement), and the code cannot settle it, stop: do not guess and do not build a substitute. The same applies later when the work reveals a conflict with the brief. Your report then starts with `questions:`, one numbered question per line. Each question gives what you found (`path:line`), the options you see, and the one you recommend. After the questions, add what you already did, if anything.";
 
-/// Auto ends a turn that changed files without having read the diff: the strongest model reviews before the user does.
-const REVIEW_MSG: &str = "Files changed during this turn and you have not read the diff since your last change. Before your final answer, read it (`diff` tool, new files included; `git diff` if you lack it) as the user's most demanding reviewer: bugs and unhandled failure paths; missing junctions (is everything this change must be wired to actually wired, does it work from the user's entry point?); leftovers (debug code, stale callers, docs, tests). Fix what you find, verify again, then give your final answer. That answer reports the work the user asked for, as it would have without this message: this check is your own process, so leave it out unless it found a defect you could not fix.";
+/// Auto ends a turn that changed files without having read the diff: it is sent back to finish what the request asked and to review the change before the user does.
+const REVIEW_MSG: &str = "Files changed during this turn and you have not read the diff since your last change. Check your work before the user reads anything:\n1. The request. Read the user's messages of this turn again, word by word. Each thing they asked for must be done, as asked. Whatever you left out, did halfway, or were about to offer as a follow-up (\"tell me if you want…\"): do it now. The same goes for what the project rules attach to a change (tests, docs, restart, a check in the running system) when it is within your tools. Leave only what is truly blocked.\n2. The impact. For what you changed (a function, an event, a data shape, a setting, a screen): is every consumer adapted, across the whole project, and does everything it relies on hold? `grep` what you have not checked, and adapt what is affected now.\n3. The diff. Read it (`diff` tool, new files included; `git diff` if you lack it) as the user's most demanding reviewer: bugs and unhandled failure paths; missing junctions (is everything this change must be wired to actually wired, does it work from the user's entry point?); leftovers (debug code, stale callers, docs, tests). Fix what you find and verify again.\nThen write your final report again, whole: it replaces anything you wrote above, so it stands alone and reports the work the user asked for. This check is your own process: the report says nothing about it, about the diff or about having read anything again, unless it found a defect you could not fix.";
 
 const CHECKPOINT_MSG: &str = "Checkpoint: stop calling tools now. Your next message is a handoff report for the orchestrator (up to 3000 characters): what is done, what is not done, files touched (path:line), what was verified and how, blockers, and the exact next step. Do not continue the work in this message.";
 
@@ -422,7 +422,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
             // Auto must finish its plan: unfinished todos send it back to work (3 nudges, then let it stop).
             if turn.depth == 0 && turn.agent.delegate_all && !handed_off && usize::from(nudges) < rt.settings.tools.auto_nudges && ctx.todos.lock().unwrap().iter().any(|t| t.status != "done") {
                 nudges += 1;
-                session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. If you are truly blocked on a user decision, call `ask`."), None)?;
+                session.lock().unwrap().add_msg(Msg::user("The todo list still has unfinished steps. Continue until every step is done and verified. A step that no longer applies: update the list, then go on. Truly blocked: solve it another way, or `ask` if only the user can unblock it."), None)?;
                 continue;
             }
             // Not when Plan is about to take over: the run must end there.
@@ -473,7 +473,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
         let run_call = |((id, name, mut args), stagger): ((String, String, Value), bool)| {
             let (rt, ctx, tx, turn, steer) = (rt.clone(), ctx.clone(), tx.clone(), turn.clone(), steer.clone());
             async move {
-                // The orchestrator's context is the expensive one: its own reads stay small, big ones go to a subagent.
+                // Auto works on the code itself, but its context lasts the whole task: one call cannot flood it.
                 // A `read` is capped by its `limit`, so the result ends on the `offset=` hint and no part of it is lost.
                 let cap = if turn.depth == 0 && turn.agent.delegate_all { rt.settings.tools.auto_max_lines } else { 0 };
                 if cap > 0 && name == "read" && args.is_object() {
@@ -507,7 +507,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                     tools::wait(&args, &ctx, &pending).await.unwrap_or_else(|e| tools::ToolOut::err(format!("{e:#}")))
                 } else if let Some(open) = (name == "task" && turn.depth == 0 && writes_files(&rt, &turn, &args)).then(|| tools::fs::open_questions(&ctx.session_id)).filter(|q| !q.is_empty()) {
                     // Building on a guess costs more round trips than settling it first.
-                    tools::ToolOut::err(format!("The plan still has open questions:\n{}\nSettle each one first (an Explore with that exact question, an MCP test, or `ask` for a user decision), write the answer and its evidence into the plan, empty `## Open questions`, then start the Build.", open.join("\n")))
+                    tools::ToolOut::err(format!("The plan still has open questions:\n{}\nSettle each one first (read the code, an Explore with that exact question, an MCP test; a choice is yours to make, `ask` as the last resort), write the answer and its evidence into the plan, empty `## Open questions`, then start the Build.", open.join("\n")))
                 } else if name == "task" && turn.depth == 0 && args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
                     // Depth 0 only: job reports are delivered to the main agent, a nested background job would leak into its context.
                     background_subagent(&rt, &turn, &id, &args, &tx)
@@ -540,7 +540,7 @@ pub async fn run(rt: Runtime, session: Arc<Mutex<Session>>, turn: Turn, tx: Tx, 
                 if cap > 0 && matches!(name.as_str(), "grep" | "find" | "ls" | "bash") {
                     let (t, cut) = tools::truncate_middle(&out.content, cap);
                     if cut {
-                        out.content = format!("{t}\n[cut to {cap} lines: you are the orchestrator — have a subagent read or run larger things and report conclusions]");
+                        out.content = format!("{t}\n[cut to {cap} lines: narrow the command or read the part you need; a sweep over many files goes to an Explore]");
                     }
                 }
                 // Auto's plan is a working document: tell it what the plan's state calls for next, never to stop.
@@ -619,7 +619,7 @@ async fn handoff(rt: &Runtime, args: &Value, tx: &Tx, session_id: &str) -> tools
         let plan = crate::config::home().join("plan").join(format!("{session_id}.md"));
         let plan = if plan.exists() { format!("Plan file: {}.", plan.display()) } else { "No plan file was saved.".into() };
         let message = format!(
-            "Plan mode finished: {summary}\n{plan} The todo list is loaded. Review the plan against the code and the requirements: if it is sound, execute it now; if it has gaps, guesses or mistakes, call `enter_plan` with precise feedback; `ask` the user only for a choice that is theirs."
+            "Plan mode finished: {summary}\n{plan} The todo list is loaded. Review the plan against the code and the requirements: if it is sound, execute it now, in this turn, until the result is proven; if it has gaps, guesses or mistakes, fix a small one yourself or call `enter_plan` with precise feedback. What is still open is yours to decide."
         );
         let _ = tx.send(Event::Handoff { agent: origin.clone(), message: Some(message) });
         return tools::ToolOut::ok(format!("Handing back to {origin} for review. End your turn now with one short line."));
@@ -665,10 +665,10 @@ fn writes_files(rt: &Runtime, parent: &Turn, args: &Value) -> bool {
 /// What Auto does after `write_plan`: settle what is still open, or build, check and review. Never end the turn.
 fn plan_next_step(open: &[String]) -> String {
     if open.is_empty() {
-        return "The plan is ready, not delivered: start the Builds now, in this turn, follow their reports, then run the Review and Deliver phases.".into();
+        return "The plan is ready, not delivered: execute it now, in this turn (yourself, or Builds for big independent batches), then prove the result.".into();
     }
     format!(
-        "The plan is not ready yet. Still open:\n{}\nSettle each one now, in this turn: an Explore or an MCP test for facts, `ask` for what only the user can decide. Then rewrite the plan with the answers.",
+        "The plan is not ready yet. Still open:\n{}\nSettle each one now, in this turn: read the code, an Explore or an MCP test for facts; a choice is yours to make, with `ask` as the last resort. Then rewrite the plan with the answers.",
         open.join("\n")
     )
 }
@@ -979,7 +979,7 @@ mod tests {
         let open = plan_next_step(&["Q1 does RegisterNpc return a key? → MCP test".into()]);
         assert!(open.contains("not ready") && open.contains("Q1 does RegisterNpc") && open.contains("`ask`"));
         let ready = plan_next_step(&[]);
-        assert!(ready.contains("start the Builds") && ready.contains("Review"));
+        assert!(ready.contains("execute it now") && ready.contains("prove"));
     }
 
     #[test]

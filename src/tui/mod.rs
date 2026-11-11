@@ -685,6 +685,8 @@ struct Ui {
     /// Session ids being opened because another client opened them (not yet attached).
     opening: Vec<String>,
     started: Instant,
+    /// Another agent takes over when this run ends (plan mode and back): the work is not done yet.
+    handoff_pending: bool,
     elapsed: Duration,
     counts: Counts,
     status: String,
@@ -1010,6 +1012,7 @@ impl Ui {
         self.interrupted = false;
         self.running = true;
         self.started = Instant::now();
+        self.handoff_pending = false;
         self.counts = Counts::default();
         self.status = "thinking".into();
         self.out_tokens = 0;
@@ -1207,7 +1210,10 @@ impl Ui {
                 self.out_tokens += usage.output;
                 self.stream_chars = 0;
             }
-            Event::Handoff { agent, .. } => self.notify(format!("switching to {agent} after this reply")),
+            Event::Handoff { agent, .. } => {
+                self.handoff_pending = true;
+                self.notify(format!("switching to {agent} after this reply"));
+            }
             Event::Ask { id, question, options } => {
                 self.attention(&format!("question: {question}"));
                 self.status = "waiting for your answer".into();
@@ -1262,7 +1268,9 @@ impl Ui {
             Event::Done => {
                 self.close_streaming();
                 self.mark_seen();
-                self.attention("done");
+                if !self.handoff_pending {
+                    self.attention("done");
+                }
                 self.running = false;
                 self.elapsed = self.started.elapsed();
                 self.refresh_diff();
@@ -3089,7 +3097,7 @@ impl Ui {
             std::mem::swap(&mut self.cache, &mut v.cache);
             std::mem::swap(&mut self.dirty, &mut v.dirty);
         }
-        let lines = if self.items.is_empty() && self.sub.is_none() { self.splash(chat_inner.height as usize) } else { self.chat_lines(chat_inner.width as usize) };
+        let lines = if self.items.is_empty() && self.sub.is_none() { self.splash(chat_inner.width as usize, chat_inner.height as usize) } else { self.chat_lines(chat_inner.width as usize) };
         if let Some(v) = &mut self.sub {
             std::mem::swap(&mut self.items, &mut v.items);
             std::mem::swap(&mut self.cache, &mut v.cache);
@@ -3343,12 +3351,12 @@ impl Ui {
         }
     }
 
-    fn splash(&self, h: usize) -> Vec<Line<'static>> {
+    fn splash(&self, w: usize, h: usize) -> Vec<Line<'static>> {
+        const LOGO: [&str; 4] = [r" _   _        _", r"| |_| |_  ___| |_ __ _", r"|  _| ' \/ -_)  _/ _` |", r" \__|_||_\___|\__\__,_|"];
         let a = &self.app.turn.agent;
-        let mut out = vec![
-            Line::from(vec![Span::styled("  θ ", theme::agent(&a.name).add_modifier(Modifier::BOLD)), Span::styled(format!("v{}{}", env!("CARGO_PKG_VERSION"), if crate::update::is_dev() { " dev" } else { "" }), theme::dim())]),
-            Line::from(Span::styled(format!("  {}  ·  {}", self.app.turn.model, crate::config::tilde(&self.app.rt.cwd)), theme::dim())),
-        ];
+        let mut out: Vec<Line<'static>> = LOGO.iter().map(|l| Line::from(Span::styled(l.to_string(), theme::agent(&a.name).add_modifier(Modifier::BOLD)))).collect();
+        out.push(Line::from(Span::styled(format!("v{}{}", env!("CARGO_PKG_VERSION"), if crate::update::is_dev() { " dev" } else { "" }), theme::dim())));
+        out.push(Line::from(Span::styled(format!("  {}  ·  {}", self.app.turn.model, crate::config::tilde(&self.app.rt.cwd)), theme::dim())));
         if let Some(s) = &self.ssh {
             out.push(Line::from(Span::styled(format!("  ssh {}:{}", s.host, s.cwd), theme::dim())));
         }
@@ -3359,6 +3367,14 @@ impl Ui {
             }
         }
         out.push(Line::from(Span::styled("  /help · shift+tab agent · ctrl+p model", theme::dim())));
+        // the block is centered as a whole: every line gets the same left margin
+        let block_w = out.iter().map(|l| l.width()).max().unwrap_or(0);
+        let left = " ".repeat(w.saturating_sub(block_w) / 2);
+        let out: Vec<Line<'static>> = out.into_iter().map(|l| {
+            let mut spans = vec![Span::raw(left.clone())];
+            spans.extend(l.spans);
+            Line::from(spans)
+        }).collect();
         let mut top = vec![Line::default(); h.saturating_sub(out.len()) / 2];
         top.extend(out);
         top
@@ -4375,6 +4391,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         restoring: 0,
         opening: vec![],
         started: Instant::now(),
+        handoff_pending: false,
         elapsed: Duration::ZERO,
         counts: Counts::default(),
         status: String::new(),
