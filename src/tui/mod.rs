@@ -1,9 +1,11 @@
 //! Full-screen ratatui interface.
 
+mod commands;
 mod markdown;
 mod tabs;
 mod tree;
 
+use commands::{COMMANDS, Hint};
 use crate::agent::Event;
 use crate::auth::{self, Method};
 use crate::agents::{self, Agent};
@@ -177,39 +179,6 @@ const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 /// Main actions behind ctrl+p, in menu order. Descriptions come from COMMANDS.
 const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/diff", "/compact", "/verbose", "/copy", "/usage", "/settings", "/login", "/help", "/quit"];
 
-const COMMANDS: &[(&str, &str)] = &[
-    ("/new", "start a new session"),
-    ("/resume", "open a previous session"),
-    ("/session", "session tabs: new | close | hide | show | <n> | width <n>"),
-    ("/tree", "browse and fork the conversation tree"),
-    ("/linters", "linters per language and whether they are installed"),
-    ("/theme", "color theme: (none) to pick | <name>"),
-    ("/remote", "control theta from a browser: (none) | stop | status"),
-    ("/ssh", "run tools on a server: <ssh arguments> | off"),
-    ("/cd", "browse the ssh server's folders: (none) opens the explorer | <dir>"),
-    ("/jobs", "background shells, linters and subagents (alt+j)"),
-    ("/undo", "remove the last turn and put its prompt back in the input: (none) | files = also put the files back"),
-    ("/diff", "changes: session | turn | unpushed, popup | split | close"),
-    ("/model", "change model"),
-    ("/agent", "change agent"),
-    ("/skills", "list skills (use $name in a message)"),
-    ("/mcp", "MCP servers: view, login, reconnect, diagnose"),
-    ("/effort", "reasoning effort"),
-    ("/settings", "settings (verbosity, task models, compaction, web)"),
-    ("/verbose", "toggle full / compact output"),
-    ("/compact", "compact context now"),
-    ("/btw", "side question, not kept in context"),
-    ("/title", "rename the session"),
-    ("/login", "log in to a provider"),
-    ("/logout", "remove provider credentials"),
-    ("/usage", "subscription limits and resets (Claude, Codex)"),
-    ("/stats", "token statistics across all sessions"),
-    ("/copy", "copy the last answer"),
-    ("/dump", "nightly: copy the whole session and its subagents as Markdown"),
-    ("/reload", "re-read settings, agents, skills, MCP config and the guides"),
-    ("/help", "keys and commands"),
-    ("/quit", "exit"),
-];
 
 /// Short one-line summary of a tool call's arguments.
 pub fn tool_summary(name: &str, args: &Value) -> String {
@@ -524,6 +493,24 @@ struct Editor {
 }
 
 impl Editor {
+    fn complete_hint(&mut self, hint: &str) {
+        let before = &self.text[..self.cur];
+        let token_start = before.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+        let (start, end) = if before[token_start..].starts_with(['$', '@']) {
+            (token_start, self.cur)
+        } else {
+            let token_end = self.cur + self.text[self.cur..].find(char::is_whitespace).unwrap_or(self.text.len() - self.cur);
+            (0, token_end)
+        };
+        let following_space = self.text[end..].chars().next().filter(|c| c.is_whitespace());
+        let tail = if hint.ends_with('/') || following_space.is_some() { "" } else { " " };
+        self.text.replace_range(start..end, &format!("{hint}{tail}"));
+        self.cur = start + hint.len() + tail.len();
+        if !hint.ends_with('/') && let Some(space) = following_space {
+            self.cur += space.len_utf8();
+        }
+    }
+
     fn insert(&mut self, s: &str) {
         self.text.insert_str(self.cur, s);
         self.cur += s.len();
@@ -1107,7 +1094,7 @@ impl Ui {
                 }
                 "popup" | "split" => view = w.to_string(),
                 s if crate::diff::SCOPES.contains(&s) => scope = s.to_string(),
-                _ => return self.notify("usage: /diff [session | turn | unpushed] [popup | split | close]"),
+                _ => return self.notify("choose a scope and view with /diff, then Tab"),
             }
         }
         let id = self.app.session.lock().unwrap().id.clone();
@@ -1432,7 +1419,7 @@ impl Ui {
                 },
                 n => match n.parse::<usize>() {
                     Ok(n) if (1..=self.tabs.len()).contains(&n) => self.switch_to(n - 1),
-                    _ => self.notify("usage: /session [new | close | hide | show | <n> | width <n>]"),
+                    _ => self.notify("choose a tab action with /session, then Tab"),
                 },
             },
             "/tree" => self.open_tree(),
@@ -1498,7 +1485,7 @@ impl Ui {
                     "" => self.remote.send(Req::RemoteStart { cwd: self.app.rt.cwd.clone() }),
                     "stop" => self.remote.send(Req::RemoteStop),
                     "status" => self.remote.send(Req::RemoteStatus),
-                    _ => self.notify("usage: /remote [stop|status]"),
+                    _ => self.notify("use /remote to start, /remote stop to stop, /remote status to check"),
                 }
             }
             "/ssh" => self.remote.send(Req::Ssh(arg.to_string())),
@@ -1705,7 +1692,7 @@ impl Ui {
     fn set_theme(&mut self, id: &str) {
         if !theme::set(id) {
             let all: Vec<_> = theme::THEMES.iter().map(|t| t.id).collect();
-            return self.notify(format!("unknown theme {id}: {}", all.join(" | ")));
+            return self.notify(format!("unknown theme {id}: {}", all.join(", ")));
         }
         self.update_settings("theme", id.into(), |s| s.theme = id.into());
         self.notify(format!("theme: {id}"));
@@ -2170,10 +2157,10 @@ impl Ui {
                 }
                 // A half-typed $skill completes first; a full name sends.
                 if let Some(tok) = self.skill_token().map(str::to_string)
-                    && let Some((h, _)) = hints.get(self.cmd_sel).cloned()
-                    && h != tok
+                    && let Some(h) = hints.get(self.cmd_sel).and_then(|h| h.completion.as_ref())
+                    && h != &tok
                 {
-                    self.complete(&h);
+                    self.complete(h);
                     self.cmd_sel = 0;
                     return;
                 }
@@ -2183,6 +2170,14 @@ impl Ui {
                     return;
                 }
                 if text.starts_with('/') && !text.contains('\n') {
+                    if cmds.is_empty() && !self.token().1.is_empty()
+                        && let Some(h) = hints.get(self.cmd_sel).and_then(|h| h.completion.as_ref())
+                        && h.trim() != self.input.text[..self.input.cur].trim()
+                    {
+                        self.complete(h);
+                        self.cmd_sel = 0;
+                        return;
+                    }
                     // Run the highlighted suggestion, or complete a partial command.
                     let first = text.split(' ').next().unwrap_or("");
                     let cmd = cmds.get(self.cmd_sel).copied().or_else(|| COMMANDS.iter().find(|(c, _)| *c == first)).or_else(|| COMMANDS.iter().find(|(c, _)| c.starts_with(first)));
@@ -2202,8 +2197,8 @@ impl Ui {
                 self.send(text, images);
             }
             KeyCode::Tab => {
-                if let Some((c, _)) = hints.get(self.cmd_sel).cloned() {
-                    self.complete(&c);
+                if let Some(c) = hints.get(self.cmd_sel).and_then(|h| h.completion.as_ref()) {
+                    self.complete(c);
                     self.cmd_sel = 0;
                 }
             }
@@ -2244,10 +2239,14 @@ impl Ui {
     }
 
     /// Suggestions under the input: slash commands, `$prefix` skills, `@path` files and folders.
-    fn hints(&self) -> Vec<(String, String)> {
+    fn hints(&self) -> Vec<Hint> {
         let slash = self.cmd_matches();
         if !slash.is_empty() {
-            return slash.iter().map(|(c, d)| (c.to_string(), d.to_string())).collect();
+            return slash.iter().map(|(c, d)| Hint::choice(c, d)).collect();
+        }
+        if self.input.text.starts_with('/') && !self.input.text.contains('\n') {
+            let providers: Vec<_> = self.app.rt.catalog.providers.iter().filter(|p| !self.input.text.starts_with("/login") || auth::shows_in_login(p)).map(|p| (p.id.as_str(), p.name.as_str())).collect();
+            return commands::arguments(&self.input.text[..self.input.cur], self.tabs.len(), &providers);
         }
         let Some(tok) = self.skill_token() else { return vec![] };
         if let Some(query) = tok.strip_prefix('@') {
@@ -2259,7 +2258,7 @@ impl Ui {
             if cache.0 != query || cache.1.elapsed() > Duration::from_secs(2) {
                 *cache = (query.to_string(), Instant::now(), mention_entries(&self.app.rt.cwd, query));
             }
-            return cache.2.clone();
+            return cache.2.iter().map(|(c, d)| Hint::choice(c, d)).collect();
         }
         let prefix = tok[1..].to_lowercase();
         self.app
@@ -2269,24 +2268,20 @@ impl Ui {
             .filter(|s| s.name.to_lowercase().starts_with(&prefix))
             .map(|s| {
                 let d = if s.description.is_empty() { s.scope.label().to_string() } else { s.description.clone() };
-                (format!("${}", s.name), d)
+                Hint::choice(&format!("${}", s.name), &d)
             })
             .collect()
     }
 
-    /// Put a picked hint into the input: `$skill` and `@path` replace the word at the cursor (a folder keeps the cursor inside it, to go deeper), `/cmd` replaces the line.
+    /// Complete the argument at the cursor while preserving following arguments.
     fn complete(&mut self, hint: &str) {
-        let (start, word) = self.token();
-        let (start, end) = if word.starts_with(['$', '@']) { (start, self.input.cur) } else { (0, self.input.text.len()) };
-        let tail = if hint.ends_with('/') { "" } else { " " };
-        self.input.text.replace_range(start..end, &format!("{hint}{tail}"));
-        self.input.cur = start + hint.len() + tail.len();
+        self.input.complete_hint(hint);
     }
 
     /// Commands matching a `/partial` input (empty when not typing a command).
     fn cmd_matches(&self) -> Vec<&'static (&'static str, &'static str)> {
-        let t = self.input.text.as_str();
-        if !t.starts_with('/') || t.contains([' ', '\n']) {
+        let t = &self.input.text[..self.input.cur];
+        if !t.starts_with('/') || self.input.text.contains('\n') || t.contains(char::is_whitespace) {
             return vec![];
         }
         COMMANDS.iter().filter(|(c, _)| c.starts_with(t) && (*c != "/dump" || crate::update::is_dev())).collect()
@@ -3358,11 +3353,11 @@ impl Ui {
                 f.render_widget(Clear, r);
         f.render_widget(UiBlock::default().style(theme::base()), r);
                 f.render_widget(UiBlock::default().style(theme::base()), r);
-                let name_w = m.iter().map(|(c, _)| c.width()).max().unwrap_or(0).max(10).min(w / 2);
-                let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, (c, d))| {
+                let name_w = m.iter().map(|h| h.label.width()).max().unwrap_or(0).max(10).min(w / 2);
+                let lines: Vec<Line> = m.iter().enumerate().skip(start).take(max).map(|(i, hint)| {
                     let st = if i == sel { theme::sel() } else { Style::default() };
-                    let name = fit(c, name_w);
-                    let desc = fit(d, w.saturating_sub(name_w + 2));
+                    let name = fit(&hint.label, name_w);
+                    let desc = fit(&hint.description, w.saturating_sub(name_w + 2));
                     let pad = " ".repeat(w.saturating_sub(name_w + 2 + desc.width()));
                     Line::from(vec![
                         Span::styled(format!(" {name:<name_w$}"), st.patch(theme::fg())),
@@ -4656,6 +4651,25 @@ fn stall_log(what: &str, since: Instant) {
 #[cfg(test)]
 mod tests {
     use super::{Editor, HistoryNavigation};
+
+    #[test]
+    fn completion_preserves_following_arguments_and_unicode() {
+        let mut input = Editor { text: "/diff ses split".into(), cur: "/diff ses".len() };
+        input.complete_hint("/diff session");
+        assert_eq!(input.text, "/diff session split");
+        assert_eq!(&input.text[..input.cur], "/diff session ");
+        input = Editor { text: "/session widt 24".into(), cur: "/session wi".len() };
+        input.complete_hint("/session width");
+        assert_eq!(input.text, "/session width 24");
+        input = Editor { text: "ouvre @ré puis continue".into(), cur: "ouvre @ré".len() };
+        input.complete_hint("@résumé.md");
+        assert_eq!(input.text, "ouvre @résumé.md puis continue");
+        assert_eq!(&input.text[..input.cur], "ouvre @résumé.md ");
+        input = Editor { text: "@sr".into(), cur: 3 };
+        input.complete_hint("@src/");
+        assert_eq!(input.text, "@src/");
+        assert_eq!(input.cur, 5);
+    }
 
     #[test]
     fn history_restores_unsent_draft_and_cursor() {
