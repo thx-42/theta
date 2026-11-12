@@ -770,6 +770,7 @@ struct Ui {
     base_tx: UnboundedSender<(String, String)>,
     /// Clickable parts of the tab strip, as drawn last frame.
     strip: tabs::Strip,
+    strip_scroll: u16,
     /// Tab under the mouse, and the marquee offset of its title.
     hover: Option<usize>,
     marquee: usize,
@@ -3043,9 +3044,12 @@ impl Ui {
             self.sidebar = Rect { width: 1, ..f.area() };
         }
         let hover = self.hover.map(|i| (i, self.marquee));
-        let (lines, strip) = if hidden || (vertical && width == 0) { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical, compact, hover) };
+        let render_area = if compact { Rect { height: strip_area.height.max(infos.len().min(u16::MAX as usize) as u16), ..strip_area } } else { strip_area };
+        let (mut lines, mut strip) = if hidden || (vertical && width == 0) { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(render_area, &infos, self.spin, vertical, compact, hover) };
+        tabs::scroll_strip(strip_area, &mut lines, &mut strip, self.strip_scroll, vertical);
+        self.strip_scroll = strip.offset;
         if !hidden {
-            f.render_widget(Paragraph::new(lines), strip_area);
+            f.render_widget(Paragraph::new(lines).scroll((0, if vertical { 0 } else { strip.offset })), strip_area);
         }
         self.strip = strip;
         // Split diff: a pane on the right, the chat keeps the rest (terminals under 100 columns get a popup instead).
@@ -4489,6 +4493,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         shell_tx,
         base_tx,
         strip: tabs::Strip::default(),
+        strip_scroll: 0,
         hover: None,
         marquee: 0,
         input_hit: (Rect::default(), 0, 0),
@@ -4573,6 +4578,14 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
                         if let Some(p) = &mut ui.diff_pane {
                             p.scroll = if up { p.scroll.saturating_sub(3) } else { (p.scroll + 3).min(p.lines.len().saturating_sub(1)) };
                         }
+                    }
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                        if ui.overlay.is_none() && tabs::hit(ui.strip.area, m.column, m.row) =>
+                    {
+                        let up = matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft);
+                        ui.strip_scroll = if up { ui.strip_scroll.saturating_sub(3) } else { ui.strip_scroll.saturating_add(3).min(ui.strip.max_offset) };
+                        ui.hover = None;
+                        ui.marquee = 0;
                     }
                     MouseEventKind::ScrollUp => ui.scroll(-3),
                     MouseEventKind::ScrollDown => ui.scroll(3),

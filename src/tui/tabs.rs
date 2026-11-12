@@ -166,10 +166,42 @@ fn clip(s: &str, max: usize) -> String {
 /// Where the strip's controls landed on screen, for mouse clicks.
 #[derive(Default)]
 pub struct Strip {
+    pub area: Rect,
+    pub offset: u16,
+    pub max_offset: u16,
     /// Per tab: the whole tab (click switches) and its × (click closes).
     pub tabs: Vec<(Rect, Rect)>,
     /// The + button (click opens a new session).
     pub new: Rect,
+}
+
+/// Scroll the strip and clip hit targets while preserving their original tab indices.
+pub fn scroll_strip(area: Rect, lines: &mut Vec<Line<'static>>, strip: &mut Strip, requested: u16, vertical: bool) {
+    let extent = if vertical { lines.len() } else { lines.iter().map(Line::width).max().unwrap_or(0) };
+    let visible = if vertical { area.height } else { area.width };
+    strip.area = area;
+    strip.max_offset = extent.saturating_sub(visible as usize).min(u16::MAX as usize) as u16;
+    strip.offset = requested.min(strip.max_offset);
+    let translate = |r: Rect| {
+        let (dx, dy) = if vertical { (0, strip.offset as i32) } else { (strip.offset as i32, 0) };
+        let x = r.x as i32 - dx;
+        let y = r.y as i32 - dy;
+        let left = x.max(area.x as i32);
+        let top = y.max(area.y as i32);
+        let right = (x + r.width as i32).min(area.right() as i32);
+        let bottom = (y + r.height as i32).min(area.bottom() as i32);
+        if right <= left || bottom <= top { Rect::default() }
+        else { Rect::new(left as u16, top as u16, (right - left) as u16, (bottom - top) as u16) }
+    };
+    for (tab, close) in &mut strip.tabs {
+        *tab = translate(*tab);
+        *close = translate(*close);
+    }
+    strip.new = translate(strip.new);
+    if vertical {
+        lines.drain(..strip.offset as usize);
+        lines.truncate(area.height as usize);
+    }
 }
 
 pub fn hit(r: Rect, col: u16, row: u16) -> bool {
@@ -340,6 +372,32 @@ mod tests {
         assert_eq!(hits.new, Rect::default());
         let (_, clipped) = strip(Rect::new(0, 0, 6, 2), &infos, 0, true, true, None);
         assert_eq!(clipped.tabs.len(), 2);
+    }
+
+    #[test]
+    fn scrolling_clips_targets_and_keeps_original_indices() {
+        let infos: Vec<_> = (0..8).map(|i| TabInfo {
+            title: format!("session {i}"), status: TabStatus::Idle,
+            agent: String::new(), model: String::new(), detail: String::new(), active: i == 0,
+        }).collect();
+        for (vertical, compact) in [(true, false), (true, true), (false, false)] {
+            let area = Rect::new(2, 3, 24, 5);
+            let render_area = if compact { Rect { height: 8, ..area } } else { area };
+            let (mut lines, mut hits) = strip(render_area, &infos, 0, vertical, compact, None);
+            scroll_strip(area, &mut lines, &mut hits, u16::MAX, vertical);
+            assert!(hits.max_offset > 0);
+            assert_eq!(hits.offset, hits.max_offset);
+            assert_eq!(hits.tabs[0].0, Rect::default());
+            assert_ne!(hits.tabs[7].0, Rect::default());
+            for (tab, close) in &hits.tabs {
+                for rect in [tab, close] {
+                    if rect.width > 0 && rect.height > 0 {
+                        assert_eq!(rect.intersection(area), *rect);
+                    }
+                }
+            }
+            if vertical { assert!(lines.len() <= area.height as usize); }
+        }
     }
 
     fn ev(e: Event) -> Push {
