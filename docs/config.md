@@ -11,7 +11,8 @@ Created on first run with defaults; the file is only written when missing.
 - `verbose`: `full | compact`. `full` shows tool calls and thinking.
 - `notify` (default true): bell and terminal notification (OSC 9) when a run that lasted 15 s or more ends or asks a question.
 - `[diff]`: `scope = session | turn | unpushed`, `view = popup | split` (defaults of `/diff`, also in `/settings`).
-- `tab_orientation`: `horizontal | vertical | hidden`. `tab_width`: 14-60, sidebar columns.
+- `tab_orientation`: `horizontal | vertical`. `tab_hidden`: hide the bar manually (`ctrl+x b`). `tab_width`: 14-60, sidebar columns.
+- `tab_auto_hide`: `off` (default), `hidden`, or `compact`; vertical bar only. Hover to restore the full sidebar and leave it to collapse. `hidden` frees the whole width (hover the left edge to reveal); `compact` keeps each tab's number and live status (spinner, completion, error). Available in `/settings`.
 - `agent`: default agent name, default `Build`.
 
 ### `[models]`: model per background task. `""` = main model.

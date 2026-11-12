@@ -16,6 +16,16 @@ use std::time::{Duration, Instant};
 /// Sidebar width bounds, in columns.
 pub const WIDTH_MIN: u16 = 14;
 pub const WIDTH_MAX: u16 = 60;
+
+/// Width of the vertical strip; a fully hidden strip reserves no chat space.
+pub fn sidebar_width(full: u16, mode: &str, expanded: bool, count: usize) -> u16 {
+    if expanded { return full; }
+    match mode {
+        "hidden" => 0,
+        "compact" => count.max(1).to_string().len() as u16 + 5,
+        _ => full,
+    }
+}
 /// Rows per tab card in the sidebar: title, agent · model, status, spacer.
 const CARD: usize = 4;
 
@@ -186,7 +196,7 @@ fn marquee(s: &str, max: usize, offset: usize) -> String {
 /// Render the tab strip into `area` and return its clickable parts.
 /// Horizontal: one row. Vertical: a card of `CARD` rows per tab, then a + row, then the divider.
 /// `hover` is the hovered tab and the marquee offset: its title scrolls when it does not fit.
-pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, hover: Option<(usize, usize)>) -> (Vec<Line<'static>>, Strip) {
+pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, compact: bool, hover: Option<(usize, usize)>) -> (Vec<Line<'static>>, Strip) {
     let mut out = Strip::default();
     // A tab at work shows in the color of its own agent.
     let glyph = |status: TabStatus, agent: &str| match status {
@@ -201,6 +211,26 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, hover: O
         Some((h, off)) if h == i && t.chars().count() > max => marquee(t, max, off),
         _ => clip(t, max),
     };
+
+    if vertical && compact {
+        let mut lines = Vec::new();
+        let digits = tabs.len().max(1).to_string().len();
+        for (i, t) in tabs.iter().take(area.height as usize).enumerate() {
+            let st = style(t.active);
+            let (g, c) = glyph(t.status, &t.agent);
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:>digits$} ", i + 1), st),
+                Span::styled(g, st.patch(c)),
+                Span::styled(" ", st),
+                Span::styled("│", theme::dim()),
+            ]));
+            out.tabs.push((Rect { y: area.y + i as u16, height: 1, ..area }, Rect::default()));
+        }
+        while lines.len() < area.height as usize {
+            lines.push(Line::from(vec![Span::raw(" ".repeat(area.width.saturating_sub(1) as usize)), Span::styled("│", theme::dim())]));
+        }
+        return (lines, out);
+    }
 
     if vertical {
         // One blank column on each side of the cards, then the divider on the last column.
@@ -284,6 +314,39 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, hover: O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_hide_restores_saved_width_and_compact_fits_tab_numbers() {
+        assert_eq!(sidebar_width(24, "off", false, 12), 24);
+        assert_eq!(sidebar_width(24, "hidden", false, 12), 0);
+        assert_eq!(sidebar_width(24, "compact", false, 9), 6);
+        assert_eq!(sidebar_width(24, "compact", false, 12), 7);
+        for mode in ["hidden", "compact"] {
+            assert_eq!(sidebar_width(38, mode, true, 12), 38);
+        }
+    }
+
+    #[test]
+    fn compact_strip_keeps_numbers_status_and_visible_click_targets() {
+        let infos: Vec<_> = [TabStatus::Working, TabStatus::Done, TabStatus::Error, TabStatus::Idle]
+            .into_iter().enumerate().map(|(i, status)| TabInfo {
+                title: "should be hidden".into(), status, agent: "Build".into(), model: String::new(),
+                detail: String::new(), active: i == 0,
+            }).collect();
+        let area = Rect::new(0, 0, 6, 6);
+        let (lines, hits) = strip(area, &infos, 0, true, true, None);
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert_eq!(text[0], format!(" 1 {} │", SPIN[0]));
+        assert_eq!(text[1], " 2 ● │");
+        assert_eq!(text[2], " 3 ! │");
+        assert_eq!(text[3], " 4 · │");
+        assert_eq!(hits.tabs.len(), 4);
+        assert!(hit(hits.tabs[2].0, 2, 2));
+        assert!(hits.tabs.iter().all(|(_, close)| *close == Rect::default()));
+        assert_eq!(hits.new, Rect::default());
+        let (_, clipped) = strip(Rect::new(0, 0, 6, 2), &infos, 0, true, true, None);
+        assert_eq!(clipped.tabs.len(), 2);
+    }
 
     fn ev(e: Event) -> Push {
         Push::Event(e)

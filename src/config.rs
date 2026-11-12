@@ -73,6 +73,8 @@ pub struct Settings {
     pub tab_hidden: bool,
     /// Sidebar width in columns (vertical tab bar only)
     pub tab_width: u16,
+    /// Vertical tab bar auto-hide: off | hidden | compact (number and status).
+    pub tab_auto_hide: String,
     /// Default agent name
     pub agent: String,
     pub models: TaskModels,
@@ -104,6 +106,7 @@ impl Default for Settings {
             notify: true,
             tab_hidden: false,
             tab_width: 24,
+            tab_auto_hide: "off".into(),
             agent: "Build".into(),
             models: TaskModels::default(),
             agents: BTreeMap::new(),
@@ -509,6 +512,7 @@ theme = "theta"                 # color theme: one of /theme's ids
 tab_orientation = "horizontal"   # session tab bar: horizontal | vertical
 tab_hidden = false               # ctrl+x b toggles; orientation is kept
 tab_width = 24                   # sidebar width in columns (14-60)
+tab_auto_hide = "off"            # vertical only: off | hidden | compact (number + status); hover to expand
 agent = "Build"
 
 # Model per background task ("" = main model)

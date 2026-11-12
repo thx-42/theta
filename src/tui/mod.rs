@@ -735,6 +735,8 @@ struct Ui {
     input_hit: (Rect, usize, usize),
     /// Sidebar rect as drawn last frame (vertical only; empty otherwise).
     sidebar: Rect,
+    /// Auto-hidden sidebar is expanded while the pointer is inside it.
+    sidebar_expanded: bool,
     /// Live sidebar width while dragging its divider; saved on release.
     drag: Option<u16>,
     /// Mouse text selection: anchor and cursor as screen (col, row).
@@ -2603,6 +2605,7 @@ impl Ui {
                 ("Diff view".into(), s.diff.view.clone()),
                 ("Theme".into(), s.theme.clone()),
                 ("Theme background".into(), if s.theme_bg { "on — theme paints the background".into() } else { "off — terminal background".into() }),
+                ("Tab bar auto-hide".into(), format!("{} (vertical only)", s.tab_auto_hide)),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
@@ -2689,6 +2692,7 @@ impl Ui {
             5 => {
                 let v = cycle(&["horizontal", "vertical"], &s.tab_orientation);
                 self.update_settings("tab_orientation", v.clone().into(), |s| s.tab_orientation = v);
+                self.sidebar_expanded = false;
             }
             6 => {
                 let w = if back {
@@ -2717,6 +2721,11 @@ impl Ui {
                 let v = !s.theme_bg;
                 theme::set_bg(v);
                 self.update_settings("theme_bg", v.into(), |s| s.theme_bg = v);
+            }
+            11 => {
+                let v = cycle(&["off", "hidden", "compact"], &s.tab_auto_hide);
+                self.update_settings("tab_auto_hide", v.clone().into(), |s| s.tab_auto_hide = v);
+                self.sidebar_expanded = false;
             }
             _ => {}
         }
@@ -2970,6 +2979,10 @@ impl Ui {
         let vertical = !hidden && orientation == "vertical";
         let infos = self.tab_infos();
         let width = self.drag.unwrap_or(self.app.rt.settings.tab_width.clamp(tabs::WIDTH_MIN, tabs::WIDTH_MAX));
+        let mode = self.app.rt.settings.tab_auto_hide.as_str();
+        let expanded = self.sidebar_expanded || self.drag.is_some();
+        let compact = vertical && mode == "compact" && !expanded;
+        let width = if vertical { tabs::sidebar_width(width, mode, expanded, infos.len()) } else { width };
         let (strip_area, area) = if hidden {
             (Rect::default(), f.area())
         } else if vertical {
@@ -2980,8 +2993,12 @@ impl Ui {
             (a, b)
         };
         self.sidebar = if vertical { strip_area } else { Rect::default() };
+        // A hidden strip still opens when the pointer reaches the left screen edge.
+        if vertical && width == 0 {
+            self.sidebar = Rect { width: 1, ..f.area() };
+        }
         let hover = self.hover.map(|i| (i, self.marquee));
-        let (lines, strip) = if hidden { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical, hover) };
+        let (lines, strip) = if hidden || (vertical && width == 0) { (Vec::new(), tabs::Strip::default()) } else { tabs::strip(strip_area, &infos, self.spin, vertical, compact, hover) };
         if !hidden {
             f.render_widget(Paragraph::new(lines), strip_area);
         }
@@ -4091,7 +4108,8 @@ impl Ui {
 
     /// The sidebar's right edge: grab it and drag to resize.
     fn on_divider(&self, col: u16, row: u16) -> bool {
-        self.sidebar.width > 0 && col == self.sidebar.right() - 1 && row >= self.sidebar.y && row < self.sidebar.bottom()
+        let auto = matches!(self.app.rt.settings.tab_auto_hide.as_str(), "hidden" | "compact");
+        (!auto || self.sidebar_expanded) && self.sidebar.width > 0 && col == self.sidebar.right() - 1 && row >= self.sidebar.y && row < self.sidebar.bottom()
     }
 
     /// Release after a drag: save the new width once.
@@ -4177,6 +4195,7 @@ impl Ui {
             self.overlay_mouse(col, row, false);
             return;
         }
+        self.sidebar_expanded = tabs::hit(self.sidebar, col, row);
         let hover = self.strip.tabs.iter().position(|(tab, _)| tabs::hit(*tab, col, row));
         if hover != self.hover {
             self.hover = hover;
@@ -4431,6 +4450,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         diff_pane: None,
         diff_rect: Rect::default(),
         sidebar: Rect::default(),
+        sidebar_expanded: false,
         drag: None,
         sel: None,
         frame: Buffer::default(),
