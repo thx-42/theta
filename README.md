@@ -71,7 +71,7 @@ theta -p "explique src/main.rs"    # mode print (non interactif)
 ```
 
 Options : `-c` reprend la dernière session du dossier, `-r <id>` une session précise, `-m provider/model`, `-a <agent>`.
-Sous-commandes : `login [provider]`, `logout <provider>`, `models [filtre]`, `agents`, `refresh` (catalogue models.dev), `update [--check] [--force]`.
+Sous-commandes : `login [provider] [--account nom]`, `accounts [provider] [compte]`, `logout <provider> [compte]`, `models [filtre]`, `agents`, `refresh` (catalogue models.dev), `update [--check] [--force]`.
 
 <details>
 <summary><b>Canaux, mises à jour, désinstallation</b></summary>
@@ -103,6 +103,28 @@ Suivi des mises à jour (depuis un clone, ou `curl … | bash -s -- <cmd>`) :
 | 🏠 **Local** | Ollama, LM Studio, ou tout endpoint OpenAI-compatible |
 
 Connexion : `/login` dans la TUI (ou `theta login`) → provider → méthode (abonnement ou clé API). OpenAI regroupe l'abonnement ChatGPT (Codex) et la clé API. Pour l'OAuth, le navigateur s'ouvre ; sinon colle le code dans la fenêtre (`ctrl+y` copie l'URL). Aussi : variables d'env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, …). Les identifiants sont stockés dans `~/.theta/auth.json` (mode 0600).
+Plusieurs comptes ou clés peuvent coexister pour chaque provider, sans nombre maximal fixé : par exemple cinq comptes Claude ou trois clés OpenCode Go. Chaque `/login` ajoute un profil et l'active ; une clé identique déjà enregistrée est réutilisée. Les anciens identifiants sont conservés sous le nom `default`.
+
+```sh
+# TUI : répéter la connexion pour chaque compte ou clé
+/login anthropic claude-1
+/login anthropic claude-2
+/login opencode-go go-1
+/login opencode-go go-2
+/accounts                          # sélecteur : entrée pour changer de compte
+/accounts anthropic claude-1       # basculement direct
+/logout anthropic claude-2         # retirer ce profil uniquement
+
+# CLI
+theta login anthropic --account claude-1
+theta login opencode-go --account go-1
+theta accounts                    # liste, profil actif et délais avant réutilisation
+theta accounts opencode-go go-1   # choisir le profil actif
+theta logout opencode-go go-2
+```
+
+Le nom est facultatif : sans nom, les nouveaux profils sont nommés `account-1`, `account-2`, etc. Réutiliser explicitement un nom remplace ce profil. Sur une réponse HTTP 429, Theta met le profil en attente (`Retry-After`, ou 60 secondes par défaut) et réessaie avec un autre profil disponible du même provider. Ces délais et le profil actif sont conservés sur disque. Si tous les profils sont limités, l'erreur est affichée ; les profils redeviennent disponibles après leur délai. Les changements s'appliquent aux prochaines requêtes et à toutes les sessions du daemon. Après un changement par CLI dans une TUI déjà ouverte, utiliser `/reload`. `/logout <provider>` sans nom retire tous les profils de ce provider. Les clés des variables d'environnement ou des settings restent le recours lorsqu'aucun profil n'est enregistré.
+
 Catalogue des modèles (contexte, prix) : [models.dev](https://models.dev), mis en cache 24 h.
 
 <details>
@@ -305,7 +327,7 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 ```
  terminal A ─┐
  terminal B ─┼──▶ daemon ──▶ sessions · runs agent · MCP
- theta -r id ┘     ~/.theta/theta.sock
+theta -r id ┘     ~/.theta/theta.sock
 ```
 
 `theta` est un client TUI. Au premier lancement il démarre un daemon en arrière-plan (`theta daemon`, socket `~/.theta/theta.sock`, log dans `~/.theta/cache/logs/daemon.log`). Le daemon possède les sessions, les runs de l'agent et les connexions MCP : fermer le TUI ne coupe rien.
@@ -336,7 +358,7 @@ Les noms de modèles sont formatés automatiquement : `anthropic/claude-sonnet-5
 
 Les indications de commande apparaissent au fil de la saisie : après `/session `, choisir une action avec ↑/↓ et Tab ; après `/session width `, l’aide indique la largeur attendue. Les suggestions suivent l’argument au niveau du curseur.
 
-Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
+Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /accounts /logout /copy /help /quit`.
 
 <details>
 <summary><b>Onglets</b></summary>

@@ -75,7 +75,7 @@ rs = "cargo clippy --quiet"
 
 - `SOUL.md` (global) and `<project>/.theta/SOUL.md`: rules for every agent.
 - `SOUL.Auto.md`: rules for the Auto agent only (global; project variant `SOUL.Auto.md` also works).
-- `auth.json`: API keys and OAuth, mode 0600. Managed with `/login` and `/logout`, not by hand.
+- `auth.json`: API keys and OAuth, mode 0600. Each provider stores multiple named API keys or OAuth accounts, an active profile, and rate-limit cooldowns. `/login <provider> [name]` adds and activates a profile; `/accounts` opens the account switcher; `/accounts <provider> <name>` switches directly. HTTP 429 rotates to another available profile, honoring `Retry-After` (60 seconds by default). `/logout <provider> <name>` removes one profile; omitting the name removes all profiles for that provider. Legacy credentials migrate as `default`. CLI equivalents: `theta login <provider> --account <name>`, `theta accounts [provider] [name]`, `theta logout <provider> [name]`.
 - `cache/models.json`: model catalog, cached 24h.
 
 ## Checks

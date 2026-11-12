@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::Mutex;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Cred {
     ApiKey { key: String },
@@ -33,15 +33,41 @@ pub enum Cred {
 #[derive(Clone, Debug, Default)]
 pub struct Resolved {
     pub token: String,
+    /// Local profile name, never a token or remote account identifier.
+    pub profile: Option<String>,
     pub oauth: bool,
     pub account_id: Option<String>,
     /// Overrides provider base URL (Copilot token proxy endpoint).
     pub base_url: Option<String>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Accounts {
+    active: String,
+    accounts: BTreeMap<String, Cred>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cooldowns: BTreeMap<String, u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Stored {
+    Legacy(Cred),
+    Accounts(Accounts),
+}
+
+#[derive(Clone)]
+pub struct Account {
+    pub provider: String,
+    pub name: String,
+    pub kind: &'static str,
+    pub active: bool,
+    pub cooldown: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct Auth {
-    store: Arc<Mutex<BTreeMap<String, Cred>>>,
+    store: Arc<Mutex<BTreeMap<String, Accounts>>>,
     /// Serializes token refreshes; the store lock is never held over the network.
     refreshing: Arc<Mutex<()>>,
 }
@@ -54,23 +80,38 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-fn save_store(store: &BTreeMap<String, Cred>) -> Result<()> {
+fn save_store(store: &BTreeMap<String, Accounts>) -> Result<()> {
+    use std::io::Write;
     std::fs::create_dir_all(config::home())?;
-    let p = path();
-    std::fs::write(&p, serde_json::to_string_pretty(store)?)?;
+    // Readers in the TUI and daemon must always see a complete credential store.
+    let temp = config::home().join(format!("auth-{:016x}.tmp", rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&temp)?;
+        file.write_all(serde_json::to_string_pretty(store)?.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path())?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result
 }
 
 impl Auth {
     pub fn load() -> Auth {
         let store = std::fs::read_to_string(path())
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<BTreeMap<String, Stored>>(&s).ok())
+            .map(|entries| entries.into_iter().map(|(id, entry)| {
+                let accounts = match entry {
+                    Stored::Legacy(cred) => Accounts { active: "default".into(), accounts: BTreeMap::from([("default".into(), cred)]), ..Default::default() },
+                    Stored::Accounts(accounts) => accounts,
+                };
+                (id, accounts)
+            }).collect())
             .unwrap_or_default();
         Auth { store: Arc::new(Mutex::new(store)), ..Default::default() }
     }
@@ -81,25 +122,82 @@ impl Auth {
         *self.store.lock().await = fresh;
     }
 
+    /// Add a credential without overwriting other accounts. Repeated credentials are deduplicated.
     pub async fn set(&self, provider: &str, cred: Cred) -> Result<()> {
-        let mut s = self.store.lock().await;
-        s.insert(provider.to_string(), cred);
-        save_store(&s)
+        self.set_named(provider, None, cred).await
+    }
+
+    pub async fn set_named(&self, provider: &str, name: Option<&str>, cred: Cred) -> Result<()> {
+        if let Some(name) = name { validate_name(name)?; }
+        let mut store = self.store.lock().await;
+        let pool = store.entry(provider.into()).or_default();
+        let existing = pool.accounts.iter().find(|(_, c)| same_account(c, &cred)).map(|(n, _)| n.clone());
+        let name = name.map(String::from).or(existing).unwrap_or_else(|| {
+            let mut n = 1;
+            while pool.accounts.contains_key(&format!("account-{n}")) { n += 1; }
+            format!("account-{n}")
+        });
+        pool.accounts.insert(name.clone(), cred);
+        pool.active = name.clone();
+        pool.cooldowns.remove(&name);
+        save_store(&store)?;
+        Ok(())
     }
 
     pub async fn remove(&self, provider: &str) -> Result<()> {
-        let mut s = self.store.lock().await;
-        s.remove(provider);
-        save_store(&s)
+        self.remove_account(provider, None).await
+    }
+
+    pub async fn remove_account(&self, provider: &str, name: Option<&str>) -> Result<()> {
+        let mut store = self.store.lock().await;
+        if let Some(name) = name {
+            let pool = store.get_mut(provider).context("no stored accounts for provider")?;
+            if pool.accounts.remove(name).is_none() { bail!("unknown account `{name}`"); }
+            pool.cooldowns.remove(name);
+            if pool.accounts.is_empty() { store.remove(provider); }
+            else if pool.active == name { pool.active = pool.accounts.keys().next().unwrap().clone(); }
+        } else { store.remove(provider); }
+        save_store(&store)
+    }
+
+    pub async fn accounts(&self, provider: Option<&str>) -> Vec<Account> {
+        let store = self.store.lock().await;
+        store.iter().filter(|(id, _)| provider.is_none_or(|p| p == id.as_str())).flat_map(|(id, pool)| {
+            pool.accounts.iter().map(|(name, cred)| Account {
+                provider: id.clone(), name: name.clone(), active: name == &pool.active,
+                kind: match cred { Cred::ApiKey { .. } => "key", Cred::Oauth { .. } => "oauth" },
+                cooldown: pool.cooldowns.get(name).copied().unwrap_or(0).saturating_sub(now_ms()).div_ceil(1000),
+            })
+        }).collect()
+    }
+
+    pub async fn select(&self, provider: &str, name: &str) -> Result<()> {
+        let mut store = self.store.lock().await;
+        let pool = store.get_mut(provider).context("no stored accounts for provider")?;
+        if !pool.accounts.contains_key(name) { bail!("unknown account `{name}`"); }
+        pool.active = name.into();
+        save_store(&store)
+    }
+
+    /// Quarantine the exact profile that received a 429 and select an available alternative.
+    pub async fn limited(&self, provider: &str, profile: Option<&str>, wait: u64) -> Result<Option<String>> {
+        let Some(profile) = profile else { return Ok(None) };
+        let mut store = self.store.lock().await;
+        let Some(pool) = store.get_mut(provider) else { return Ok(None) };
+        if pool.accounts.len() < 2 || !pool.accounts.contains_key(profile) { return Ok(None); }
+        pool.cooldowns.insert(profile.into(), now_ms().saturating_add(wait.max(1).saturating_mul(1000)));
+        let next = pool.accounts.keys().find(|name| name.as_str() != profile && pool.cooldowns.get(*name).copied().unwrap_or(0) <= now_ms()).cloned();
+        if let Some(name) = &next { pool.active = name.clone(); }
+        save_store(&store)?;
+        Ok(next)
     }
 
     /// Human-readable credential source, or None.
     pub async fn status(&self, p: &Provider) -> Option<String> {
-        if let Some(c) = self.store.lock().await.get(&p.id) {
-            return Some(match c {
-                Cred::ApiKey { .. } => "key".into(),
-                Cred::Oauth { .. } => "oauth".into(),
-            });
+        if let Some(pool) = self.store.lock().await.get(&p.id)
+            && let Some(c) = pool.accounts.get(&pool.active) {
+            let kind = match c { Cred::ApiKey { .. } => "key", Cred::Oauth { .. } => "oauth" };
+            return Some(format!("{kind} · {} ({})", pool.active, pool.accounts.len()));
         }
         if !p.api_key.is_empty() {
             return Some("settings".into());
@@ -108,15 +206,32 @@ impl Auth {
     }
 
     pub async fn resolve(&self, p: &Provider) -> Result<Resolved> {
-        let cred = self.store.lock().await.get(&p.id).cloned();
+        let (profile, cred) = {
+            let mut store = self.store.lock().await;
+            match store.get_mut(&p.id) {
+                Some(pool) if !pool.accounts.is_empty() => {
+                    let available = |name: &str| pool.cooldowns.get(name).copied().unwrap_or(0) <= now_ms();
+                    let name = if pool.accounts.contains_key(&pool.active) && available(&pool.active) { &pool.active }
+                        else { pool.accounts.keys().find(|n| available(n)).context("all accounts are rate limited; wait for reset or use /accounts")? };
+                    let name = name.clone();
+                    let cred = pool.accounts.get(&name).cloned();
+                    if pool.active != name {
+                        pool.active = name.clone();
+                        save_store(&store)?;
+                    }
+                    (Some(name), cred)
+                }
+                _ => (None, None),
+            }
+        };
         match cred {
-            Some(Cred::ApiKey { key }) => return Ok(Resolved { token: key, ..Default::default() }),
+            Some(Cred::ApiKey { key }) => return Ok(Resolved { token: key, profile, ..Default::default() }),
             Some(Cred::Oauth { access, refresh, expires, account_id }) => {
                 let kind = p.oauth.context("provider has no OAuth support")?;
                 let (access, account_id) = if now_ms() + 60_000 >= expires {
                     let _one = self.refreshing.lock().await;
                     // another task may have refreshed while this one waited
-                    let current = self.store.lock().await.get(&p.id).cloned();
+                    let current = self.store.lock().await.get(&p.id).and_then(|pool| pool.accounts.get(profile.as_ref().unwrap())).cloned();
                     match current {
                         Some(Cred::Oauth { access, account_id, expires, .. }) if now_ms() + 60_000 < expires => (access, account_id),
                         other => {
@@ -133,7 +248,12 @@ impl Auth {
                                 _ => unreachable!(),
                             };
                             let mut store = self.store.lock().await;
-                            store.insert(p.id.clone(), fresh);
+                            // Do not resurrect a profile removed or replaced during the network call.
+                            if let Some(pool) = store.get_mut(&p.id)
+                                && let Some(saved) = pool.accounts.get_mut(profile.as_ref().unwrap())
+                                && matches!(saved, Cred::Oauth { refresh: r, .. } if r == &refresh) {
+                                *saved = fresh;
+                            }
                             save_store(&store)?;
                             out
                         }
@@ -142,7 +262,7 @@ impl Auth {
                     (access, account_id)
                 };
                 let base_url = (kind == OAuthKind::Copilot).then(|| copilot_base_url(&access));
-                return Ok(Resolved { token: access, oauth: true, account_id, base_url });
+                return Ok(Resolved { token: access, profile, oauth: true, account_id, base_url });
             }
             None => {}
         }
@@ -159,6 +279,22 @@ impl Auth {
             return Ok(Resolved::default()); // local provider, no key
         }
         bail!("no credentials for {} — run `theta login {}` or set {}", p.name, p.id, p.env.join("/"))
+    }
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        bail!("account names must contain only letters, numbers, '.', '_' or '-'");
+    }
+    Ok(())
+}
+
+fn same_account(a: &Cred, b: &Cred) -> bool {
+    match (a, b) {
+        (Cred::ApiKey { key: a }, Cred::ApiKey { key: b }) => a == b,
+        (Cred::Oauth { access: a, refresh: ar, account_id: ai, .. }, Cred::Oauth { access: b, refresh: br, account_id: bi, .. }) =>
+            a == b || (!ar.is_empty() && ar == br) || (ai.is_some() && ai == bi),
+        _ => false,
     }
 }
 
@@ -410,7 +546,7 @@ pub async fn oauth(kind: OAuthKind, io: &mut Io) -> Result<Cred> {
 }
 
 /// `theta login` on a plain terminal.
-pub async fn login_cli(auth: &Auth, p: &Provider) -> Result<()> {
+pub async fn login_cli(auth: &Auth, p: &Provider, account: Option<&str>) -> Result<()> {
     let opts = login_options(p);
     let opt = match opts.len() {
         0 => bail!("{} needs no login", p.name),
@@ -450,7 +586,10 @@ pub async fn login_cli(auth: &Auth, p: &Provider) -> Result<()> {
             oauth(kind, &mut Io { say, paste }).await?
         }
     };
-    auth.set(&opt.provider, cred).await?;
+    match account {
+        Some(name) => auth.set_named(&opt.provider, Some(name), cred).await?,
+        None => auth.set(&opt.provider, cred).await?,
+    }
     println!("✓ logged in to {}", p.name);
     Ok(())
 }
@@ -655,6 +794,68 @@ mod tests {
         let resolved = auth.resolve(provider).await.unwrap();
         assert!(resolved.oauth);
         assert_eq!(resolved.token, "rotated-access");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("THETA_HOME", value),
+                None => std::env::remove_var("THETA_HOME"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pools_preserve_legacy_credentials_switch_and_remove_independently() {
+        let _guard = config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("theta-accounts-{}", rand::random::<u64>()));
+        let previous = std::env::var_os("THETA_HOME");
+        unsafe { std::env::set_var("THETA_HOME", &dir) };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(path(), r#"{"opencode-go":{"type":"api_key","key":"old-key"}}"#).unwrap();
+        let auth = Auth::load();
+        let providers = crate::catalog::providers(&Default::default());
+        let provider = providers.iter().find(|p| p.id == "opencode-go").unwrap();
+        assert_eq!(auth.resolve(provider).await.unwrap().token, "old-key");
+        for key in ["second-key", "third-key", "third-key"] {
+            auth.set(&provider.id, Cred::ApiKey { key: key.into() }).await.unwrap();
+        }
+        let accounts = auth.accounts(Some(&provider.id)).await;
+        assert_eq!(accounts.len(), 3, "a repeated key must not add another slot");
+        assert_eq!(auth.resolve(provider).await.unwrap().token, "third-key");
+        auth.select(&provider.id, "default").await.unwrap();
+        assert_eq!(Auth::load().resolve(provider).await.unwrap().token, "old-key");
+        assert!(auth.select(&provider.id, "missing").await.is_err());
+        auth.remove_account(&provider.id, Some("default")).await.unwrap();
+        assert_eq!(auth.accounts(Some(&provider.id)).await.len(), 2);
+        assert!(auth.resolve(provider).await.is_ok());
+        auth.set_named("anthropic", Some("claude-1"), Cred::Oauth {
+            access: "claude-access".into(), refresh: "claude-refresh".into(),
+            expires: now_ms() + 3_600_000, account_id: None,
+        }).await.unwrap();
+        auth.set_named("anthropic", Some("claude-2"), Cred::Oauth {
+            access: "other-access".into(), refresh: "other-refresh".into(),
+            expires: now_ms() + 3_600_000, account_id: None,
+        }).await.unwrap();
+        let claude = providers.iter().find(|p| p.id == "anthropic").unwrap();
+        auth.select("anthropic", "claude-1").await.unwrap();
+        assert_eq!(auth.resolve(claude).await.unwrap().token, "claude-access");
+        assert_eq!(Auth::load().accounts(Some("anthropic")).await.len(), 2);
+        // A long provider reset must rotate once and survive a reload.
+        let before = auth.resolve(provider).await.unwrap();
+        let next = auth.limited(&provider.id, before.profile.as_deref(), 3600).await.unwrap().unwrap();
+        assert_ne!(Some(next.as_str()), before.profile.as_deref());
+        assert_eq!(Auth::load().resolve(provider).await.unwrap().profile.as_deref(), Some(next.as_str()));
+        assert!(auth.limited(&provider.id, Some(&next), 3600).await.unwrap().is_none());
+        assert!(auth.resolve(provider).await.is_err());
+        assert!(Auth::load().resolve(provider).await.is_err());
+        auth.store.lock().await.get_mut(&provider.id).unwrap().cooldowns.insert(before.profile.unwrap(), now_ms() - 1);
+        assert_eq!(auth.resolve(provider).await.unwrap().token, before.token);
+        assert!(auth.accounts(Some(&provider.id)).await.iter().any(|a| a.cooldown > 3500));
+        auth.remove(&provider.id).await.unwrap();
+        assert_eq!(auth.accounts(None).await.len(), 2, "logout must preserve other providers");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path()).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("THETA_HOME", value),

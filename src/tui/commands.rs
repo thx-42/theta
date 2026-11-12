@@ -23,7 +23,8 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "compact context now"),
     ("/btw", "side question, not kept in context"),
     ("/title", "rename the session"),
-    ("/login", "log in to a provider"),
+    ("/login", "add a provider account or API key"),
+    ("/accounts", "switch provider accounts and API keys"),
     ("/logout", "remove provider credentials"),
     ("/usage", "subscription limits and resets (Claude, Codex)"),
     ("/stats", "token statistics across all sessions"),
@@ -102,9 +103,10 @@ pub(super) fn arguments(before: &str, tabs: usize, providers: &[(&str, &str)]) -
         ("/theme", []) => {
             for theme in super::theme::THEMES { choice(theme.id, "apply this color theme"); }
         }
-        ("/login" | "/logout", []) => {
+        ("/login" | "/logout" | "/accounts", []) => {
             for (id, name) in providers { choice(id, name); }
         }
+        ("/login" | "/logout" | "/accounts", [_]) => return guide("<account>", "profile name from /accounts"),
         ("/ssh", _) if previous.first() != Some(&"off") => {
             if previous.is_empty() { choice("off", "return to local tools"); }
             hints.extend(guide("<ssh arguments>", "SSH host, user and connection options"));

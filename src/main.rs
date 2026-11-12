@@ -66,9 +66,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Log in to a provider (OAuth subscription or API key).
-    Login { provider: Option<String> },
+    Login {
+        provider: Option<String>,
+        /// Name this account (reusing a name replaces that profile).
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Remove stored credentials.
-    Logout { provider: String },
+    Logout { provider: String, account: Option<String> },
+    /// List stored accounts, or switch the active account for a provider.
+    Accounts { provider: Option<String>, account: Option<String> },
     /// List models (optionally filtered).
     Models { filter: Option<String> },
     /// List agents (global and local).
@@ -255,7 +262,8 @@ async fn main() -> Result<()> {
     let cwd = config::logical_cwd()?;
     let rt = build_runtime(cwd.clone()).await?;
     match cli.cmd {
-        Some(Cmd::Login { provider }) => {
+        Some(Cmd::Login { provider, account }) => {
+            if let Some(name) = &account { auth::validate_name(name)?; }
             let id = match provider {
                 Some(p) => p,
                 None => {
@@ -272,9 +280,25 @@ async fn main() -> Result<()> {
                 }
             };
             let p = rt.catalog.provider(&id).with_context(|| format!("unknown provider `{id}`"))?;
-            return auth::login_cli(&rt.auth, p).await;
+            return auth::login_cli(&rt.auth, p, account.as_deref()).await;
         }
-        Some(Cmd::Logout { provider }) => return rt.auth.remove(&provider).await,
+        Some(Cmd::Logout { provider, account }) => return match account {
+            Some(name) => rt.auth.remove_account(&provider, Some(&name)).await,
+            None => rt.auth.remove(&provider).await,
+        },
+        Some(Cmd::Accounts { provider, account }) => {
+            if let Some(name) = account {
+                let provider = provider.context("usage: theta accounts <provider> <account>")?;
+                rt.auth.select(&provider, &name).await?;
+                println!("✓ {provider}: {name}");
+            } else {
+                for a in rt.auth.accounts(provider.as_deref()).await {
+                    let cooldown = if a.cooldown > 0 { format!(" · available in {}s", a.cooldown) } else { String::new() };
+                    println!("{} {} / {} · {}{}", if a.active { "●" } else { "○" }, a.provider, a.name, a.kind, cooldown);
+                }
+            }
+            return Ok(());
+        }
         Some(Cmd::Models { filter }) => {
             for p in &rt.catalog.providers {
                 let ok = rt.auth.status(p).await.is_some();

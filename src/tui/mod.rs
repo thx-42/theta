@@ -177,7 +177,7 @@ const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 
 
 /// Main actions behind ctrl+p, in menu order. Descriptions come from COMMANDS.
-const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/diff", "/compact", "/verbose", "/copy", "/usage", "/settings", "/login", "/help", "/quit"];
+const ACTIONS: &[&str] = &["/model", "/effort", "/agent", "/new", "/resume", "/tree", "/undo", "/diff", "/compact", "/verbose", "/copy", "/usage", "/settings", "/accounts", "/login", "/help", "/quit"];
 
 
 /// Short one-line summary of a tool call's arguments.
@@ -333,6 +333,7 @@ enum Purpose {
     Session,
     Login,
     LoginMethod,
+    Accounts,
     Logout,
     Effort,
     Theme,
@@ -399,6 +400,7 @@ struct LoginView {
     title: String,
     /// Provider id the credential is saved under.
     provider: String,
+    account: Option<String>,
     key: bool,
     lines: Vec<String>,
     input: Editor,
@@ -1485,6 +1487,7 @@ impl Ui {
                     self.open_login_methods(arg);
                 }
             }
+            "/accounts" => self.accounts_command(arg),
             "/logout" => {
                 if arg.is_empty() {
                     self.open_providers(Purpose::Logout);
@@ -1622,14 +1625,17 @@ impl Ui {
     }
 
     fn logout(&mut self, id: &str) {
-        let auth = self.app.rt.auth.clone();
-        let id = id.to_string();
-        let remote = self.remote.clone();
-        tokio::spawn(async move {
-            let _ = auth.remove(&id).await;
-            remote.send(Req::Reload);
-        });
-        self.notify("credentials removed");
+        futures::executor::block_on(self.app.rt.auth.reload());
+        let args: Vec<_> = id.split_whitespace().collect();
+        if args.is_empty() || args.len() > 2 { return self.notify("usage: /logout <provider> [account]"); }
+        match futures::executor::block_on(self.app.rt.auth.remove_account(args[0], args.get(1).copied())) {
+            Ok(()) => {
+                self.remote.send(Req::Reload);
+                self.notify("credentials removed");
+                self.invalidate_all();
+            }
+            Err(e) => self.notify(e.to_string()),
+        }
     }
 
     fn copy_last(&mut self) {
@@ -1848,24 +1854,57 @@ impl Ui {
         self.overlay = Some(Overlay::Pick(Picker { title: title.into(), items, filter: String::new(), sel: 0, purpose }));
     }
 
+    fn accounts_command(&mut self, arg: &str) {
+        futures::executor::block_on(self.app.rt.auth.reload());
+        let args: Vec<_> = arg.split_whitespace().collect();
+        if args.len() > 2 { return self.notify("usage: /accounts [provider] [account]"); }
+        if let [provider, name] = args.as_slice() {
+            match futures::executor::block_on(self.app.rt.auth.select(provider, name)) {
+                Ok(()) => {
+                    self.remote.send(Req::Reload);
+                    self.notify(format!("{provider}: {name}"));
+                    self.invalidate_all();
+                }
+                Err(e) => self.notify(e.to_string()),
+            }
+            return;
+        }
+        let accounts = futures::executor::block_on(self.app.rt.auth.accounts(args.first().copied()));
+        let items: Vec<_> = accounts.into_iter().map(|a| {
+            let cooldown = if a.cooldown > 0 { format!(" · available in {}s", a.cooldown) } else { String::new() };
+            item(format!("{} / {}", a.provider, a.name), format!("{}{}{}", if a.active { "● active · " } else { "" }, a.kind, cooldown), format!("{} {}", a.provider, a.name))
+        }).collect();
+        if items.is_empty() { return self.notify("no stored accounts — /login to add one"); }
+        self.overlay = Some(Overlay::Pick(Picker { title: "Accounts · enter to switch".into(), items, filter: String::new(), sel: 0, purpose: Purpose::Accounts }));
+    }
+
     /// Second step of /login: how to authenticate (subscription or API key). Skipped when there is one way.
     fn open_login_methods(&mut self, id: &str) {
-        let Some(p) = self.app.rt.catalog.provider(id).cloned() else { return self.notify(format!("unknown provider {id}")) };
+        let args: Vec<_> = id.split_whitespace().collect();
+        if args.is_empty() || args.len() > 2 { return self.notify("usage: /login <provider> [account]"); }
+        if let Some(name) = args.get(1) {
+            if let Err(e) = auth::validate_name(name) { return self.notify(e.to_string()); }
+        }
+        let provider = args[0];
+        let Some(p) = self.app.rt.catalog.provider(provider).cloned() else { return self.notify(format!("unknown provider {provider}")) };
         let opts = auth::login_options(&p);
         match opts.len() {
             0 => self.notify(format!("{} needs no login", p.name)),
-            1 => self.start_login(&p.id, 0),
+            1 => self.start_login(id, 0),
             _ => {
-                let items = opts.iter().enumerate().map(|(i, o)| item(o.label, "", format!("{}\t{i}", p.id))).collect();
+                let items = opts.iter().enumerate().map(|(i, o)| item(o.label, "", format!("{id}\t{i}"))).collect();
                 self.overlay = Some(Overlay::Pick(Picker { title: format!("Log in to {}", p.name), items, filter: String::new(), sel: 0, purpose: Purpose::LoginMethod }));
             }
         }
     }
 
     fn start_login(&mut self, id: &str, idx: usize) {
+        let mut args = id.split_whitespace();
+        let id = args.next().unwrap_or("");
+        let account = args.next().map(String::from);
         let Some(p) = self.app.rt.catalog.provider(id).cloned() else { return };
         let Some(o) = auth::login_options(&p).into_iter().nth(idx) else { return };
-        let mut v = LoginView { title: format!("{} · {}", p.name, o.label), provider: o.provider.clone(), key: o.method == Method::Key, lines: vec![], input: Editor::default(), paste: None, task: None };
+        let mut v = LoginView { title: format!("{} · {}", p.name, o.label), provider: o.provider.clone(), account: account.clone(), key: o.method == Method::Key, lines: vec![], input: Editor::default(), paste: None, task: None };
         if let Method::Oauth(kind) = o.method {
             let (say, mut said) = unbounded_channel();
             let (paste_tx, paste) = unbounded_channel();
@@ -1881,7 +1920,8 @@ impl Ui {
                 });
                 let r = async {
                     let cred = auth::oauth(kind, &mut auth::Io { say, paste }).await?;
-                    auth.set(&provider, cred).await
+                    auth.reload().await;
+                    auth.set_named(&provider, account.as_deref(), cred).await
                 }
                 .await;
                 let _ = fwd.await;
@@ -1903,7 +1943,7 @@ impl Ui {
         let (paste_tx, paste) = unbounded_channel();
         let tx = self.login_tx.clone();
         let remote = self.remote.clone();
-        let mut v = LoginView { title: format!("MCP · {n}"), provider: String::new(), key: false, lines: vec!["starting…".into()], input: Editor::default(), paste: Some(paste_tx), task: None };
+        let mut v = LoginView { title: format!("MCP · {n}"), provider: String::new(), account: None, key: false, lines: vec!["starting…".into()], input: Editor::default(), paste: Some(paste_tx), task: None };
         v.task = Some(tokio::spawn(async move {
             let fwd_tx = tx.clone();
             let fwd = tokio::spawn(async move {
@@ -2046,6 +2086,7 @@ impl Ui {
                     self.start_login(id, i.parse().unwrap_or(0));
                 }
             }
+            Purpose::Accounts => self.accounts_command(&value),
             Purpose::Logout => self.logout(&value),
             Purpose::Effort => self.set_effort(&value),
             Purpose::Theme => self.set_theme(&value),
@@ -2538,8 +2579,10 @@ impl Ui {
                         if t.is_empty() {
                         } else if v.key {
                             let (auth, id, tx) = (self.app.rt.auth.clone(), v.provider.clone(), self.login_tx.clone());
+                            let account = v.account.clone();
                             tokio::spawn(async move {
-                                let r = auth.set(&id, crate::auth::Cred::ApiKey { key: t }).await;
+                                auth.reload().await;
+                                let r = auth.set_named(&id, account.as_deref(), crate::auth::Cred::ApiKey { key: t }).await;
                                 let _ = tx.send(LoginMsg::Done(r.map_err(|e| format!("{e:#}"))));
                             });
                         } else if let Some(p) = &v.paste {
