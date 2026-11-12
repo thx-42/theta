@@ -329,6 +329,8 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 
 `/` affiche les commandes, `$` les skills et `@` les fichiers : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` ou `@fichier` incomplet, `enter` complète d'abord). `@src/` descend dans le dossier, `@mod` retrouve aussi `src/tui/mod.rs` plus profond ; `.gitignore` est respecté. La liste a la largeur de l'input. Rien n'a de couleur propre : l'interface (barre du bas, logo, listes, spinner, titres) prend la couleur de l'agent actif (le prompt utilisateur et son `›` restent blancs), et chaque message ou outil garde celle de l'agent qui l'a écrit. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
+Les noms de modèles sont formatés automatiquement : `anthropic/claude-sonnet-5-5` devient `Anthropic - Claude Sonnet 5.5`. Chaque mot commence par une majuscule, `/` devient ` - ` et les tirets deviennent des espaces, sauf entre deux chiffres où ils deviennent des points. Désactive « Pretty model names » dans `/settings` → General, ou définis `pretty_model_names = false` dans `settings.toml`, pour afficher les identifiants bruts. Les identifiants utilisés pour les appels API restent inchangés.
+
 Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
 
 <details>

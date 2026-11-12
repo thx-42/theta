@@ -57,6 +57,8 @@ pub fn project_root(cwd: &Path) -> PathBuf {
 pub struct Settings {
     /// `provider/model`
     pub model: String,
+    /// Format model names for display without changing provider identifiers.
+    pub pretty_model_names: bool,
     /// Reasoning effort: low | medium | high | xhigh | max
     pub effort: String,
     /// full: show tool calls and thinking; compact: only final answer + one progress line
@@ -98,6 +100,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             model: "anthropic/claude-sonnet-5-5".into(),
+            pretty_model_names: true,
             effort: "medium".into(),
             verbose: "full".into(),
             tab_orientation: "horizontal".into(),
@@ -125,6 +128,30 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Display-only model label. Keep the original string for storage and API calls.
+    pub fn model_label(&self, model: &str) -> String {
+        if !self.pretty_model_names {
+            return model.to_string();
+        }
+        let mut label = String::with_capacity(model.len());
+        let mut chars = model.chars().peekable();
+        let mut previous = None;
+        let mut word_start = true;
+        while let Some(c) = chars.next() {
+            match c {
+                '/' => label.push_str(" - "),
+                '-' if previous.is_some_and(|p: char| p.is_ascii_digit())
+                    && chars.peek().is_some_and(|n| n.is_ascii_digit()) => label.push('.'),
+                '-' => label.push(' '),
+                c if c.is_alphabetic() && word_start => label.extend(c.to_uppercase()),
+                c => label.push(c),
+            }
+            word_start = !c.is_alphabetic();
+            previous = Some(c);
+        }
+        label
+    }
+
     /// `[agents.<name>]` entry, matched case-insensitively like agent names.
     pub fn agent(&self, name: &str) -> Option<&AgentSettings> {
         self.agents.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
@@ -504,6 +531,7 @@ pub fn sync_agents(dir: &Path, force: bool) {
 
 const DEFAULT_SETTINGS: &str = r#"# theta settings. Project overrides: <project>/.theta/settings.toml
 model = "anthropic/claude-sonnet-5-5"
+pretty_model_names = true        # readable model labels in the interface
 effort = "medium"        # low | medium | high | xhigh | max
 verbose = "full"         # full | compact
 theme_bg = false                # theme paints the background
@@ -630,6 +658,33 @@ mod sync_tests {
 #[cfg(test)]
 mod logical_tests {
     use super::*;
+
+    #[test]
+    fn model_labels_follow_generic_rules() {
+        let settings = Settings::default();
+        for (raw, expected) in [
+            ("anthropic/claude-sonnet-5-5", "Anthropic - Claude Sonnet 5.5"),
+            ("openai/gpt-4-1-mini", "Openai - Gpt 4.1 Mini"),
+            ("custom/model-12-34-56-7b", "Custom - Model 12.34.56.7B"),
+            ("équipe/élan-2-fast", "Équipe - Élan 2 Fast"),
+            ("vendor/GPT-4.1", "Vendor - GPT 4.1"),
+            ("/a//b-", " - A -  - B "),
+            ("", ""),
+        ] {
+            assert_eq!(settings.model_label(raw), expected);
+        }
+    }
+
+    #[test]
+    fn model_label_setting_defaults_and_can_be_disabled() {
+        let mut settings: Settings = toml::from_str("").unwrap();
+        assert!(settings.pretty_model_names);
+        settings = toml::from_str("pretty_model_names = false").unwrap();
+        let raw = "anthropic/claude-sonnet-5-5";
+        assert_eq!(settings.model_label(raw), raw);
+        let saved = toml::to_string(&settings).unwrap();
+        assert!(!toml::from_str::<Settings>(&saved).unwrap().pretty_model_names);
+    }
 
     #[test]
     fn tilde_abbreviates_home() {

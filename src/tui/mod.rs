@@ -372,7 +372,7 @@ impl Picker {
         self.items
             .iter()
             .enumerate()
-            .filter(|(_, it)| f.is_empty() || f.split_whitespace().all(|w| format!("{} {} {}", it.group, it.label, it.detail).to_lowercase().contains(w)))
+            .filter(|(_, it)| f.is_empty() || f.split_whitespace().all(|w| format!("{} {} {} {}", it.group, it.label, it.detail, it.value).to_lowercase().contains(w)))
             .map(|(i, _)| i)
             .collect()
     }
@@ -1705,7 +1705,7 @@ impl Ui {
                 let key = m.key();
                 let price = if m.cost_in > 0.0 { format!("  ${}/{}", m.cost_in, m.cost_out) } else { String::new() };
                 let detail = format!("{}k{price}{}", m.context / 1000, if key == current { "  ← current" } else { "" });
-                items.push(PickItem { label: m.id.clone(), detail, value: key, group: p.name.clone() });
+                items.push(PickItem { label: rt.settings.model_label(&m.id), detail, value: key, group: p.name.clone() });
             }
         }
         if items.iter().all(|i| i.value.is_empty()) {
@@ -1946,7 +1946,7 @@ impl Ui {
                     Target::Subagent => self.update_settings("models.subagent", value.clone().into(), |s| s.models.subagent = v),
                     Target::Agent(i) => self.set_agent_setting(i, "model", value.clone()),
                 }
-                self.notify(format!("model: {}", if value.is_empty() { "default" } else { &value }));
+                self.notify(format!("model: {}", if value.is_empty() { "default".into() } else { self.app.rt.settings.model_label(&value) }));
                 self.back_to_settings();
             }
             Purpose::Agent => {
@@ -2591,7 +2591,7 @@ impl Ui {
     fn settings_rows(&self, tab: SettingsTab) -> Vec<(String, String)> {
         let s = &self.app.rt.settings;
         let or_default = |m: &str| if m.is_empty() { "(default)".to_string() } else { m.to_string() };
-        let or_main = |m: &str| if m.is_empty() { "(main model)".to_string() } else { m.to_string() };
+        let or_main = |m: &str| if m.is_empty() { "(main model)".to_string() } else { s.model_label(m) };
         match tab {
             SettingsTab::General => vec![
                 ("Output".into(), if s.verbose == "compact" { "compact — final answer + progress line".into() } else { "full — show tools and thinking".into() }),
@@ -2606,10 +2606,11 @@ impl Ui {
                 ("Theme".into(), s.theme.clone()),
                 ("Theme background".into(), if s.theme_bg { "on — theme paints the background".into() } else { "off — terminal background".into() }),
                 ("Tab bar auto-hide".into(), format!("{} (vertical only)", s.tab_auto_hide)),
+                ("Pretty model names".into(), if s.pretty_model_names { "on".into() } else { "off".into() }),
             ],
             SettingsTab::Models => {
                 let mut rows = vec![
-                    ("Main model".into(), self.app.turn.model.clone()),
+                    ("Main model".into(), s.model_label(&self.app.turn.model)),
                     ("Reasoning effort".into(), self.app.turn.effort.clone()),
                     ("Compaction model".into(), or_main(&s.models.compaction)),
                     ("Session-title model".into(), or_main(&s.models.title)),
@@ -2618,7 +2619,7 @@ impl Ui {
                 ];
                 for a in self.app.rt.agents.iter() {
                     let cfg = s.agent(&a.name).cloned().unwrap_or_default();
-                    rows.push((format!("{} model", a.name), or_default(&cfg.model)));
+                    rows.push((format!("{} model", a.name), if cfg.model.is_empty() { "(default)".into() } else { s.model_label(&cfg.model) }));
                     rows.push((format!("{} effort", a.name), or_default(&cfg.effort)));
                 }
                 rows
@@ -2726,6 +2727,10 @@ impl Ui {
                 let v = cycle(&["off", "hidden", "compact"], &s.tab_auto_hide);
                 self.update_settings("tab_auto_hide", v.clone().into(), |s| s.tab_auto_hide = v);
                 self.sidebar_expanded = false;
+            }
+            12 => {
+                let v = !s.pretty_model_names;
+                self.update_settings("pretty_model_names", v.into(), |s| s.pretty_model_names = v);
             }
             _ => {}
         }
@@ -3324,7 +3329,7 @@ impl Ui {
         let ag = theme::agent(&a.name);
         let mut left = vec![
             Span::styled(format!(" {}", a.name), ag.add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" · {} · {}", self.app.turn.model, self.app.turn.effort), theme::dim()),
+            Span::styled(format!(" · {} · {}", self.app.rt.settings.model_label(&self.app.turn.model), self.app.turn.effort), theme::dim()),
         ];
         if let Some(s) = &self.ssh {
             left.push(Span::styled(format!(" · {}:{}", s.host, s.cwd), theme::dim()));
@@ -3373,7 +3378,7 @@ impl Ui {
         let a = &self.app.turn.agent;
         let mut out: Vec<Line<'static>> = LOGO.iter().map(|l| Line::from(Span::styled(l.to_string(), theme::agent(&a.name).add_modifier(Modifier::BOLD)))).collect();
         out.push(Line::from(Span::styled(format!("v{}{}", env!("CARGO_PKG_VERSION"), if crate::update::is_dev() { " dev" } else { "" }), theme::dim())));
-        out.push(Line::from(Span::styled(format!("  {}  ·  {}", self.app.turn.model, crate::config::tilde(&self.app.rt.cwd)), theme::dim())));
+        out.push(Line::from(Span::styled(format!("  {}  ·  {}", self.app.rt.settings.model_label(&self.app.turn.model), crate::config::tilde(&self.app.rt.cwd)), theme::dim())));
         if let Some(s) = &self.ssh {
             out.push(Line::from(Span::styled(format!("  ssh {}:{}", s.host, s.cwd), theme::dim())));
         }
@@ -4073,7 +4078,7 @@ impl Ui {
                         title: self.title_now(),
                         status: if working { TabStatus::Working } else { TabStatus::Idle },
                         agent: self.app.turn.agent.name.clone(),
-                        model: self.app.turn.model.clone(),
+                        model: self.app.rt.settings.model_label(&self.app.turn.model),
                         detail,
                         active: true,
                     }
@@ -4085,7 +4090,7 @@ impl Ui {
                         TabStatus::Error => "error",
                         TabStatus::Idle => "idle",
                     };
-                    tabs::TabInfo { title: t.title.clone(), status: t.status, agent: t.agent.clone(), model: t.model.clone(), detail: detail.into(), active: false }
+                    tabs::TabInfo { title: t.title.clone(), status: t.status, agent: t.agent.clone(), model: self.app.rt.settings.model_label(&t.model), detail: detail.into(), active: false }
                 }
             })
             .collect()

@@ -183,10 +183,6 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(n)))
 }
 
-fn short_model(m: &str) -> &str {
-    m.rsplit('/').next().unwrap_or(m)
-}
-
 /// `max` columns of `s` looping like an LED sign, shifted by `offset` characters.
 fn marquee(s: &str, max: usize, offset: usize) -> String {
     let chars: Vec<char> = format!("{s}   ").chars().collect();
@@ -260,7 +256,7 @@ pub fn strip(area: Rect, tabs: &[TabInfo], spin: usize, vertical: bool, compact:
                 Span::styled("×", st.patch(theme::dim())),
             ]));
             // Row 2: agent · model. Row 3: what it is doing. Row 4: spacer.
-            let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, short_model(&t.model)) };
+            let who = if t.agent.is_empty() { String::new() } else { format!("   {} · {}", t.agent, t.model) };
             lines.push(row(vec![Span::styled(pad(&clip(&who, w), w), theme::agent(&t.agent))]));
             let detail_style = match t.status {
                 TabStatus::Working => theme::agent(&t.agent),
