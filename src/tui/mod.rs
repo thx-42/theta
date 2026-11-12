@@ -237,8 +237,18 @@ impl Counts {
 
     /// Estimate the streaming output until the provider sends exact usage for the step.
     fn tokens(&self) -> Span<'static> {
-        let output = self.output + (self.stream_chars / 4) as u64;
-        Span::styled(format!("({} ↓ tokens · {output} ↑ tokens)", self.input), theme::dim())
+        let compact = |n: u64| {
+            for (scale, unit) in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")] {
+                if n >= scale {
+                    let decimals = n % scale / (scale / 100);
+                    return format!("{}.{decimals:02}{unit}", n / scale);
+                }
+            }
+            n.to_string()
+        };
+        let input = compact(self.input);
+        let output = compact(self.output + (self.stream_chars / 4) as u64);
+        Span::styled(format!("({input} ↓ tokens · {output} ↑ tokens)"), theme::dim())
     }
 
     fn add(&mut self, name: &str) {
