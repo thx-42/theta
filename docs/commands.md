@@ -10,6 +10,7 @@
 - `/theme [name]`: color theme (theta, light, opencode, tokyonight, catppuccin, gruvbox, nord, dracula, ... run `/theme` for the full list), saved as `theme` in settings. Each theme reshuffles agent colors.
 - `/agent`: pick agent. See `agents.md`.
 - `/skills`: list skills. See `skills.md`.
+- `/memories`: list persistent project notes and show whether memory is enabled. `list <page>` shows ten notes, `search <words>` searches descriptions/files/symbols, `show <id>` reads a note, `add <text>` saves one, `edit <id> <new content>` changes its content, and `delete <id>` removes it. `off` disables agent reads and writes while preserving notes; `on` enables them again. Management remains available while disabled. On SSH, manages the remote project memory.
 - `/mcp`: pop-up of MCP servers (reconnect, login, logout, diagnose). See `mcp.md`.
 - `/settings`: verbosity, task models, compaction, web.
 - `/verbose`: toggle full and compact output.

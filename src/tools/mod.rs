@@ -3,6 +3,7 @@
 pub mod fs;
 pub mod shell;
 mod web;
+pub mod memory;
 
 use crate::config::Settings;
 use crate::types::ToolDef;
@@ -64,7 +65,7 @@ pub enum Kind {
 
 pub fn kind(name: &str) -> Kind {
     match name {
-        "read" | "ls" | "find" | "grep" | "diff" => Kind::Read,
+        "read" | "ls" | "find" | "grep" | "diff" | "memory_search" => Kind::Read,
         "write" | "edit" | "write_plan" => Kind::Write,
         "bash" => Kind::Command,
         _ => Kind::Other,
@@ -78,6 +79,12 @@ fn def(name: &str, description: &str, schema: Value) -> ToolDef {
 /// All built-in tool definitions. `task` is added by the agent when subagents are allowed.
 pub fn all_defs() -> Vec<ToolDef> {
     vec![
+        def("memory_search", "Search persistent project notes by keywords, descriptions, file names or symbols (case-insensitive, ranked by matched terms). Returns at most 5 notes by default. Search before scanning unfamiliar code; verify referenced code before using it.",
+            json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}},"required":["query"]})),
+        def("memory_write", "Remember a short, verified finding for future sessions. Include a useful description and optional project-relative file and symbol. Supply id to update an existing note (only supplied fields change); otherwise title and content are required. Never store secrets or temporary task progress.",
+            json!({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string","maxLength":160},"content":{"type":"string","maxLength":2000},"file":{"type":"string","maxLength":500},"symbol":{"type":"string","maxLength":200}}})),
+        def("memory_delete", "Delete an obsolete or incorrect project memory by id.",
+            json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
         def("read", "Read a text file. Output is capped: use offset/limit (1-indexed lines) for large files.",
             json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]})),
         def("write", "Create or overwrite a file. Creates parent directories.",
@@ -189,7 +196,7 @@ pub fn save_log(raw: &[u8]) -> Option<PathBuf> {
 /// Tools that only read: several in one reply run at the same time. Everything else (shell, edits, MCP, questions)
 /// runs alone, in the order the model wrote it. `task` stays parallel: that is how subagents fan out.
 pub fn concurrent_safe(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "find" | "ls" | "diff" | "web_search" | "web_fetch" | "task" | "job" | "list_agents")
+    matches!(name, "memory_search" | "read" | "grep" | "find" | "ls" | "diff" | "web_search" | "web_fetch" | "task" | "job" | "list_agents")
 }
 
 /// Subagent transcripts live on this machine: reading them must not go to the ssh host.
@@ -214,6 +221,7 @@ pub async fn run_live(name: &str, args: &Value, ctx: &ToolCtx, live: &mut (dyn F
         return host.call(name, args).await;
     }
     let res = match name {
+        "memory_search" | "memory_write" | "memory_delete" | "memory_manage" => memory::run(name, args, &ctx.cwd),
         "read" => fs::read(args, ctx),
         "write" => fs::write(args, ctx),
         "write_plan" => fs::write_plan(args, &ctx.session_id),

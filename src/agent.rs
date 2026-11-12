@@ -1008,6 +1008,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_tools_are_available_and_respect_disabled_tools() {
+        let mut rt = test_rt().await;
+        rt.agents = Arc::new(vec![
+            agents::parse_builtin(agents::DEFAULT_BUILD, "Build"),
+            agents::parse_builtin(agents::DEFAULT_AUTO, "Auto"),
+            agents::parse_builtin(agents::DEFAULT_PLAN, "Plan"),
+            agents::parse_builtin(agents::DEFAULT_EXPLORE, "Explore"),
+            agents::parse_builtin(agents::DEFAULT_REVIEW, "Review"),
+        ]);
+        for agent in rt.agents.iter() {
+            let names: Vec<_> = rt.tools_for(agent, 0).into_iter().map(|d| d.name).collect();
+            for name in ["memory_search", "memory_write", "memory_delete"] {
+                assert!(names.iter().any(|n| n == name), "{} lacks {name}", agent.name);
+            }
+        }
+        let mut settings = (*rt.settings).clone();
+        settings.tools.disabled.push("memory_write".into());
+        rt.settings = Arc::new(settings);
+        let build = agents::find(&rt.agents, "Build").unwrap();
+        assert!(!rt.tools_for(build, 0).iter().any(|d| d.name == "memory_write"));
+    }
+
+    #[tokio::test]
     async fn verify_reports_ok_and_failure_tail() {
         let dir = std::env::temp_dir();
         assert_eq!(verify(&dir, "true", 10).await, "[verify `true`: ok]");

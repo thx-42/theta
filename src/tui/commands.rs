@@ -15,6 +15,7 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/model", "change model"),
     ("/agent", "change agent"),
     ("/skills", "list skills (use $name in a message)"),
+    ("/memories", "browse, edit and enable or disable project memory"),
     ("/mcp", "MCP servers: view, login, reconnect, diagnose"),
     ("/effort", "reasoning effort"),
     ("/settings", "settings (verbosity, task models, compaction, web)"),
@@ -62,6 +63,15 @@ pub(super) fn arguments(before: &str, tabs: usize, providers: &[(&str, &str)]) -
         }
     };
     match (command, previous.as_slice()) {
+        ("/memories", []) => {
+            for (value, description) in [("list", "list notes by page"), ("search", "search notes by keywords"), ("show", "read a note by id"), ("add", "save a short note"), ("edit", "replace a note's content"), ("delete", "delete a note by id"), ("on", "enable project memory"), ("off", "disable memory and keep notes")] {
+                choice(value, description);
+            }
+        }
+        ("/memories", ["edit"]) => return guide("<id> <new content>", "replace the content of a note"),
+        ("/memories", ["show" | "delete"]) => return guide("<id>", "note id from /memories"),
+        ("/memories", ["list"]) => return guide("<page>", "ten notes per page"),
+        ("/memories", ["search" | "add"]) => return guide("<text>", "keywords or note content"),
         ("/session", []) => {
             for (value, description) in [("new", "open a new tab"), ("close", "close the current tab"), ("hide", "hide the tab sidebar"), ("show", "show the tab sidebar"), ("width", "set the tab sidebar width")] {
                 choice(value, description);

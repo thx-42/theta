@@ -4,6 +4,9 @@ Tools are what the agent can call. Each agent sees a subset. Names below are the
 
 ## Built-in tools
 
+- `memory_search`: search persistent project notes by keywords, description, file or symbol; case-insensitive, ranked by matching terms. `query` is required; `limit` defaults to 5 (maximum 20). Only matching notes enter the conversation, never the system prompt. No embeddings or external service required; use related keywords when needed.
+- `memory_write`: save a concise finding (`title`, `content`, optional project-relative `file`, `symbol`); supply `id` to update only the provided fields. Notes survive sessions and are shared by agents in this project. Exact duplicates are ignored. Limits: title 160, content 2000, file 500, symbol 200 characters.
+- `memory_delete`: remove a stale note by `id`. Memory tools are included in shipped agents and the default set; custom explicit `tools:` lists must add them. Discovery notes are permitted for read-only agents because they do not modify source files.
 - `read`: read a file. Large files: use `offset` and `limit`. Results are cached per run.
 - `write`: create a file or replace it entirely. Use `edit` for changes to existing files.
 - `edit`: exact string replacement in a file. `all: true` on an edit replaces every occurrence. A miss says where the text departs from the file; a match that differs only by indentation is applied and re-indented.
@@ -42,3 +45,11 @@ An agent file without `tools:` gets every built-in tool except the opt-in ones, 
 - Everywhere: `[tools] disabled = ["bash"]` in `settings.toml`. Works for MCP names too.
 
 Warning: a `tools:` list that lacks `read` or `grep` leaves the agent unable to inspect code. Check after editing.
+
+## Project memory
+
+Notes and the enable/disable setting live in `<project>/.theta/memory/notes.json` (project root detected from `.theta` or `.git`), separate from system instructions and session transcripts. Ignore `.theta/memory/` in your project's `.gitignore` for private local notes. Writes are locked across processes and replace the store atomically. An invalid store produces an error instead of silently discarding notes. Over SSH the store lives in the remote project.
+
+Use `/memories` to browse and manage notes, including while memory is disabled. `off` blocks all agent memory tools immediately, including calls in an active turn; saved notes and existing conversation history remain. Memory is enabled by default. Only short usage instructions are in the system prompt: notes are retrieved on demand. Search results are hints to verify against current code, never instructions to execute. Store stable discoveries rather than credentials, secrets or temporary task progress.
+
+Example: `memory_write({"title":"Token validation", "content":"Reuse validate_token to verify bearer tokens before API requests; returns the authenticated user.", "file":"src/auth.rs", "symbol":"validate_token"})`, then `memory_search({"query":"bearer token validation"})` in a later session.

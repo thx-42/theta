@@ -451,6 +451,7 @@ enum Overlay {
     Diff(DiffView),
     Help,
     Report(String, Vec<String>),
+    Memories(Vec<String>, u16),
     Ask(AskView),
     Login(LoginView),
     Mcp(McpView),
@@ -1428,6 +1429,18 @@ impl Ui {
             "/diff" => self.open_diff(arg),
             "/model" => self.open_models(Target::Main),
             "/agent" => self.open_agents(),
+            "/memories" => {
+                let args = serde_json::json!({"command": arg});
+                self.report("θ memories", move |rt| Box::pin(async move {
+                    let out = if let Some(host) = rt.ssh.get() {
+                        host.call("memory_manage", &args).await
+                    } else {
+                        crate::tools::memory::run("memory_manage", &args, &rt.cwd)
+                            .unwrap_or_else(|e| crate::tools::ToolOut::err(format!("{e:#}")))
+                    };
+                    out.content.lines().map(String::from).collect()
+                }));
+            }
             "/mcp" => self.mcp_command(),
             "/skills" => {
                 let l: Vec<_> = self.app.rt.skills.iter().map(|s| format!("${}{} ({})", s.name, if s.auto { "*" } else { "" }, s.scope.label())).collect();
@@ -1589,7 +1602,9 @@ impl Ui {
 
     /// Open a text overlay and fill it when `job` finishes.
     fn report(&mut self, title: &str, job: impl FnOnce(crate::agent::Runtime) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>) {
-        self.overlay = Some(Overlay::Report(title.into(), vec!["loading…".into()]));
+        self.overlay = Some(if title == "θ memories" {
+            Overlay::Memories(vec!["loading…".into()], 0)
+        } else { Overlay::Report(title.into(), vec!["loading…".into()]) });
         let (tx, fut) = (self.login_tx.clone(), job(self.app.rt.clone()));
         tokio::spawn(async move {
             let _ = tx.send(LoginMsg::Report(fut.await));
@@ -1916,6 +1931,11 @@ impl Ui {
     fn on_login(&mut self, m: LoginMsg) {
         if let (LoginMsg::Report(lines), Some(Overlay::Report(_, l))) = (&m, &mut self.overlay) {
             *l = lines.clone();
+            return;
+        }
+        if let (LoginMsg::Report(lines), Some(Overlay::Memories(l, scroll))) = (&m, &mut self.overlay) {
+            *l = lines.clone();
+            *scroll = 0;
             return;
         }
         let Some(Overlay::Login(v)) = &mut self.overlay else { return };
@@ -2330,6 +2350,20 @@ impl Ui {
         let Some(ov) = self.overlay.take() else { return };
         match ov {
             Overlay::Help | Overlay::Leader => {}
+            Overlay::Memories(lines, mut scroll) => {
+                let width = crossterm::terminal::size().map(|(w, _)| w.saturating_sub(10).min(94) as usize).unwrap_or(80).max(1);
+                let max = lines.iter().map(|line| wrapped_rows(line, width)).sum::<usize>().saturating_sub(1).min(u16::MAX as usize) as u16;
+                match k.code {
+                    KeyCode::Down => scroll = scroll.saturating_add(1).min(max),
+                    KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10).min(max),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = max,
+                    _ => return,
+                }
+                self.overlay = Some(Overlay::Memories(lines, scroll));
+            }
             Overlay::Mcp(mut v) => {
                 let rows = &self.mcp_rows;
                 let name = rows.get(v.sel).map(|r| r.name.clone());
@@ -3460,6 +3494,7 @@ impl Ui {
             Overlay::Dir(v) => v.entries.len().min(18) + 3,
             Overlay::Jobs(v) => if v.view.is_some() { 24 } else { self.jobs.len().max(1) + 3 },
             Overlay::Report(_, l) => l.len() + 2,
+            Overlay::Memories(lines, _) => lines.iter().map(|line| wrapped_rows(line, iw.max(1))).sum::<usize>().min(60) + 2,
             Overlay::Diff(v) => v.lines.len().min(60) + 3,
             Overlay::Mcp(_) => self.mcp_rows.len().max(1) + 6,
             Overlay::Activity(_) => self.activity().len().max(1) + 3,
@@ -3598,6 +3633,11 @@ impl Ui {
                     }
                 }
                 f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).block(block("θ mcp").title_bottom(hint(" ↑↓ select · enter reconnect · l login · o logout · d diagnose · esc close "))), r);
+            }
+            Overlay::Memories(lines, scroll) => {
+                let l: Vec<_> = lines.iter().map(|line| Line::from(line.clone())).collect();
+                f.render_widget(Paragraph::new(l).wrap(Wrap { trim: false }).scroll((*scroll, 0))
+                    .block(block("θ memories").title_bottom(hint(" ↑↓ pgup pgdn scroll · esc close "))), r);
             }
             Overlay::Report(title, lines) => {
                 let mut l = lines.iter().map(|x| Line::from(Span::styled(x.clone(), if x.starts_with(' ') || x.starts_with("loading") { Style::default() } else { theme::accent().add_modifier(Modifier::BOLD) }))).collect::<Vec<_>>();
