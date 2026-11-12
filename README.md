@@ -282,7 +282,9 @@ Réponds court, sans formules de politesse.
 - `$nom` dans un message injecte le skill dans ce message (`/skills` liste les skills, `*` = auto).
 - Rendre un skill automatique sans toucher au fichier : `[skills] auto = ["caveman", "ponytail"]` dans `settings.toml` (global ou projet).
 
-Skills fournis dans `.theta/skills/` (actifs quand theta tourne dans ce repo) : `$caveman`, `$ponytail`, `$review`, `$debug`, `$commit`. Copie-les dans `~/.theta/skills/` pour les avoir partout.
+Skills fournis dans `.theta/skills/` (actifs quand theta tourne dans ce repo) : `$caveman`, `$ponytail`, `$design`, `$review`, `$debug`, `$commit`. `$caveman`, `$ponytail` et `$design` sont aussi installés dans `~/.theta/skills/` au démarrage, sans écraser les versions personnelles. Copie les autres dans ce dossier pour les avoir partout.
+
+`$design` aide à créer des interfaces soignées : direction visuelle, typographie, couleurs, responsive, accessibilité et vérification du rendu. Exemple : `$design crée une page de connexion pour cette application`. Après ajout dans une session déjà ouverte : `/reload`.
 
 ### Contexte
 
@@ -331,6 +333,8 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 `/` affiche les commandes, `$` les skills et `@` les fichiers : `↑↓` pour choisir, `tab` pour compléter, `enter` pour lancer (sur un `$skill` ou `@fichier` incomplet, `enter` complète d'abord). `@src/` descend dans le dossier, `@mod` retrouve aussi `src/tui/mod.rs` plus profond ; `.gitignore` est respecté. La liste a la largeur de l'input. Rien n'a de couleur propre : l'interface (barre du bas, logo, listes, spinner, titres) prend la couleur de l'agent actif (le prompt utilisateur et son `›` restent blancs), et chaque message ou outil garde celle de l'agent qui l'a écrit. Le sélecteur de modèles (`ctrl+p`) ne liste que les providers connectés, groupés par provider.
 
 Les noms de modèles sont formatés automatiquement : `anthropic/claude-sonnet-5-5` devient `Anthropic - Claude Sonnet 5.5`. Chaque mot commence par une majuscule, `/` devient ` - ` et les tirets deviennent des espaces, sauf entre deux chiffres où ils deviennent des points. Désactive « Pretty model names » dans `/settings` → General, ou définis `pretty_model_names = false` dans `settings.toml`, pour afficher les identifiants bruts. Les identifiants utilisés pour les appels API restent inchangés.
+
+Les indications de commande apparaissent au fil de la saisie : après `/session `, choisir une action avec ↑/↓ et Tab ; après `/session width `, l’aide indique la largeur attendue. Les suggestions suivent l’argument au niveau du curseur.
 
 Commandes : `/new /resume /session /tree /jobs /linters /model /agent /effort /settings /verbose /compact /btw /title /login /logout /copy /help /quit`.
 

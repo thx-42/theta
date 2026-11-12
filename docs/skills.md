@@ -21,6 +21,7 @@ Answer in short sentences. No filler.
 
 ## Use
 
+- Bundled skills `caveman`, `ponytail` and `design` are installed globally at startup when missing; existing files are preserved. `$design` guides interface design and implementation, including responsive layouts, accessibility and visual checks.
 - `$name` in a message injects that skill for this message only.
 - `[skills] auto = ["name"]` in settings also makes it auto.
 - `[skills] subagent = [...]`: injected into every subagent. Default `["caveman", "ponytail"]`; absent names are ignored.

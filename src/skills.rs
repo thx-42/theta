@@ -62,8 +62,8 @@ pub fn discover(project: &Path, auto: &[String]) -> Vec<Skill> {
     out
 }
 
-/// Skills every install gets: the defaults of `[skills] subagent` name them.
-const SHIPPED: &[(&str, &str)] = &[("caveman", include_str!("../.theta/skills/caveman.md")), ("ponytail", include_str!("../.theta/skills/ponytail.md"))];
+/// Skills every install gets, including the defaults of `[skills] subagent`.
+const SHIPPED: &[(&str, &str)] = &[("caveman", include_str!("../.theta/skills/caveman.md")), ("ponytail", include_str!("../.theta/skills/ponytail.md")), ("design", include_str!("../.theta/skills/design.md"))];
 
 /// Write the shipped skills that are missing from `dir` (an existing file is the user's and is left alone).
 pub fn install_shipped(dir: &Path) {
