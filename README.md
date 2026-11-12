@@ -317,6 +317,7 @@ Un modèle de tâche sans identifiants retombe sur le modèle principal.
 | Touche | Action |
 |---|---|
 | `enter` / `alt+enter`, `ctrl+j` | envoyer / nouvelle ligne |
+| `↑` / `↓` | historique des prompts ; `↓` après le plus récent restaure le brouillon et son curseur |
 | `esc` | interrompre l'agent |
 | `shift+tab` | agent suivant (`tab` complète `/` et `@`) |
 | `ctrl+p` `ctrl+t` `ctrl+r` | modèle · arbre de conversation · sessions |

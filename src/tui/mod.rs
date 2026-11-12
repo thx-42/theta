@@ -651,6 +651,49 @@ impl Editor {
     }
 }
 
+/// History position and unsent draft belong to the tab, even though history is shared.
+#[derive(Default)]
+struct HistoryNavigation {
+    index: Option<usize>,
+    draft: Option<Editor>,
+}
+
+impl HistoryNavigation {
+    fn previous(&mut self, input: &mut Editor, history: &[String], width: usize) {
+        if input.move_row(-1, width) || (self.index.is_none() && input.text.contains('\n')) {
+            return;
+        }
+        let Some(last) = history.len().checked_sub(1) else { return };
+        let i = match self.index {
+            Some(0) => return,
+            Some(i) => i - 1,
+            None => {
+                self.draft = Some(std::mem::take(input));
+                last
+            }
+        };
+        self.index = Some(i);
+        input.set(history[i].clone());
+    }
+
+    fn next(&mut self, input: &mut Editor, history: &[String], width: usize) {
+        if input.move_row(1, width) {
+            return;
+        }
+        match self.index {
+            Some(i) if i + 1 < history.len() => {
+                self.index = Some(i + 1);
+                input.set(history[i + 1].clone());
+            }
+            Some(_) => {
+                self.index = None;
+                *input = self.draft.take().unwrap_or_default();
+            }
+            None => {}
+        }
+    }
+}
+
 struct Ui {
     app: App,
     items: Vec<Item>,
@@ -662,7 +705,7 @@ struct Ui {
     transcripts: std::collections::HashMap<String, String>,
     input: Editor,
     history: Vec<String>,
-    hist: Option<usize>,
+    hist: HistoryNavigation,
     scroll_top: Option<usize>,
     last_total: usize,
     last_view: usize,
@@ -942,7 +985,6 @@ impl Ui {
         if !text.is_empty() {
             self.history.push(text.clone());
         }
-        self.hist = None;
         self.save_tabs();
         self.remote.send(Req::Send(text, images));
     }
@@ -993,9 +1035,8 @@ impl Ui {
         if !self.images.is_empty() {
             return self.notify("images can't be steered: press enter to queue them");
         }
-        self.input.take();
+        self.take_input();
         self.history.push(text.clone());
-        self.hist = None;
         self.push(Item::Steer { text: text.clone(), delivered: false });
         self.remote.send(Req::Steer(text));
     }
@@ -1987,6 +2028,11 @@ impl Ui {
 
     // ---------- keys ----------
 
+    fn take_input(&mut self) -> String {
+        self.hist = HistoryNavigation::default();
+        self.input.take()
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         if k.kind == KeyEventKind::Release {
             return;
@@ -2048,7 +2094,7 @@ impl Ui {
             }
             KeyCode::Char('c') if ctrl => {
                 if !self.input.text.is_empty() || !self.images.is_empty() {
-                    self.input.take();
+                    self.take_input();
                     self.images.clear();
                 } else if self.running {
                     self.interrupt();
@@ -2109,7 +2155,7 @@ impl Ui {
                     return;
                 }
                 if let Some(cmd) = text.strip_prefix('!') {
-                    self.input.take();
+                    self.take_input();
                     self.shell(cmd.trim().to_string());
                     return;
                 }
@@ -2118,7 +2164,7 @@ impl Ui {
                     let first = text.split(' ').next().unwrap_or("");
                     let cmd = cmds.get(self.cmd_sel).copied().or_else(|| COMMANDS.iter().find(|(c, _)| *c == first)).or_else(|| COMMANDS.iter().find(|(c, _)| c.starts_with(first)));
                     self.cmd_sel = 0;
-                    self.input.take();
+                    self.take_input();
                     match cmd {
                         Some((c, _)) => {
                             let rest = text[first.len()..].trim();
@@ -2128,7 +2174,7 @@ impl Ui {
                     }
                     return;
                 }
-                self.input.take();
+                self.take_input();
                 let images = std::mem::take(&mut self.images);
                 self.send(text, images);
             }
@@ -2152,36 +2198,8 @@ impl Ui {
             KeyCode::PageDown => self.scroll((self.last_view as i64 / 2).max(3)),
             KeyCode::Up if k.modifiers.contains(KeyModifiers::SHIFT) => self.scroll(-3),
             KeyCode::Down if k.modifiers.contains(KeyModifiers::SHIFT) => self.scroll(3),
-            KeyCode::Up => {
-                if self.input.move_row(-1, self.input_w) || self.input.text.contains('\n') {
-                    return;
-                }
-                if self.history.is_empty() {
-                    return;
-                }
-                let i = match self.hist {
-                    None => self.history.len() - 1,
-                    Some(i) => i.saturating_sub(1),
-                };
-                self.hist = Some(i);
-                self.input.set(self.history[i].clone());
-            }
-            KeyCode::Down => {
-                if self.input.move_row(1, self.input_w) || self.input.text.contains('\n') {
-                    return;
-                }
-                match self.hist {
-                    Some(i) if i + 1 < self.history.len() => {
-                        self.hist = Some(i + 1);
-                        self.input.set(self.history[i + 1].clone());
-                    }
-                    Some(_) => {
-                        self.hist = None;
-                        self.input.take();
-                    }
-                    None => {}
-                }
-            }
+            KeyCode::Up => self.hist.previous(&mut self.input, &self.history, self.input_w),
+            KeyCode::Down => self.hist.next(&mut self.input, &self.history, self.input_w),
             KeyCode::Char(c) => {
                 let mut b = [0u8; 4];
                 self.input.insert(c.encode_utf8(&mut b));
@@ -3577,6 +3595,7 @@ impl Ui {
                 let mut l = vec![Line::from(Span::styled("Keys", theme::accent().add_modifier(Modifier::BOLD)))];
                 for (k, d) in [
                     ("enter", "send · alt+enter / ctrl+j newline"),
+                    ("↑ / ↓", "prompt history · ↓ past newest restores draft"),
                     ("esc", "interrupt the agent"),
                     ("tab / shift+tab", "next agent / cycle effort"),
                     ("ctrl+p", "actions menu"),
@@ -3836,6 +3855,7 @@ impl Ui {
         swap(&mut self.cache, &mut v.cache);
         swap(&mut self.dirty, &mut v.dirty);
         swap(&mut self.input, &mut v.input);
+        swap(&mut self.hist, &mut v.hist);
         swap(&mut self.scroll_top, &mut v.scroll_top);
         swap(&mut self.last_total, &mut v.last_total);
         swap(&mut self.last_view, &mut v.last_view);
@@ -4400,7 +4420,7 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         transcripts: Default::default(),
         input: Editor::default(),
         history: vec![],
-        hist: None,
+        hist: HistoryNavigation::default(),
         scroll_top: None,
         last_total: 0,
         last_view: 0,
@@ -4608,6 +4628,82 @@ fn stall_log(what: &str, since: Instant) {
 
 #[cfg(test)]
 mod tests {
+    use super::{Editor, HistoryNavigation};
+
+    #[test]
+    fn history_restores_unsent_draft_and_cursor() {
+        let history = vec!["first prompt".into(), "latest prompt".into()];
+        let mut nav = HistoryNavigation::default();
+        let mut input = Editor { text: "mon brouillon ébauché".into(), cur: "mon brouillon é".len() };
+        let cursor = input.cur;
+        nav.previous(&mut input, &history, 80);
+        assert_eq!(input.text, "latest prompt");
+        nav.previous(&mut input, &history, 80);
+        assert_eq!(input.text, "first prompt");
+        // Repeated Up at the boundary must not overwrite the stash (or edits).
+        input.insert(" edited");
+        nav.previous(&mut input, &history, 80);
+        assert_eq!(input.text, "first prompt edited");
+        nav.next(&mut input, &history, 80);
+        nav.next(&mut input, &history, 80);
+        assert_eq!(input.text, "mon brouillon ébauché");
+        assert_eq!(input.cur, cursor);
+        assert!(nav.index.is_none() && nav.draft.is_none());
+        input.insert(" nouveau");
+        let revised = input.text.clone();
+        nav.previous(&mut input, &history, 80);
+        nav.next(&mut input, &history, 80);
+        assert_eq!(input.text, revised);
+    }
+
+    #[test]
+    fn history_can_restore_draft_after_multiline_prompt() {
+        let history = vec!["first\nsecond".into()];
+        let mut nav = HistoryNavigation::default();
+        let mut input = Editor { text: "draft".into(), cur: 2 };
+        nav.previous(&mut input, &history, 80);
+        // A recalled multiline prompt must allow Down back to the draft.
+        nav.previous(&mut input, &history, 80);
+        assert_eq!(input.cur, 5);
+        nav.next(&mut input, &history, 80);
+        assert_eq!(input.text, "first\nsecond");
+        nav.next(&mut input, &history, 80);
+        assert_eq!(input.text, "draft");
+        assert_eq!(input.cur, 2);
+    }
+
+    #[test]
+    fn history_keeps_empty_drafts_and_ignores_empty_history() {
+        let mut nav = HistoryNavigation::default();
+        let mut input = Editor { text: "draft".into(), cur: 3 };
+        nav.previous(&mut input, &[], 80);
+        nav.next(&mut input, &[], 80);
+        assert_eq!(input.text, "draft");
+        assert_eq!(input.cur, 3);
+        assert!(nav.index.is_none() && nav.draft.is_none());
+        input.take();
+        let history = vec!["old prompt".into()];
+        nav.previous(&mut input, &history, 80);
+        nav.next(&mut input, &history, 80);
+        assert!(input.text.is_empty());
+        assert_eq!(input.cur, 0);
+    }
+
+    #[test]
+    fn history_preserves_multiline_and_wrapped_cursor_navigation() {
+        let history = vec!["old prompt".into()];
+        let mut nav = HistoryNavigation::default();
+        let mut input = Editor { text: "first\nsecond".into(), cur: 12 };
+        nav.previous(&mut input, &history, 80);
+        nav.previous(&mut input, &history, 80);
+        assert_eq!(input.text, "first\nsecond");
+        assert!(nav.draft.is_none());
+        input.set("abcdefghij".into());
+        nav.previous(&mut input, &history, 4);
+        assert_eq!(input.text, "abcdefghij");
+        assert!(nav.draft.is_none());
+    }
+
     #[test]
     fn mentions_navigate_to_a_file() {
         let root = std::env::temp_dir().join(format!("theta-mention-{}", std::process::id()));
