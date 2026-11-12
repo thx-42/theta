@@ -1768,7 +1768,7 @@ impl Ui {
             for m in rt.catalog.models_of(p) {
                 let key = m.key();
                 let price = if m.cost_in > 0.0 { format!("  ${}/{}", m.cost_in, m.cost_out) } else { String::new() };
-                let detail = format!("{}k{price}{}", m.context / 1000, if key == current { "  ← current" } else { "" });
+                let detail = format!("{}{price}{}", crate::usage::context_window(m.context), if key == current { "  ← current" } else { "" });
                 items.push(PickItem { label: rt.settings.model_label(&m.id), detail, value: key, group: p.name.clone() });
             }
         }

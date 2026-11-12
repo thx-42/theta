@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
                     if filter.as_ref().is_some_and(|f| !key.contains(f.as_str())) {
                         continue;
                     }
-                    if writeln!(std::io::stdout(), "{} {key:<50} {:>6}k ctx  ${}/{}", if ok { "●" } else { "○" }, m.context / 1000, m.cost_in, m.cost_out).is_err() {
+                    if writeln!(std::io::stdout(), "{} {key:<50} {:>7} ctx  ${}/{}", if ok { "●" } else { "○" }, usage::context_window(m.context), m.cost_in, m.cost_out).is_err() {
                         return Ok(()); // stdout closed (e.g. piped to head)
                     }
                 }

@@ -18,7 +18,16 @@ fn human(n: u64) -> String {
     match n {
         0..=9_999 => n.to_string(),
         10_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
-        _ => format!("{:.2}M", n as f64 / 1e6),
+        1_000_000..=899_999_999 => format!("{:.2}M", n as f64 / 1e6),
+        _ => format!("{:.1}B", n as f64 / 1e9),
+    }
+}
+
+pub fn context_window(n: u64) -> String {
+    if n >= 500_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else {
+        format!("{}k", n / 1000)
     }
 }
 
@@ -81,11 +90,19 @@ async fn get(rt: &Runtime, url: &str, token: &str, headers: &[(&str, String)]) -
     res.json().await.map_err(|e| e.to_string())
 }
 
+fn subscription_credentials(result: anyhow::Result<crate::auth::Resolved>, login: &str) -> Result<crate::auth::Resolved, String> {
+    match result {
+        Ok(c) if c.oauth => Ok(c),
+        Ok(_) => Err(format!("  {login}")),
+        Err(e) => Err(format!("  ✗ authentication failed: {e:#}")),
+    }
+}
+
 async fn claude(rt: &Runtime) -> Vec<String> {
     let Some(p) = rt.catalog.provider("anthropic") else { return vec!["  unavailable".into()] };
-    let creds = match rt.auth.resolve(p).await {
-        Ok(c) if c.oauth => c,
-        Ok(_) | Err(_) => return vec!["  not logged in with a Claude subscription (/login)".into()],
+    let creds = match subscription_credentials(rt.auth.resolve(p).await, "not logged in with a Claude subscription (/login)") {
+        Ok(c) => c,
+        Err(e) => return vec![e],
     };
     let v = match get(rt, "https://api.anthropic.com/api/oauth/usage", &creds.token, &[("anthropic-beta", "oauth-2025-04-20".into())]).await {
         Ok(v) => v,
@@ -103,9 +120,9 @@ async fn claude(rt: &Runtime) -> Vec<String> {
 
 async fn codex(rt: &Runtime) -> Vec<String> {
     let Some(p) = rt.catalog.provider("openai-codex") else { return vec!["  unavailable".into()] };
-    let creds = match rt.auth.resolve(p).await {
-        Ok(c) if c.oauth => c,
-        Ok(_) | Err(_) => return vec!["  not logged in with ChatGPT (/login)".into()],
+    let creds = match subscription_credentials(rt.auth.resolve(p).await, "not logged in with ChatGPT (/login)") {
+        Ok(c) => c,
+        Err(e) => return vec![e],
     };
     let v = match get(rt, "https://chatgpt.com/backend-api/wham/usage", &creds.token, &[("chatgpt-account-id", creds.account_id.unwrap_or_default())]).await {
         Ok(v) => v,
@@ -126,6 +143,8 @@ async fn codex(rt: &Runtime) -> Vec<String> {
 }
 
 pub async fn usage(rt: &Runtime) -> Vec<String> {
+    // The daemon or another client may have logged in or rotated the OAuth tokens.
+    rt.auth.reload().await;
     let (c, x) = tokio::join!(claude(rt), codex(rt));
     let mut out = vec!["Claude (Pro/Max)".to_string()];
     out.extend(c);
@@ -218,6 +237,21 @@ pub fn stats(catalog: &Catalog) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_auth_preserves_refresh_errors() {
+        let err = anyhow::anyhow!("connection refused").context("OAuth refresh failed");
+        let message = subscription_credentials(Err(err), "not logged in").unwrap_err();
+        assert_eq!(message, "  ✗ authentication failed: OAuth refresh failed: connection refused");
+        assert!(!message.contains("not logged in"));
+    }
+
+    #[test]
+    fn subscription_auth_requires_oauth() {
+        let oauth = crate::auth::Resolved { token: "subscription-token".into(), oauth: true, ..Default::default() };
+        assert_eq!(subscription_credentials(Ok(oauth), "not logged in").unwrap().token, "subscription-token");
+        assert_eq!(subscription_credentials(Ok(crate::auth::Resolved::default()), "not logged in").unwrap_err(), "  not logged in");
+    }
 
     #[test]
     fn dates() {
