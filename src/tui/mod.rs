@@ -254,9 +254,24 @@ struct Counts {
     write: u32,
     cmd: u32,
     tools: u32,
+    input: u64,
+    output: u64,
+    stream_chars: usize,
 }
 
 impl Counts {
+    fn step(&mut self, usage: &crate::types::Usage) {
+        self.input += usage.input + usage.cache_read + usage.cache_write;
+        self.output += usage.output;
+        self.stream_chars = 0;
+    }
+
+    /// Estimate the streaming output until the provider sends exact usage for the step.
+    fn tokens(&self) -> Span<'static> {
+        let output = self.output + (self.stream_chars / 4) as u64;
+        Span::styled(format!("({} ↓ tokens · {output} ↑ tokens)", self.input), theme::dim())
+    }
+
     fn add(&mut self, name: &str) {
         match tools::kind(name) {
             ToolKind::Read => self.read += 1,
@@ -748,9 +763,6 @@ struct Ui {
     quit_armed: Option<Instant>,
     notice: Option<(String, Instant)>,
     spin: usize,
-    /// Output tokens of finished steps + streamed chars of the current one (for the live counter).
-    out_tokens: u64,
-    stream_chars: usize,
     asks: VecDeque<AskView>,
     login_tx: UnboundedSender<LoginMsg>,
     cmd_sel: usize,
@@ -1058,8 +1070,6 @@ impl Ui {
         self.handoff_pending = false;
         self.counts = Counts::default();
         self.status = "thinking".into();
-        self.out_tokens = 0;
-        self.stream_chars = 0;
         self.scroll_top = None;
         self.take_diff_base();
     }
@@ -1197,7 +1207,7 @@ impl Ui {
         match ev {
             Event::Text(t) => {
                 let i = self.last_assistant_streaming();
-                self.stream_chars += t.len();
+                self.counts.stream_chars += t.len();
                 if let Item::Assistant { text, .. } = &mut self.items[i] {
                     text.push_str(&t);
                 }
@@ -1206,7 +1216,7 @@ impl Ui {
             }
             Event::Thinking(t) => {
                 let i = self.last_assistant_streaming();
-                self.stream_chars += t.len();
+                self.counts.stream_chars += t.len();
                 if let Item::Assistant { thinking, .. } = &mut self.items[i] {
                     thinking.push_str(&t);
                 }
@@ -1250,8 +1260,7 @@ impl Ui {
                     self.cost += m.cost(&usage);
                 }
                 self.ctx_tokens = usage.context();
-                self.out_tokens += usage.output;
-                self.stream_chars = 0;
+                self.counts.step(&usage);
             }
             Event::Handoff { agent, .. } => {
                 self.handoff_pending = true;
@@ -1282,7 +1291,7 @@ impl Ui {
                     let i = self.items.len() - 1;
                     self.touch(i);
                 }
-                self.stream_chars = 0;
+                self.counts.stream_chars = 0;
                 self.status = format!("retry {attempt} in {wait}s");
                 self.notify(format!("provider error, retrying in {wait}s ({attempt}): {reason}"));
             }
@@ -1345,6 +1354,20 @@ impl Ui {
                     }
                     if name == "task" {
                         kids.push(Kid { id: cid, parent: id.to_string(), by, who, title: tool_summary("task", &args), done: None, sub: Counts::default() });
+                    }
+                }
+                self.touch(i);
+            }
+            Event::Text(_) | Event::Thinking(_) | Event::Step { .. } | Event::Retry { .. } => {
+                if let Item::Tool { sub, kids, .. } = &mut self.items[i] {
+                    let counts = if id == root { Some(sub) } else { kids.iter_mut().find(|k| k.id == id).map(|k| &mut k.sub) };
+                    if let Some(counts) = counts {
+                        match ev {
+                            Event::Text(t) | Event::Thinking(t) => counts.stream_chars += t.len(),
+                            Event::Step { usage, .. } => counts.step(&usage),
+                            Event::Retry { .. } => counts.stream_chars = 0,
+                            _ => {}
+                        }
                     }
                 }
                 self.touch(i);
@@ -2877,6 +2900,8 @@ impl Ui {
                         Span::styled(agent.clone(), theme::agent(agent).add_modifier(Modifier::BOLD)),
                         Span::styled(" ▸ ", theme::dim()),
                         Span::styled(who_s.clone(), theme::agent(who_s).add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        sub.tokens(),
                         Span::raw("  "),
                     ];
                     lines = markdown::wrap(vec![Span::styled(summary.clone(), theme::dim())], width, head, vec![Span::raw("      ")]);
@@ -2900,6 +2925,8 @@ impl Ui {
                             Span::styled(k.by.clone(), theme::agent(&k.by).add_modifier(Modifier::BOLD)),
                             Span::styled(" ▸ ", theme::dim()),
                             Span::styled(k.who.clone(), theme::agent(&k.who).add_modifier(Modifier::BOLD)),
+                            Span::raw(" "),
+                            k.sub.tokens(),
                             Span::raw("  "),
                         ];
                         let used: usize = head.iter().map(|s| s.content.width()).sum();
@@ -3118,7 +3145,7 @@ impl Ui {
         let todo_open: Vec<Todo> = self.todos.iter().filter(|t| t.status != "done").cloned().collect();
         let todo_rows = todo_open.len().min(8) + usize::from(todo_done > 0);
         let todo_h = if todo_open.is_empty() && !self.running { 0 } else { (todo_rows + 1) as u16 };
-        let show_progress = self.running || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
+        let show_progress = self.running || self.counts.input + self.counts.output > 0 || self.counts.read + self.counts.write + self.counts.cmd + self.counts.tools > 0;
         let [chat, todo_area, progress, _gap, input_area, _gap2, status] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(todo_h),
@@ -3204,7 +3231,9 @@ impl Ui {
                     spans.push(Span::styled(c.to_string(), st));
                 }
                 if !rest.is_empty() {
-                    let r: String = rest.chars().take(width.saturating_sub(n + 16)).collect();
+                    let counts_width: usize = self.counts.spans().iter().map(|s| s.width()).sum();
+                    let reserved = n + time.width() + counts_width + self.counts.tokens().width() + 8;
+                    let r: String = rest.chars().take(width.saturating_sub(reserved)).collect();
                     spans.push(Span::styled(format!(" {r}"), theme::dim()));
                 }
                 spans.push(Span::styled(format!("  {time}"), theme::dim()));
@@ -3224,6 +3253,8 @@ impl Ui {
                     spans.extend(c);
                 }
             }
+            spans.push(Span::raw("  "));
+            spans.push(self.counts.tokens());
             f.render_widget(Paragraph::new(Line::from(spans)), progress);
         }
 
@@ -3869,8 +3900,6 @@ impl Ui {
         swap(&mut self.jobs, &mut v.jobs);
         swap(&mut self.cost, &mut v.cost);
         swap(&mut self.ctx_tokens, &mut v.ctx_tokens);
-        swap(&mut self.out_tokens, &mut v.out_tokens);
-        swap(&mut self.stream_chars, &mut v.stream_chars);
         swap(&mut self.asks, &mut v.asks);
         swap(&mut self.app.session, &mut v.session);
         swap(&mut self.app.turn, &mut v.turn);
@@ -4451,8 +4480,6 @@ pub async fn run(rt: crate::agent::Runtime, remote: Remote, pushes: UnboundedRec
         quit_armed: None,
         notice: None,
         spin: 0,
-        out_tokens: 0,
-        stream_chars: 0,
         asks: VecDeque::new(),
         login_tx,
         cmd_sel: 0,
