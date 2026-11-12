@@ -634,6 +634,36 @@ async fn refresh_token(kind: OAuthKind, refresh: &str) -> Result<Cred> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn reload_picks_up_tokens_rotated_by_another_client() {
+        let _guard = config::TEST_HOME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("theta-auth-{}", rand::random::<u64>()));
+        let previous = std::env::var_os("THETA_HOME");
+        unsafe { std::env::set_var("THETA_HOME", &dir) };
+        let auth = Auth::load();
+        let other = Auth::load();
+        other.set("anthropic", Cred::Oauth {
+            access: "rotated-access".into(),
+            refresh: "rotated-refresh".into(),
+            expires: now_ms() + 3_600_000,
+            account_id: None,
+        }).await.unwrap();
+        let providers = crate::catalog::providers(&Default::default());
+        let provider = providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert!(auth.status(provider).await.is_none());
+        auth.reload().await;
+        let resolved = auth.resolve(provider).await.unwrap();
+        assert!(resolved.oauth);
+        assert_eq!(resolved.token, "rotated-access");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("THETA_HOME", value),
+                None => std::env::remove_var("THETA_HOME"),
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn parses_codes() {
         assert_eq!(parse_code("/callback?code=ab%2Fc&state=xy"), (Some("ab/c".into()), Some("xy".into())));
