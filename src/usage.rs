@@ -70,7 +70,7 @@ fn window(label: &str, used_pct: f64, reset_in: Option<i64>) -> String {
 }
 
 async fn get(rt: &Runtime, url: &str, token: &str, headers: &[(&str, String)]) -> Result<Value, String> {
-    let mut req = rt.http.get(url).bearer_auth(token).header("user-agent", "claude-cli/2.1.280");
+    let mut req = rt.http.get(url).bearer_auth(token).header("user-agent", crate::auth::CLAUDE_CODE_USER_AGENT);
     for (k, v) in headers {
         req = req.header(*k, v);
     }

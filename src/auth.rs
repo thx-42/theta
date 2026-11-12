@@ -183,6 +183,9 @@ const ANTHROPIC_TOKEN: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const ANTHROPIC_PORT: u16 = 53692;
 
+// Shared OAuth client identity for inference and subscription usage requests.
+pub(crate) const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.322";
+
 const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN: &str = "https://auth.openai.com/oauth/token";

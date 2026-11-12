@@ -1,7 +1,7 @@
 //! Anthropic Messages API (API key or Claude Pro/Max OAuth).
 
 use super::{OnDelta, Request, Response, Sse, StreamError, parse_args, send};
-use crate::auth::Resolved;
+use crate::auth::{CLAUDE_CODE_USER_AGENT, Resolved};
 use crate::catalog::Provider;
 use crate::types::{Block, Delta, Msg, Role, Usage};
 use anyhow::{Result, bail};
@@ -149,7 +149,7 @@ pub async fn stream(
     rb = if oauth {
         rb.header("authorization", format!("Bearer {}", creds.token))
             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-            .header("user-agent", "claude-cli/2.1.280")
+            .header("user-agent", CLAUDE_CODE_USER_AGENT)
             .header("x-app", "cli")
     } else {
         rb.header("x-api-key", &creds.token)
